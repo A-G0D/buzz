@@ -692,6 +692,7 @@ pub fn run() {
             read_clipboard_text,
             fetch_snapshot_bytes,
             relay_requires_membership,
+            enterprise_login_gate,
             list_relay_members,
             get_my_relay_membership,
             add_relay_member,

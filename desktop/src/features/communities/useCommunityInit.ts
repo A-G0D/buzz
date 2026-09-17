@@ -43,6 +43,7 @@ import { resetAvatarPresentations } from "@/features/profile/avatarPresentationS
 import { resetAvatarProfileSync } from "@/features/profile/avatarProfileSync";
 import { resetSidebarRelayConnectionCardState } from "@/features/sidebar/ui/useSidebarRelayConnectionCard";
 import { clearMarkdownNodeCache } from "@/shared/ui/markdown/nodeCache";
+import { ensureEnterpriseLoginForRelay } from "./enterpriseLoginGate";
 import { resetMessageLinkMetadataCache } from "@/shared/ui/markdown/useMessageLinkMetadata";
 import { resetVideoPlayerState } from "@/shared/ui/videoPlayerState";
 
@@ -322,6 +323,25 @@ export function useCommunityInit(
           return;
         }
       }
+      try {
+        await ensureEnterpriseLoginForRelay(activeCommunity.relayUrl);
+      } catch (error) {
+        console.error("Enterprise login gate failed:", error);
+        if (!cancelled) {
+          setResult({
+            isReady: false,
+            needsSetup: false,
+            appliedKey: null,
+            error:
+              error instanceof Error
+                ? error.message
+                : "Enterprise login is required for this community",
+          });
+        }
+        return;
+      }
+      if (cancelled) return;
+
       hasInitializedRef.current = true;
       appliedRelayUrlRef.current = activeCommunity.relayUrl;
       appliedPubkeyRef.current = identityPubkey ?? appliedPubkeyRef.current;

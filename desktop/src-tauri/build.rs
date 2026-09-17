@@ -18,6 +18,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=BUZZ_BUILD_RELAY_RECONNECT_CMD");
     println!("cargo:rerun-if-env-changed=BUZZ_BUILD_AGENT_ACCESS_OWNER_ONLY");
     println!("cargo:rerun-if-env-changed=BUZZ_BUILD_AUTO_CONNECT_DEFAULT_RELAY");
+    println!("cargo:rerun-if-env-changed=BUZZ_BUILD_ENTERPRISE_AUTH_RELAYS");
     println!("cargo:rerun-if-env-changed=BUZZ_BUILD_DEMO_SLUG");
     println!("cargo:rustc-check-cfg=cfg(buzz_updater_enabled)");
 
@@ -123,6 +124,29 @@ fn main() {
     // leave this unset and retain explicit community selection.
     if std::env::var("BUZZ_BUILD_AUTO_CONNECT_DEFAULT_RELAY").is_ok() {
         println!("cargo:rustc-env=BUZZ_DESKTOP_BUILD_AUTO_CONNECT_DEFAULT_RELAY=1");
+    }
+
+    if let Ok(relays) = std::env::var("BUZZ_BUILD_ENTERPRISE_AUTH_RELAYS") {
+        let trimmed = relays.trim();
+        if trimmed.is_empty() {
+            panic!("BUZZ_BUILD_ENTERPRISE_AUTH_RELAYS must not be empty when set");
+        }
+        for relay in trimmed
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            if !(relay.starts_with("wss://")
+                || relay.starts_with("ws://")
+                || relay.starts_with("https://")
+                || relay.starts_with("http://"))
+            {
+                panic!(
+                    "BUZZ_BUILD_ENTERPRISE_AUTH_RELAYS entries must be relay URLs, got {relay:?}"
+                );
+            }
+        }
+        println!("cargo:rustc-env=BUZZ_DESKTOP_BUILD_ENTERPRISE_AUTH_RELAYS={trimmed}");
     }
 
     let updater_public_key = std::env::var("BUZZ_UPDATER_PUBLIC_KEY")

@@ -226,6 +226,8 @@ type E2eConfig = {
     projectRepoSnapshotError?: string;
     /** Delay remote repository snapshots so project loading UI is observable. */
     projectRepoSnapshotDelayMs?: number;
+    /** Enterprise login gate result for the selected relay. Defaults to not required. */
+    enterpriseLoginGate?: { status: "notRequired" } | { status: "required" };
     /** Builderlab account returned by hosted-community onboarding. Null/omitted = signed out. */
     builderlabAuth?: {
       email?: string;
@@ -12533,6 +12535,10 @@ export function maybeInstallE2eTauriMocks() {
           registry: await handleMockCommand("list_voice_registry", null),
         };
       }
+      case "enterprise_login_gate":
+        return (
+          activeConfig?.mock?.enterpriseLoginGate ?? { status: "notRequired" }
+        );
       case "get_builderlab_auth":
         return activeConfig?.mock?.builderlabAuth ?? null;
       case "start_builderlab_login": {
