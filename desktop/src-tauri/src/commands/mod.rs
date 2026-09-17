@@ -22,6 +22,7 @@ mod clipboard;
 mod dms;
 mod engrams;
 mod enterprise_auth;
+mod enterprise_relay_url;
 mod export_util;
 mod global_agent_config;
 mod identity;

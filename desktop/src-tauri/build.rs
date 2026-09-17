@@ -1,6 +1,7 @@
 // Shared schema, included from the same source the runtime command parses with,
 // so the build-time validation below and the runtime parse cannot drift.
 include!("src/commands/reconnect_hook_config.rs");
+include!("src/commands/enterprise_relay_url.rs");
 // Same source of truth the runtime filters with, so a baked build env cannot
 // carry a reserved key the runtime believes it already rejected.
 include!("src/managed_agents/reserved_env_keys.rs");
@@ -128,24 +129,7 @@ fn main() {
 
     if let Ok(relays) = std::env::var("BUZZ_BUILD_ENTERPRISE_AUTH_RELAYS") {
         let trimmed = relays.trim();
-        if trimmed.is_empty() {
-            panic!("BUZZ_BUILD_ENTERPRISE_AUTH_RELAYS must not be empty when set");
-        }
-        for relay in trimmed
-            .split(',')
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            if !(relay.starts_with("wss://")
-                || relay.starts_with("ws://")
-                || relay.starts_with("https://")
-                || relay.starts_with("http://"))
-            {
-                panic!(
-                    "BUZZ_BUILD_ENTERPRISE_AUTH_RELAYS entries must be relay URLs, got {relay:?}"
-                );
-            }
-        }
+        parse_enterprise_relay_allowlist(trimmed).unwrap_or_else(|error| panic!("{error}"));
         println!("cargo:rustc-env=BUZZ_DESKTOP_BUILD_ENTERPRISE_AUTH_RELAYS={trimmed}");
     }
 

@@ -1,13 +1,11 @@
 use std::time::Duration;
 
-use serde::Serialize;
-use tauri::State;
-use url::Url;
-
 use crate::{
     app_state::AppState,
     relay::{classify_request_error, parse_json_response, relay_error_message},
 };
+use serde::Serialize;
+use tauri::State;
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", tag = "status")]
@@ -141,38 +139,15 @@ fn trusted_enterprise_relays(raw: Option<&'static str>) -> Result<Vec<String>, S
     let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
         return Ok(Vec::new());
     };
-    raw.split(',')
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(canonical_relay_url)
-        .collect()
+    super::enterprise_relay_url::parse_enterprise_relay_allowlist(raw)
 }
 
 fn relay_matches_any_trusted(relay_url: &str, trusted: &[String]) -> Result<bool, String> {
     if trusted.is_empty() {
         return Ok(false);
     }
-    let relay = canonical_relay_url(relay_url)?;
+    let relay = super::enterprise_relay_url::canonical_enterprise_relay_url(relay_url)?;
     Ok(trusted.iter().any(|trusted| trusted == &relay))
-}
-
-fn canonical_relay_url(raw: &str) -> Result<String, String> {
-    let mut url = Url::parse(raw.trim()).map_err(|error| format!("invalid relay URL: {error}"))?;
-    let scheme = match url.scheme() {
-        "ws" | "http" => "ws",
-        "wss" | "https" => "wss",
-        other => return Err(format!("unsupported relay URL scheme: {other}")),
-    };
-    url.set_scheme(scheme)
-        .map_err(|_| "could not normalize relay URL scheme".to_owned())?;
-    if url.host_str().is_none() {
-        return Err("relay URL must include a host".to_owned());
-    }
-    url.set_fragment(None);
-    url.set_query(None);
-    let path = url.path().trim_end_matches('/').to_owned();
-    url.set_path(&path);
-    Ok(url.to_string())
 }
 
 #[cfg(test)]
@@ -203,6 +178,59 @@ mod tests {
             .unwrap(),
             EnterpriseLoginGateStatus::Required,
         );
+    }
+
+    #[test]
+    fn default_ports_are_canonicalized_for_trusted_matching() {
+        assert_eq!(
+            evaluate_enterprise_login_gate(
+                "https://buzz.block.builderlab.xyz/",
+                &discovery_document(),
+                Some("wss://buzz.block.builderlab.xyz:443"),
+            )
+            .unwrap(),
+            EnterpriseLoginGateStatus::Required,
+        );
+        assert_eq!(
+            evaluate_enterprise_login_gate(
+                "http://localhost/",
+                &discovery_document(),
+                Some("ws://localhost:80"),
+            )
+            .unwrap(),
+            EnterpriseLoginGateStatus::Required,
+        );
+    }
+
+    #[test]
+    fn trusted_allowlist_rejects_empty_entries() {
+        let error = trusted_enterprise_relays(Some("wss://relay.example,"))
+            .expect_err("empty entries must fail closed");
+        assert!(error.contains("entry 2 must not be empty"));
+    }
+
+    #[test]
+    fn trusted_allowlist_rejects_userinfo_query_and_fragment() {
+        for relay in [
+            "wss://user@relay.example",
+            "wss://relay.example?env=prod",
+            "wss://relay.example#prod",
+        ] {
+            assert!(
+                trusted_enterprise_relays(Some(relay)).is_err(),
+                "{relay} should be rejected",
+            );
+        }
+    }
+
+    #[test]
+    fn trusted_allowlist_rejects_missing_host_and_unsupported_scheme() {
+        for relay in ["wss://", "file://relay.example"] {
+            assert!(
+                trusted_enterprise_relays(Some(relay)).is_err(),
+                "{relay} should be rejected",
+            );
+        }
     }
 
     #[test]
