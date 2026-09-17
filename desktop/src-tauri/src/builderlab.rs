@@ -299,6 +299,40 @@ fn register_pending_builderlab_login(
     Ok(true)
 }
 
+fn commit_builderlab_login_session(
+    login: &BuilderlabLogin,
+    session: &BuilderlabSession,
+    login_id: &str,
+    credential: String,
+) -> Result<(), String> {
+    commit_builderlab_login_session_with_hook(login, session, login_id, credential, || {})
+}
+
+fn commit_builderlab_login_session_with_hook(
+    login: &BuilderlabLogin,
+    session: &BuilderlabSession,
+    login_id: &str,
+    credential: String,
+    before_session_lock: impl FnOnce(),
+) -> Result<(), String> {
+    // Keep this lock order consistent everywhere a Builderlab login result is
+    // committed: first BuilderlabLogin, then BuilderlabSession. Holding the login
+    // lock through the session write prevents cancel/replacement from
+    // interleaving after the ownership check but before credential storage.
+    let mut login_state = login.0.lock().map_err(|error| error.to_string())?;
+    if login_state
+        .pending
+        .as_ref()
+        .is_none_or(|pending| pending.id != login_id)
+    {
+        return Err("Builderlab authentication canceled".to_owned());
+    }
+    before_session_lock();
+    *session.0.lock().map_err(|error| error.to_string())? = Some(StoredSession { credential });
+    login_state.pending = None;
+    Ok(())
+}
+
 async fn abort_builderlab_login(
     login: &BuilderlabLogin,
     server: tokio::task::JoinHandle<()>,
@@ -489,20 +523,7 @@ pub(crate) async fn start_builderlab_login(
         email: me.email,
         name: me.name,
     };
-    {
-        let mut state = login.0.lock().map_err(|error| error.to_string())?;
-        if state
-            .pending
-            .as_ref()
-            .is_none_or(|pending| pending.id != login_id)
-        {
-            return Err("Builderlab authentication canceled".to_owned());
-        }
-        state.pending = None;
-    }
-    *session.0.lock().map_err(|error| error.to_string())? = Some(StoredSession {
-        credential: exchanged.session_credential,
-    });
+    commit_builderlab_login_session(&login, &session, &login_id, exchanged.session_credential)?;
     Ok(info)
 }
 
@@ -852,6 +873,92 @@ mod tests {
                 .as_ref()
                 .map(|pending| pending.id.as_str()),
             Some("legacy-flow"),
+        );
+    }
+
+    #[test]
+    fn canceled_attempt_tombstones_are_bounded() {
+        let login = BuilderlabLogin::default();
+        for index in 0..(CANCELED_LOGIN_ATTEMPT_TOMBSTONE_LIMIT + 5) {
+            let attempt_id = format!("enterprise-login-{index}");
+            assert!(!cancel_builderlab_login_attempt(&login, Some(&attempt_id)).unwrap());
+        }
+
+        let state = login.0.lock().unwrap();
+        assert_eq!(
+            state.canceled_attempts.len(),
+            CANCELED_LOGIN_ATTEMPT_TOMBSTONE_LIMIT,
+        );
+        assert_eq!(
+            state.canceled_attempts.front().map(String::as_str),
+            Some("enterprise-login-5"),
+        );
+    }
+
+    #[test]
+    fn stale_attempt_cannot_commit_session_after_replacement() {
+        let login = BuilderlabLogin::default();
+        let session = BuilderlabSession::default();
+        let (cancel, _receiver) = oneshot::channel();
+        login.0.lock().unwrap().pending = Some(PendingLogin {
+            id: "enterprise-login-new".to_owned(),
+            cancel,
+        });
+
+        let result = commit_builderlab_login_session(
+            &login,
+            &session,
+            "enterprise-login-old",
+            "stale-credential".to_owned(),
+        );
+
+        assert_eq!(result.unwrap_err(), "Builderlab authentication canceled");
+        assert!(session.0.lock().unwrap().is_none());
+        assert_eq!(
+            login
+                .0
+                .lock()
+                .unwrap()
+                .pending
+                .as_ref()
+                .map(|pending| pending.id.as_str()),
+            Some("enterprise-login-new"),
+        );
+    }
+
+    #[test]
+    fn session_commit_holds_login_ownership_fence_through_write() {
+        let login = BuilderlabLogin::default();
+        let session = BuilderlabSession::default();
+        let (cancel, _receiver) = oneshot::channel();
+        login.0.lock().unwrap().pending = Some(PendingLogin {
+            id: "enterprise-login-a".to_owned(),
+            cancel,
+        });
+
+        commit_builderlab_login_session_with_hook(
+            &login,
+            &session,
+            "enterprise-login-a",
+            "fresh-credential".to_owned(),
+            || {
+                assert!(
+                    login.0.try_lock().is_err(),
+                    "login ownership must remain locked until after the session write",
+                );
+            },
+        )
+        .unwrap();
+
+        assert!(login.0.lock().unwrap().pending.is_none());
+        assert_eq!(
+            session
+                .0
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|stored| stored.credential.as_str()),
+            Some("fresh-credential"),
         );
     }
 
