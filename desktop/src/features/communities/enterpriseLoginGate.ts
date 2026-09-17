@@ -22,8 +22,14 @@ export async function enterpriseLoginGate(
  * provider configuration stays in the signed build and in native commands; this
  * function never reads URLs or issuer details from NIP-11.
  */
+export type EnsureEnterpriseLoginOptions = {
+  loginAttemptId?: string;
+  onBrowserLoginStarted?: () => void;
+};
+
 export async function ensureEnterpriseLoginForRelay(
   relayUrl: string,
+  options?: EnsureEnterpriseLoginOptions,
 ): Promise<BuilderlabAuth | null> {
   const gate = await enterpriseLoginGate(relayUrl);
   if (gate.status === "notRequired") {
@@ -40,5 +46,8 @@ export async function ensureEnterpriseLoginForRelay(
     // Fall through to a fresh browser login.
   }
 
-  return startBuilderlabLogin();
+  options?.onBrowserLoginStarted?.();
+  return startBuilderlabLogin(
+    options?.loginAttemptId ? { attemptId: options.loginAttemptId } : undefined,
+  );
 }

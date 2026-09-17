@@ -88,6 +88,7 @@ test("ensureEnterpriseLoginForRelay reuses an existing Builderlab session", asyn
 test("ensureEnterpriseLoginForRelay starts browser login when no valid session exists", async () => {
   const auth = { name: "Person", expiresAt: "2026-09-17T17:00:00Z" };
   const calls = [];
+  const started = [];
   const restore = installTauriInvoke(async (command, args) => {
     calls.push([command, args]);
     if (command === "enterprise_login_gate") return { status: "required" };
@@ -98,7 +99,10 @@ test("ensureEnterpriseLoginForRelay starts browser login when no valid session e
 
   try {
     assert.deepEqual(
-      await gate.ensureEnterpriseLoginForRelay("wss://relay.example"),
+      await gate.ensureEnterpriseLoginForRelay("wss://relay.example", {
+        loginAttemptId: "attempt-1",
+        onBrowserLoginStarted: () => started.push("started"),
+      }),
       auth,
     );
     assert.deepEqual(
@@ -109,6 +113,11 @@ test("ensureEnterpriseLoginForRelay starts browser login when no valid session e
         "start_builderlab_login",
       ],
     );
+    assert.deepEqual(calls.at(-1), [
+      "start_builderlab_login",
+      { attemptId: "attempt-1" },
+    ]);
+    assert.deepEqual(started, ["started"]);
   } finally {
     restore();
   }

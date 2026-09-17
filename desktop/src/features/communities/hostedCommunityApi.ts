@@ -145,16 +145,20 @@ export function getBuilderlabAuth() {
   return invoke<BuilderlabAuth | null>("get_builderlab_auth");
 }
 
-export function cancelBuilderlabLogin() {
-  return invoke<void>("cancel_builderlab_login");
+export type BuilderlabLoginAttempt = {
+  attemptId: string;
+};
+
+export function cancelBuilderlabLogin(options?: BuilderlabLoginAttempt) {
+  return invoke<void>("cancel_builderlab_login", options);
 }
 
 export function clearBuilderlabAuth() {
   return invoke<void>("clear_builderlab_auth");
 }
 
-export function startBuilderlabLogin() {
-  return invoke<BuilderlabAuth>("start_builderlab_login");
+export function startBuilderlabLogin(options?: BuilderlabLoginAttempt) {
+  return invoke<BuilderlabAuth>("start_builderlab_login", options);
 }
 
 export async function loadHostedCommunityAccount(): Promise<HostedCommunityAccount> {

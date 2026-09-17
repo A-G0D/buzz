@@ -14,6 +14,7 @@ use url::Url;
 
 const BUILDERLAB_API_BASE_URL: &str = "https://app.builderlab.xyz/api/goose";
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const ENTERPRISE_LOGIN_ATTEMPT_PREFIX: &str = "enterprise-login-";
 const BB_SESSION_CREDENTIAL_HEADER: &str = "X-BB-Session-Credential";
 // Builderlab enforces an Origin check on the identity bind endpoints. Browsers
 // attach this automatically; the desktop reqwest client must set it explicitly
@@ -146,7 +147,7 @@ pub(crate) struct BuilderlabSession(Mutex<Option<StoredSession>>);
 pub(crate) struct BuilderlabLogin(Mutex<Option<PendingLogin>>);
 
 struct PendingLogin {
-    id: uuid::Uuid,
+    id: String,
     cancel: oneshot::Sender<()>,
 }
 
@@ -253,6 +254,7 @@ pub(crate) async fn start_builderlab_login(
     app_state: tauri::State<'_, crate::app_state::AppState>,
     session: tauri::State<'_, BuilderlabSession>,
     login: tauri::State<'_, BuilderlabLogin>,
+    attempt_id: Option<String>,
 ) -> Result<BuilderlabAuthInfo, String> {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -275,23 +277,45 @@ pub(crate) async fn start_builderlab_login(
         let _ = axum::serve(listener, router).await;
     });
 
-    let login_url = login_url(&return_to)?;
-    if let Err(error) = app.opener().open_url(login_url.as_str(), None::<&str>) {
-        server.abort();
-        return Err(format!("could not open Builderlab authentication: {error}"));
-    }
-
-    let login_id = uuid::Uuid::new_v4();
+    let login_id = attempt_id
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let (cancel_sender, mut cancel_receiver) = oneshot::channel();
     {
         let mut pending = login.0.lock().map_err(|error| error.to_string())?;
-        if let Some(previous) = pending.take() {
-            let _ = previous.cancel.send(());
+        if pending.is_some() {
+            if attempt_id.is_some()
+                && !pending
+                    .as_ref()
+                    .is_some_and(|pending| pending.id.starts_with(ENTERPRISE_LOGIN_ATTEMPT_PREFIX))
+            {
+                server.abort();
+                return Err("Builderlab authentication is already in progress".to_owned());
+            }
+            if let Some(previous) = pending.take() {
+                let _ = previous.cancel.send(());
+            }
         }
         *pending = Some(PendingLogin {
-            id: login_id,
+            id: login_id.clone(),
             cancel: cancel_sender,
         });
+    }
+
+    let login_url = login_url(&return_to)?;
+    if let Err(error) = app.opener().open_url(login_url.as_str(), None::<&str>) {
+        server.abort();
+        let mut pending = login
+            .0
+            .lock()
+            .map_err(|lock_error| lock_error.to_string())?;
+        if pending
+            .as_ref()
+            .is_some_and(|pending| pending.id == login_id)
+        {
+            *pending = None;
+        }
+        return Err(format!("could not open Builderlab authentication: {error}"));
     }
 
     let exchange_code = tokio::select! {
@@ -394,14 +418,30 @@ pub(crate) async fn get_builderlab_auth(
     }
 }
 
+fn cancel_builderlab_login_attempt(
+    login: &BuilderlabLogin,
+    attempt_id: Option<&str>,
+) -> Result<bool, String> {
+    let mut pending = login.0.lock().map_err(|error| error.to_string())?;
+    let should_cancel = match (pending.as_ref(), attempt_id) {
+        (Some(login), Some(attempt_id)) => login.id == attempt_id,
+        (Some(_), None) => true,
+        (None, _) => false,
+    };
+    if should_cancel {
+        if let Some(pending) = pending.take() {
+            let _ = pending.cancel.send(());
+        }
+    }
+    Ok(should_cancel)
+}
+
 #[tauri::command]
 pub(crate) fn cancel_builderlab_login(
     login: tauri::State<'_, BuilderlabLogin>,
+    attempt_id: Option<String>,
 ) -> Result<(), String> {
-    if let Some(pending) = login.0.lock().map_err(|error| error.to_string())?.take() {
-        let _ = pending.cancel.send(());
-    }
-    Ok(())
+    cancel_builderlab_login_attempt(&login, attempt_id.as_deref()).map(|_| ())
 }
 
 #[tauri::command]
@@ -643,6 +683,38 @@ pub(crate) async fn transfer_builderlab_community(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancel_with_attempt_id_only_cancels_matching_pending_login() {
+        let login = BuilderlabLogin::default();
+        let (cancel, mut receiver) = oneshot::channel();
+        *login.0.lock().unwrap() = Some(PendingLogin {
+            id: "attempt-a".to_owned(),
+            cancel,
+        });
+
+        assert!(!cancel_builderlab_login_attempt(&login, Some("attempt-b")).unwrap());
+        assert!(login.0.lock().unwrap().is_some());
+        assert!(receiver.try_recv().is_err());
+
+        assert!(cancel_builderlab_login_attempt(&login, Some("attempt-a")).unwrap());
+        assert!(login.0.lock().unwrap().is_none());
+        assert!(receiver.try_recv().is_ok());
+    }
+
+    #[test]
+    fn cancel_without_attempt_id_preserves_existing_blind_cancel_behavior() {
+        let login = BuilderlabLogin::default();
+        let (cancel, mut receiver) = oneshot::channel();
+        *login.0.lock().unwrap() = Some(PendingLogin {
+            id: "legacy-flow".to_owned(),
+            cancel,
+        });
+
+        assert!(cancel_builderlab_login_attempt(&login, None).unwrap());
+        assert!(login.0.lock().unwrap().is_none());
+        assert!(receiver.try_recv().is_ok());
+    }
 
     #[test]
     fn auth_complete_page_uses_buzz_brand() {

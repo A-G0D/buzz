@@ -193,7 +193,7 @@ function installTauriInvoke(handler) {
   };
 }
 
-function testCommunity() {
+function testCommunity(overrides = {}) {
   return {
     id: "community-1",
     name: "Enterprise",
@@ -201,7 +201,12 @@ function testCommunity() {
     token: "token-1",
     reposDir: "/tmp/buzz-repos",
     addedAt: "2026-09-17T00:00:00.000Z",
+    ...overrides,
   };
+}
+
+function neverSettles() {
+  return new Promise(() => {});
 }
 
 test("useCommunityInit gates enterprise login before applying the community", async () => {
@@ -287,6 +292,96 @@ test("useCommunityInit blocks community apply when enterprise login gate fails",
     hook.unmount();
   } finally {
     restore();
+    mock.reset();
+  }
+});
+
+test("useCommunityInit cancels an owned pending Builderlab login on superseded init", async () => {
+  const { cleanup, renderHook, waitFor } = await import(
+    "@testing-library/react"
+  );
+  const { useCommunityInit } = await import("./useCommunityInit.ts");
+  const calls = [];
+  const communityA = testCommunity({
+    id: "community-a",
+    relayUrl: "wss://enterprise-a.example",
+  });
+  const communityB = testCommunity({
+    id: "community-b",
+    relayUrl: "wss://ordinary-b.example",
+  });
+  const restore = installTauriInvoke(async (command, args) => {
+    calls.push([command, args]);
+    if (command === "get_identity") {
+      return { pubkey: "pubkey-1", display_name: "Tester" };
+    }
+    if (command === "enterprise_login_gate") {
+      return args.relayUrl === communityA.relayUrl
+        ? { status: "required" }
+        : { status: "notRequired" };
+    }
+    if (command === "get_builderlab_auth") {
+      return null;
+    }
+    if (command === "start_builderlab_login") {
+      return neverSettles();
+    }
+    if (command === "cancel_builderlab_login") {
+      return null;
+    }
+    if (command === "apply_workspace") {
+      return null;
+    }
+    throw new Error(`unexpected command: ${command}`);
+  });
+
+  try {
+    const hook = renderHook(
+      ({ community, key }) => useCommunityInit(community, key, false, true),
+      { initialProps: { community: communityA, key: "community-a-key" } },
+    );
+
+    await waitFor(() => {
+      assert.equal(
+        calls.some(([command]) => command === "start_builderlab_login"),
+        true,
+      );
+    });
+    const startCall = calls.find(
+      ([command]) => command === "start_builderlab_login",
+    );
+    assert.equal(typeof startCall?.[1]?.attemptId, "string");
+
+    hook.rerender({ community: communityB, key: "community-b-key" });
+
+    await waitFor(() => assert.equal(hook.result.current.isReady, true));
+    const cancelIndex = calls.findIndex(
+      ([command]) => command === "cancel_builderlab_login",
+    );
+    const applyIndex = calls.findIndex(
+      ([command, args]) =>
+        command === "apply_workspace" && args.relayUrl === communityB.relayUrl,
+    );
+
+    assert.notEqual(cancelIndex, -1);
+    assert.notEqual(applyIndex, -1);
+    assert.ok(cancelIndex < applyIndex);
+    assert.deepEqual(calls[cancelIndex], [
+      "cancel_builderlab_login",
+      { attemptId: startCall[1].attemptId },
+    ]);
+    assert.equal(
+      calls.some(
+        ([command, args]) =>
+          command === "apply_workspace" &&
+          args.relayUrl === communityA.relayUrl,
+      ),
+      false,
+    );
+    hook.unmount();
+  } finally {
+    restore();
+    cleanup();
     mock.reset();
   }
 });

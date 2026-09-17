@@ -44,6 +44,7 @@ import { resetAvatarProfileSync } from "@/features/profile/avatarProfileSync";
 import { resetSidebarRelayConnectionCardState } from "@/features/sidebar/ui/useSidebarRelayConnectionCard";
 import { clearMarkdownNodeCache } from "@/shared/ui/markdown/nodeCache";
 import { ensureEnterpriseLoginForRelay } from "./enterpriseLoginGate";
+import { cancelBuilderlabLogin } from "./hostedCommunityApi";
 import { resetMessageLinkMetadataCache } from "@/shared/ui/markdown/useMessageLinkMetadata";
 import { resetVideoPlayerState } from "@/shared/ui/videoPlayerState";
 
@@ -180,6 +181,7 @@ export function useCommunityInit(
   // biome-ignore lint/correctness/useExhaustiveDependencies: we intentionally depend on specific properties (id/relayUrl/token/reposDir) — depending on the whole object would trigger resets on name-only changes
   useEffect(() => {
     let cancelled = false;
+    let ownedEnterpriseLoginAttemptId: string | null = null;
 
     async function init() {
       if (!activeCommunity) {
@@ -323,9 +325,19 @@ export function useCommunityInit(
           return;
         }
       }
+      const enterpriseLoginAttemptId = `enterprise-login-${
+        globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`
+      }`;
       try {
-        await ensureEnterpriseLoginForRelay(activeCommunity.relayUrl);
+        await ensureEnterpriseLoginForRelay(activeCommunity.relayUrl, {
+          loginAttemptId: enterpriseLoginAttemptId,
+          onBrowserLoginStarted: () => {
+            ownedEnterpriseLoginAttemptId = enterpriseLoginAttemptId;
+          },
+        });
+        ownedEnterpriseLoginAttemptId = null;
       } catch (error) {
+        ownedEnterpriseLoginAttemptId = null;
         console.error("Enterprise login gate failed:", error);
         if (!cancelled) {
           setResult({
@@ -432,6 +444,14 @@ export function useCommunityInit(
 
     return () => {
       cancelled = true;
+      if (ownedEnterpriseLoginAttemptId !== null) {
+        void cancelBuilderlabLogin({
+          attemptId: ownedEnterpriseLoginAttemptId,
+        }).catch(() => {
+          // Best-effort cleanup for a browser login this hook invocation owns.
+        });
+        ownedEnterpriseLoginAttemptId = null;
+      }
     };
   }, [
     activeCommunity?.id,
