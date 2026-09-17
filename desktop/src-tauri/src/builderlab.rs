@@ -1,4 +1,8 @@
-use std::{collections::HashMap, sync::Mutex, time::Duration};
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::Mutex,
+    time::Duration,
+};
 
 use axum::{
     extract::{Path, Query, State as AxumState},
@@ -15,6 +19,7 @@ use url::Url;
 const BUILDERLAB_API_BASE_URL: &str = "https://app.builderlab.xyz/api/goose";
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const ENTERPRISE_LOGIN_ATTEMPT_PREFIX: &str = "enterprise-login-";
+const CANCELED_LOGIN_ATTEMPT_TOMBSTONE_LIMIT: usize = 64;
 const BB_SESSION_CREDENTIAL_HEADER: &str = "X-BB-Session-Credential";
 // Builderlab enforces an Origin check on the identity bind endpoints. Browsers
 // attach this automatically; the desktop reqwest client must set it explicitly
@@ -144,7 +149,13 @@ const AUTH_COMPLETE_HTML: &str = r#"<!doctype html>
 pub(crate) struct BuilderlabSession(Mutex<Option<StoredSession>>);
 
 #[derive(Default)]
-pub(crate) struct BuilderlabLogin(Mutex<Option<PendingLogin>>);
+pub(crate) struct BuilderlabLogin(Mutex<BuilderlabLoginState>);
+
+#[derive(Default)]
+struct BuilderlabLoginState {
+    pending: Option<PendingLogin>,
+    canceled_attempts: VecDeque<String>,
+}
 
 struct PendingLogin {
     id: String,
@@ -225,6 +236,80 @@ fn login_url(return_to: &str) -> Result<Url, String> {
     Ok(login_url)
 }
 
+fn remember_canceled_attempt(state: &mut BuilderlabLoginState, attempt_id: String) {
+    if state
+        .canceled_attempts
+        .iter()
+        .any(|canceled| canceled == &attempt_id)
+    {
+        return;
+    }
+    if state.canceled_attempts.len() >= CANCELED_LOGIN_ATTEMPT_TOMBSTONE_LIMIT {
+        state.canceled_attempts.pop_front();
+    }
+    state.canceled_attempts.push_back(attempt_id);
+}
+
+fn is_canceled_attempt(state: &BuilderlabLoginState, attempt_id: &str) -> bool {
+    state
+        .canceled_attempts
+        .iter()
+        .any(|canceled| canceled == attempt_id)
+}
+
+fn clear_matching_pending_login(login: &BuilderlabLogin, login_id: &str) -> Result<(), String> {
+    let mut state = login.0.lock().map_err(|error| error.to_string())?;
+    if state
+        .pending
+        .as_ref()
+        .is_some_and(|pending| pending.id == login_id)
+    {
+        state.pending = None;
+    }
+    Ok(())
+}
+
+fn register_pending_builderlab_login(
+    login: &BuilderlabLogin,
+    login_id: &str,
+    cancel: oneshot::Sender<()>,
+    is_enterprise_attempt: bool,
+) -> Result<bool, String> {
+    let mut state = login.0.lock().map_err(|error| error.to_string())?;
+    if is_enterprise_attempt && is_canceled_attempt(&state, login_id) {
+        return Ok(false);
+    }
+    if state.pending.is_some() {
+        if is_enterprise_attempt
+            && !state
+                .pending
+                .as_ref()
+                .is_some_and(|pending| pending.id.starts_with(ENTERPRISE_LOGIN_ATTEMPT_PREFIX))
+        {
+            return Err("Builderlab authentication is already in progress".to_owned());
+        }
+        if let Some(previous) = state.pending.take() {
+            let _ = previous.cancel.send(());
+        }
+    }
+    state.pending = Some(PendingLogin {
+        id: login_id.to_owned(),
+        cancel,
+    });
+    Ok(true)
+}
+
+async fn abort_builderlab_login(
+    login: &BuilderlabLogin,
+    server: tokio::task::JoinHandle<()>,
+    login_id: &str,
+    error: String,
+) -> Result<BuilderlabAuthInfo, String> {
+    server.abort();
+    clear_matching_pending_login(login, login_id)?;
+    Err(error)
+}
+
 async fn authenticated_user(
     client: &reqwest::Client,
     credential: &str,
@@ -280,91 +365,123 @@ pub(crate) async fn start_builderlab_login(
     let login_id = attempt_id
         .clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let is_enterprise_attempt = attempt_id.is_some();
     let (cancel_sender, mut cancel_receiver) = oneshot::channel();
+    match register_pending_builderlab_login(&login, &login_id, cancel_sender, is_enterprise_attempt)
     {
-        let mut pending = login.0.lock().map_err(|error| error.to_string())?;
-        if pending.is_some() {
-            if attempt_id.is_some()
-                && !pending
-                    .as_ref()
-                    .is_some_and(|pending| pending.id.starts_with(ENTERPRISE_LOGIN_ATTEMPT_PREFIX))
-            {
-                server.abort();
-                return Err("Builderlab authentication is already in progress".to_owned());
-            }
-            if let Some(previous) = pending.take() {
-                let _ = previous.cancel.send(());
-            }
+        Ok(true) => {}
+        Ok(false) => {
+            server.abort();
+            return Err("Builderlab authentication canceled".to_owned());
         }
-        *pending = Some(PendingLogin {
-            id: login_id.clone(),
-            cancel: cancel_sender,
-        });
+        Err(error) => {
+            server.abort();
+            return Err(error);
+        }
     }
 
-    let login_url = login_url(&return_to)?;
+    let login_url = match login_url(&return_to) {
+        Ok(login_url) => login_url,
+        Err(error) => return abort_builderlab_login(&login, server, &login_id, error).await,
+    };
     if let Err(error) = app.opener().open_url(login_url.as_str(), None::<&str>) {
-        server.abort();
-        let mut pending = login
-            .0
-            .lock()
-            .map_err(|lock_error| lock_error.to_string())?;
-        if pending
-            .as_ref()
-            .is_some_and(|pending| pending.id == login_id)
-        {
-            *pending = None;
-        }
-        return Err(format!("could not open Builderlab authentication: {error}"));
+        return abort_builderlab_login(
+            &login,
+            server,
+            &login_id,
+            format!("could not open Builderlab authentication: {error}"),
+        )
+        .await;
     }
 
     let exchange_code = tokio::select! {
         result = tokio::time::timeout(LOGIN_TIMEOUT, receiver) => match result {
             Ok(Ok(Ok(code))) => code,
             Ok(Ok(Err(error))) => {
-                server.abort();
-                return Err(error);
+                return abort_builderlab_login(&login, server, &login_id, error).await;
             }
             Ok(Err(_)) => {
-                server.abort();
-                return Err("local authentication callback stopped unexpectedly".to_owned());
+                return abort_builderlab_login(
+                    &login,
+                    server,
+                    &login_id,
+                    "local authentication callback stopped unexpectedly".to_owned(),
+                )
+                .await;
             }
             Err(_) => {
-                server.abort();
-                return Err("Builderlab authentication timed out".to_owned());
+                return abort_builderlab_login(
+                    &login,
+                    server,
+                    &login_id,
+                    "Builderlab authentication timed out".to_owned(),
+                )
+                .await;
             }
         },
         _ = &mut cancel_receiver => {
-            server.abort();
-            return Err("Builderlab authentication canceled".to_owned());
+            return abort_builderlab_login(
+                &login,
+                server,
+                &login_id,
+                "Builderlab authentication canceled".to_owned(),
+            )
+            .await;
         }
     };
     server.abort();
 
-    let response = app_state
+    let exchange_url = match api_url("/v1/auth/login/exchange") {
+        Ok(exchange_url) => exchange_url,
+        Err(error) => {
+            clear_matching_pending_login(&login, &login_id)?;
+            return Err(error);
+        }
+    };
+    let response = match app_state
         .http_client
-        .post(api_url("/v1/auth/login/exchange")?)
+        .post(exchange_url)
         .json(&serde_json::json!({ "code": exchange_code }))
         .timeout(Duration::from_secs(30))
         .send()
         .await
-        .map_err(|error| format!("Builderlab code exchange failed: {error}"))?;
+    {
+        Ok(response) => response,
+        Err(error) => {
+            clear_matching_pending_login(&login, &login_id)?;
+            return Err(format!("Builderlab code exchange failed: {error}"));
+        }
+    };
     if !response.status().is_success() {
+        let status = response.status();
+        clear_matching_pending_login(&login, &login_id)?;
         return Err(format!(
-            "Builderlab code exchange failed with HTTP {}",
-            response.status()
+            "Builderlab code exchange failed with HTTP {status}"
         ));
     }
-    let exchanged: LoginExchangeResponse = response
-        .json()
-        .await
-        .map_err(|error| format!("invalid Builderlab code exchange response: {error}"))?;
+    let exchanged: LoginExchangeResponse = match response.json().await {
+        Ok(exchanged) => exchanged,
+        Err(error) => {
+            clear_matching_pending_login(&login, &login_id)?;
+            return Err(format!(
+                "invalid Builderlab code exchange response: {error}"
+            ));
+        }
+    };
     if exchanged.session_credential.is_empty() {
+        clear_matching_pending_login(&login, &login_id)?;
         return Err("Builderlab code exchange returned an empty credential".to_owned());
     }
 
-    let me = authenticated_user(&app_state.http_client, &exchanged.session_credential).await?;
+    let me = match authenticated_user(&app_state.http_client, &exchanged.session_credential).await {
+        Ok(me) => me,
+        Err(error) => {
+            clear_matching_pending_login(&login, &login_id)?;
+            return Err(error);
+        }
+    };
     if exchanged.expires_at != me.expires_at {
+        clear_matching_pending_login(&login, &login_id)?;
         return Err("Builderlab session expiry did not match code exchange".to_owned());
     }
     let info = BuilderlabAuthInfo {
@@ -373,14 +490,15 @@ pub(crate) async fn start_builderlab_login(
         name: me.name,
     };
     {
-        let mut pending = login.0.lock().map_err(|error| error.to_string())?;
-        if pending
+        let mut state = login.0.lock().map_err(|error| error.to_string())?;
+        if state
+            .pending
             .as_ref()
             .is_none_or(|pending| pending.id != login_id)
         {
             return Err("Builderlab authentication canceled".to_owned());
         }
-        *pending = None;
+        state.pending = None;
     }
     *session.0.lock().map_err(|error| error.to_string())? = Some(StoredSession {
         credential: exchanged.session_credential,
@@ -422,14 +540,17 @@ fn cancel_builderlab_login_attempt(
     login: &BuilderlabLogin,
     attempt_id: Option<&str>,
 ) -> Result<bool, String> {
-    let mut pending = login.0.lock().map_err(|error| error.to_string())?;
-    let should_cancel = match (pending.as_ref(), attempt_id) {
+    let mut state = login.0.lock().map_err(|error| error.to_string())?;
+    if let Some(attempt_id) = attempt_id {
+        remember_canceled_attempt(&mut state, attempt_id.to_owned());
+    }
+    let should_cancel = match (state.pending.as_ref(), attempt_id) {
         (Some(login), Some(attempt_id)) => login.id == attempt_id,
         (Some(_), None) => true,
         (None, _) => false,
     };
     if should_cancel {
-        if let Some(pending) = pending.take() {
+        if let Some(pending) = state.pending.take() {
             let _ = pending.cancel.send(());
         }
     }
@@ -688,31 +809,63 @@ mod tests {
     fn cancel_with_attempt_id_only_cancels_matching_pending_login() {
         let login = BuilderlabLogin::default();
         let (cancel, mut receiver) = oneshot::channel();
-        *login.0.lock().unwrap() = Some(PendingLogin {
+        login.0.lock().unwrap().pending = Some(PendingLogin {
             id: "attempt-a".to_owned(),
             cancel,
         });
 
         assert!(!cancel_builderlab_login_attempt(&login, Some("attempt-b")).unwrap());
-        assert!(login.0.lock().unwrap().is_some());
+        assert!(login.0.lock().unwrap().pending.is_some());
         assert!(receiver.try_recv().is_err());
 
         assert!(cancel_builderlab_login_attempt(&login, Some("attempt-a")).unwrap());
-        assert!(login.0.lock().unwrap().is_none());
+        assert!(login.0.lock().unwrap().pending.is_none());
         assert!(receiver.try_recv().is_ok());
+    }
+
+    #[test]
+    fn cancel_before_registration_tombstones_enterprise_attempt() {
+        let login = BuilderlabLogin::default();
+        assert!(!cancel_builderlab_login_attempt(&login, Some("enterprise-login-a")).unwrap());
+
+        let (cancel, _receiver) = oneshot::channel();
+        assert!(
+            !register_pending_builderlab_login(&login, "enterprise-login-a", cancel, true,)
+                .unwrap()
+        );
+        assert!(login.0.lock().unwrap().pending.is_none());
+    }
+
+    #[test]
+    fn cancel_before_registration_does_not_block_legacy_attempts() {
+        let login = BuilderlabLogin::default();
+        assert!(!cancel_builderlab_login_attempt(&login, Some("legacy-flow")).unwrap());
+
+        let (cancel, _receiver) = oneshot::channel();
+        assert!(register_pending_builderlab_login(&login, "legacy-flow", cancel, false).unwrap());
+        assert_eq!(
+            login
+                .0
+                .lock()
+                .unwrap()
+                .pending
+                .as_ref()
+                .map(|pending| pending.id.as_str()),
+            Some("legacy-flow"),
+        );
     }
 
     #[test]
     fn cancel_without_attempt_id_preserves_existing_blind_cancel_behavior() {
         let login = BuilderlabLogin::default();
         let (cancel, mut receiver) = oneshot::channel();
-        *login.0.lock().unwrap() = Some(PendingLogin {
+        login.0.lock().unwrap().pending = Some(PendingLogin {
             id: "legacy-flow".to_owned(),
             cancel,
         });
 
         assert!(cancel_builderlab_login_attempt(&login, None).unwrap());
-        assert!(login.0.lock().unwrap().is_none());
+        assert!(login.0.lock().unwrap().pending.is_none());
         assert!(receiver.try_recv().is_ok());
     }
 
