@@ -8,22 +8,22 @@ const { authoritativeEnterpriseProfile } = await import(
 test("authoritativeEnterpriseProfile requires independent username and display name", () => {
   assert.deepEqual(
     authoritativeEnterpriseProfile({
-      corporateUsername: " seiler ",
-      corporateDisplayName: " Brad Seiler ",
+      username: " seiler ",
+      name: " Brad Seiler ",
       expiresAt: "2026-09-18T21:00:00Z",
     }),
     { username: "seiler", displayName: "Brad Seiler" },
   );
   assert.equal(
     authoritativeEnterpriseProfile({
-      corporateUsername: "seiler",
+      username: "seiler",
       expiresAt: "2026-09-18T21:00:00Z",
     }),
     null,
   );
   assert.equal(
     authoritativeEnterpriseProfile({
-      corporateDisplayName: "Brad Seiler",
+      name: "Brad Seiler",
       expiresAt: "2026-09-18T21:00:00Z",
     }),
     null,

@@ -168,8 +168,8 @@ struct StoredSession {
 struct LoginExchangeResponse {
     session_credential: String,
     expires_at: String,
-    corporate_username: Option<String>,
-    corporate_display_name: Option<String>,
+    username: Option<String>,
+    name: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -177,18 +177,16 @@ struct LoginExchangeResponse {
 pub(crate) struct BuilderlabAuthInfo {
     expires_at: String,
     email: Option<String>,
+    username: Option<String>,
     name: Option<String>,
-    corporate_username: Option<String>,
-    corporate_display_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct AuthMeResponse {
     email: Option<String>,
-    name: Option<String>,
     expires_at: String,
-    corporate_username: Option<String>,
-    corporate_display_name: Option<String>,
+    username: Option<String>,
+    name: Option<String>,
 }
 
 struct CallbackState {
@@ -536,11 +534,9 @@ pub(crate) async fn start_builderlab_login(
     let info = BuilderlabAuthInfo {
         expires_at: me.expires_at.clone(),
         email: me.email,
-        name: me.name,
-        corporate_username: normalized_auth_field(me.corporate_username)
-            .or_else(|| normalized_auth_field(exchanged.corporate_username)),
-        corporate_display_name: normalized_auth_field(me.corporate_display_name)
-            .or_else(|| normalized_auth_field(exchanged.corporate_display_name)),
+        username: normalized_auth_field(me.username)
+            .or_else(|| normalized_auth_field(exchanged.username)),
+        name: normalized_auth_field(me.name).or_else(|| normalized_auth_field(exchanged.name)),
     };
     commit_builderlab_login_session(&login, &session, &login_id, exchanged.session_credential)?;
     Ok(info)
@@ -564,9 +560,8 @@ pub(crate) async fn get_builderlab_auth(
         Ok(me) => Ok(Some(BuilderlabAuthInfo {
             expires_at: me.expires_at,
             email: me.email,
-            name: me.name,
-            corporate_username: normalized_auth_field(me.corporate_username),
-            corporate_display_name: normalized_auth_field(me.corporate_display_name),
+            username: normalized_auth_field(me.username),
+            name: normalized_auth_field(me.name),
         })),
         Err(error) => {
             *session
@@ -1031,11 +1026,50 @@ mod tests {
     }
 
     #[test]
-    fn blank_corporate_identity_fields_normalize_to_none() {
+    fn blank_identity_profile_fields_normalize_to_none() {
         assert_eq!(normalized_auth_field(Some("  ".to_owned())), None);
         assert_eq!(
             normalized_auth_field(Some(" seiler ".to_owned())),
             Some("seiler".to_owned())
+        );
+    }
+
+    #[test]
+    fn builderlab_auth_json_uses_username_and_name_fields() {
+        let exchange: LoginExchangeResponse = serde_json::from_value(serde_json::json!({
+            "session_credential": "credential",
+            "expires_at": "2099-01-01T00:00:00Z",
+            "username": "seiler",
+            "name": "Brad Seiler",
+        }))
+        .unwrap();
+        assert_eq!(exchange.username.as_deref(), Some("seiler"));
+        assert_eq!(exchange.name.as_deref(), Some("Brad Seiler"));
+
+        let me: AuthMeResponse = serde_json::from_value(serde_json::json!({
+            "email": "brad@example.com",
+            "expires_at": "2099-01-01T00:00:00Z",
+            "username": "seiler",
+            "name": "Brad Seiler",
+        }))
+        .unwrap();
+        assert_eq!(me.username.as_deref(), Some("seiler"));
+        assert_eq!(me.name.as_deref(), Some("Brad Seiler"));
+
+        let info = BuilderlabAuthInfo {
+            expires_at: "2099-01-01T00:00:00Z".to_owned(),
+            email: Some("brad@example.com".to_owned()),
+            username: Some("seiler".to_owned()),
+            name: Some("Brad Seiler".to_owned()),
+        };
+        assert_eq!(
+            serde_json::to_value(info).unwrap(),
+            serde_json::json!({
+                "email": "brad@example.com",
+                "expiresAt": "2099-01-01T00:00:00Z",
+                "username": "seiler",
+                "name": "Brad Seiler",
+            })
         );
     }
 

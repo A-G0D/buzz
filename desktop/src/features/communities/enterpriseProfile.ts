@@ -8,8 +8,8 @@ export type EnterpriseProfileSeed = {
 export function authoritativeEnterpriseProfile(
   auth: BuilderlabAuth | null | undefined,
 ): EnterpriseProfileSeed | null {
-  const username = auth?.corporateUsername?.trim() ?? "";
-  const displayName = auth?.corporateDisplayName?.trim() ?? "";
+  const username = auth?.username?.trim() ?? "";
+  const displayName = auth?.name?.trim() ?? "";
   if (!username || !displayName) return null;
   return { username, displayName };
 }

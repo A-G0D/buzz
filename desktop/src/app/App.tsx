@@ -575,9 +575,10 @@ function CommunityApp({
             !isTransactionStillConnecting(transactionRef.current, transactionId)
           )
             return;
+          profileCheckTransactionRef.current = null;
           communityOnboarding.update(
             {
-              stage: "profile",
+              stage: "corporate-profile",
               error:
                 error instanceof Error
                   ? error.message

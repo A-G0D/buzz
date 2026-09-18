@@ -231,9 +231,8 @@ type E2eConfig = {
     /** Builderlab account returned by hosted-community onboarding. Null/omitted = signed out. */
     builderlabAuth?: {
       email?: string;
-      name?: string;
-      corporateUsername?: string | null;
-      corporateDisplayName?: string | null;
+      username?: string | null;
+      name?: string | null;
       expiresAt: string;
     } | null;
     /** Optional policy returned by the native join-policy discovery command. */
