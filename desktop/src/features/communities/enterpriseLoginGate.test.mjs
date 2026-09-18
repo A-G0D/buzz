@@ -122,3 +122,68 @@ test("ensureEnterpriseLoginForRelay starts browser login when no valid session e
     restore();
   }
 });
+
+test("ensureEnterpriseLoginForRelay waits for explicit consent before browser login", async () => {
+  const calls = [];
+  let continueLogin;
+  const restore = installTauriInvoke(async (command, args) => {
+    calls.push([command, args]);
+    if (command === "enterprise_login_gate") return { status: "required" };
+    if (command === "get_builderlab_auth") return null;
+    if (command === "start_builderlab_login") {
+      return { expiresAt: "2026-09-18T21:00:00Z" };
+    }
+    throw new Error(`unexpected command: ${command}`);
+  });
+
+  try {
+    const pending = gate.ensureEnterpriseLoginForRelay("wss://relay.example", {
+      onEnterpriseLoginRequired: () =>
+        new Promise((resolve) => {
+          continueLogin = resolve;
+        }),
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.deepEqual(
+      calls.map(([command]) => command),
+      ["enterprise_login_gate", "get_builderlab_auth"],
+    );
+    continueLogin(true);
+    await pending;
+    assert.deepEqual(
+      calls.map(([command]) => command),
+      [
+        "enterprise_login_gate",
+        "get_builderlab_auth",
+        "start_builderlab_login",
+      ],
+    );
+  } finally {
+    restore();
+  }
+});
+
+test("ensureEnterpriseLoginForRelay does not open browser when consent is canceled", async () => {
+  const calls = [];
+  const restore = installTauriInvoke(async (command, args) => {
+    calls.push([command, args]);
+    if (command === "enterprise_login_gate") return { status: "required" };
+    if (command === "get_builderlab_auth") return null;
+    throw new Error(`unexpected command: ${command}`);
+  });
+
+  try {
+    await assert.rejects(
+      gate.ensureEnterpriseLoginForRelay("wss://relay.example", {
+        onEnterpriseLoginRequired: () => false,
+      }),
+      /Enterprise sign-in canceled/,
+    );
+    assert.deepEqual(
+      calls.map(([command]) => command),
+      ["enterprise_login_gate", "get_builderlab_auth"],
+    );
+  } finally {
+    restore();
+  }
+});

@@ -9,6 +9,8 @@ export const VALID_HOSTED_COMMUNITY_NAME = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 export type BuilderlabAuth = {
   email?: string;
   name?: string;
+  corporateUsername?: string | null;
+  corporateDisplayName?: string | null;
   expiresAt: string;
 };
 

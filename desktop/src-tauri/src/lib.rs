@@ -4,6 +4,8 @@ mod app_state;
 mod archive;
 mod build_identity;
 mod builderlab;
+#[cfg(test)]
+mod builderlab_api_config;
 mod channel_head_cache;
 mod commands;
 mod deep_link;

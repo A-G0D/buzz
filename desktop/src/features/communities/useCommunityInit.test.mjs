@@ -297,7 +297,7 @@ test("useCommunityInit blocks community apply when enterprise login gate fails",
 });
 
 test("useCommunityInit cancels an owned pending Builderlab login on superseded init", async () => {
-  const { cleanup, renderHook, waitFor } = await import(
+  const { cleanup, renderHook, waitFor, act } = await import(
     "@testing-library/react"
   );
   const { useCommunityInit } = await import("./useCommunityInit.ts");
@@ -341,6 +341,10 @@ test("useCommunityInit cancels an owned pending Builderlab login on superseded i
       { initialProps: { community: communityA, key: "community-a-key" } },
     );
 
+    await waitFor(() => assert.ok("enterpriseLogin" in hook.result.current));
+    await act(async () => {
+      hook.result.current.enterpriseLogin.onContinue();
+    });
     await waitFor(() => {
       assert.equal(
         calls.some(([command]) => command === "start_builderlab_login"),
@@ -378,6 +382,110 @@ test("useCommunityInit cancels an owned pending Builderlab login on superseded i
       ),
       false,
     );
+    hook.unmount();
+  } finally {
+    restore();
+    cleanup();
+    mock.reset();
+  }
+});
+
+test("useCommunityInit waits for explicit enterprise browser consent", async () => {
+  const { cleanup, renderHook, waitFor, act } = await import(
+    "@testing-library/react"
+  );
+  const { useCommunityInit } = await import("./useCommunityInit.ts");
+  const calls = [];
+  const restore = installTauriInvoke(async (command, args) => {
+    calls.push([command, args]);
+    if (command === "get_identity") {
+      return { pubkey: "pubkey-1", display_name: "Tester" };
+    }
+    if (command === "enterprise_login_gate") return { status: "required" };
+    if (command === "get_builderlab_auth") return null;
+    if (command === "start_builderlab_login") {
+      return { expiresAt: "2026-09-18T21:00:00Z" };
+    }
+    if (command === "apply_workspace") return null;
+    throw new Error(`unexpected command: ${command}`);
+  });
+
+  try {
+    const community = testCommunity({ name: "Block Buzz" });
+    const hook = renderHook(() =>
+      useCommunityInit(community, "community-key", false, true),
+    );
+
+    await waitFor(() => assert.ok("enterpriseLogin" in hook.result.current));
+    assert.equal(
+      hook.result.current.enterpriseLogin.communityName,
+      "Block Buzz",
+    );
+    assert.deepEqual(
+      calls.map(([command]) => command),
+      ["get_identity", "enterprise_login_gate", "get_builderlab_auth"],
+    );
+
+    await act(async () => {
+      hook.result.current.enterpriseLogin.onContinue();
+    });
+    await waitFor(() => assert.equal(hook.result.current.isReady, true));
+
+    assert.deepEqual(
+      calls.map(([command]) => command),
+      [
+        "get_identity",
+        "enterprise_login_gate",
+        "get_builderlab_auth",
+        "start_builderlab_login",
+        "apply_workspace",
+      ],
+    );
+    hook.unmount();
+  } finally {
+    restore();
+    cleanup();
+    mock.reset();
+  }
+});
+
+test("useCommunityInit exposes authoritative enterprise profile when both corporate fields are present", async () => {
+  const { cleanup, renderHook, waitFor, act } = await import(
+    "@testing-library/react"
+  );
+  const { useCommunityInit } = await import("./useCommunityInit.ts");
+  const calls = [];
+  const restore = installTauriInvoke(async (command, args) => {
+    calls.push([command, args]);
+    if (command === "get_identity") {
+      return { pubkey: "pubkey-1", display_name: "Tester" };
+    }
+    if (command === "enterprise_login_gate") return { status: "required" };
+    if (command === "get_builderlab_auth") return null;
+    if (command === "start_builderlab_login") {
+      return {
+        expiresAt: "2026-09-18T21:00:00Z",
+        corporateUsername: " seiler ",
+        corporateDisplayName: " Brad Seiler ",
+      };
+    }
+    if (command === "apply_workspace") return null;
+    throw new Error(`unexpected command: ${command}`);
+  });
+
+  try {
+    const hook = renderHook(() =>
+      useCommunityInit(testCommunity(), "community-key", false, true),
+    );
+    await waitFor(() => assert.ok("enterpriseLogin" in hook.result.current));
+    await act(async () => {
+      hook.result.current.enterpriseLogin.onContinue();
+    });
+    await waitFor(() => assert.equal(hook.result.current.isReady, true));
+    assert.deepEqual(hook.result.current.enterpriseProfile, {
+      username: "seiler",
+      displayName: "Brad Seiler",
+    });
     hook.unmount();
   } finally {
     restore();

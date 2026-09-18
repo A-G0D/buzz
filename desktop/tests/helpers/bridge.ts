@@ -162,7 +162,13 @@ type MockBridgeOptions = {
   /** Native-like huddle state seeded from authoritative role-bearing membership. */
   huddle?: MockHuddleSeed;
   /** Builderlab account returned by hosted-community onboarding. Null/omitted = signed out. */
-  builderlabAuth?: { email?: string; name?: string; expiresAt: string } | null;
+  builderlabAuth?: {
+    email?: string;
+    name?: string;
+    corporateUsername?: string | null;
+    corporateDisplayName?: string | null;
+    expiresAt: string;
+  } | null;
   /** Optional policy returned by the native join-policy discovery command. */
   joinPolicy?: {
     terms_markdown?: string;

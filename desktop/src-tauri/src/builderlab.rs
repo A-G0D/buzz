@@ -16,7 +16,6 @@ use tauri_plugin_opener::OpenerExt;
 use tokio::{net::TcpListener, sync::oneshot};
 use url::Url;
 
-const BUILDERLAB_API_BASE_URL: &str = "https://app.builderlab.xyz/api/goose";
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const ENTERPRISE_LOGIN_ATTEMPT_PREFIX: &str = "enterprise-login-";
 const CANCELED_LOGIN_ATTEMPT_TOMBSTONE_LIMIT: usize = 64;
@@ -25,7 +24,6 @@ const BB_SESSION_CREDENTIAL_HEADER: &str = "X-BB-Session-Credential";
 // attach this automatically; the desktop reqwest client must set it explicitly
 // or challenge/verify fail with `invalid_origin`. It also seeds the challenge
 // body's `origin` field so both agree.
-const BUILDERLAB_ORIGIN: &str = "https://app.builderlab.xyz";
 const AUTH_COMPLETE_HTML: &str = r#"<!doctype html>
 <html lang="en">
 <head>
@@ -170,6 +168,8 @@ struct StoredSession {
 struct LoginExchangeResponse {
     session_credential: String,
     expires_at: String,
+    corporate_username: Option<String>,
+    corporate_display_name: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -178,6 +178,8 @@ pub(crate) struct BuilderlabAuthInfo {
     expires_at: String,
     email: Option<String>,
     name: Option<String>,
+    corporate_username: Option<String>,
+    corporate_display_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -185,6 +187,8 @@ struct AuthMeResponse {
     email: Option<String>,
     name: Option<String>,
     expires_at: String,
+    corporate_username: Option<String>,
+    corporate_display_name: Option<String>,
 }
 
 struct CallbackState {
@@ -221,8 +225,19 @@ async fn login_callback(
     Html(AUTH_COMPLETE_HTML).into_response()
 }
 
+fn builderlab_api_base_url() -> &'static str {
+    option_env!("BUZZ_DESKTOP_BUILD_BUILDERLAB_API_BASE_URL")
+        .unwrap_or("https://app.builderlab.xyz/api/goose")
+}
+
+fn builderlab_origin() -> Result<String, String> {
+    let url = Url::parse(builderlab_api_base_url())
+        .map_err(|error| format!("invalid Builderlab API URL: {error}"))?;
+    Ok(url.origin().ascii_serialization())
+}
+
 fn api_url(path: &str) -> Result<Url, String> {
-    Url::parse(&format!("{BUILDERLAB_API_BASE_URL}{path}"))
+    Url::parse(&format!("{}{}", builderlab_api_base_url(), path))
         .map_err(|error| format!("invalid Builderlab API URL: {error}"))
 }
 
@@ -522,6 +537,10 @@ pub(crate) async fn start_builderlab_login(
         expires_at: me.expires_at.clone(),
         email: me.email,
         name: me.name,
+        corporate_username: normalized_auth_field(me.corporate_username)
+            .or_else(|| normalized_auth_field(exchanged.corporate_username)),
+        corporate_display_name: normalized_auth_field(me.corporate_display_name)
+            .or_else(|| normalized_auth_field(exchanged.corporate_display_name)),
     };
     commit_builderlab_login_session(&login, &session, &login_id, exchanged.session_credential)?;
     Ok(info)
@@ -546,6 +565,8 @@ pub(crate) async fn get_builderlab_auth(
             expires_at: me.expires_at,
             email: me.email,
             name: me.name,
+            corporate_username: normalized_auth_field(me.corporate_username),
+            corporate_display_name: normalized_auth_field(me.corporate_display_name),
         })),
         Err(error) => {
             *session
@@ -555,6 +576,12 @@ pub(crate) async fn get_builderlab_auth(
             Err(error)
         }
     }
+}
+
+fn normalized_auth_field(value: Option<String>) -> Option<String> {
+    let value = value?;
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
 }
 
 fn cancel_builderlab_login_attempt(
@@ -620,7 +647,7 @@ async fn authenticated_json(
     let response = client
         .request(method, api_url(path)?)
         .header(BB_SESSION_CREDENTIAL_HEADER, credential)
-        .header(reqwest::header::ORIGIN, BUILDERLAB_ORIGIN)
+        .header(reqwest::header::ORIGIN, builderlab_origin()?)
         .json(&body)
         .timeout(Duration::from_secs(60))
         .send()
@@ -670,7 +697,7 @@ pub(crate) async fn bind_builderlab_nostr_identity(
         &session,
         reqwest::Method::POST,
         "/v1/buzz/nostr-identities/challenge",
-        serde_json::json!({ "origin": BUILDERLAB_ORIGIN }),
+        serde_json::json!({ "origin": builderlab_origin()? }),
     )
     .await?;
     // A structured error here (e.g. missing_mapping) arrives as an object with an
@@ -1001,6 +1028,15 @@ mod tests {
             "https://app.builderlab.xyz"
         );
         assert_eq!(login.path(), "/api/goose/v1/auth/login");
+    }
+
+    #[test]
+    fn blank_corporate_identity_fields_normalize_to_none() {
+        assert_eq!(normalized_auth_field(Some("  ".to_owned())), None);
+        assert_eq!(
+            normalized_auth_field(Some(" seiler ".to_owned())),
+            Some("seiler".to_owned())
+        );
     }
 
     #[test]

@@ -232,6 +232,8 @@ type E2eConfig = {
     builderlabAuth?: {
       email?: string;
       name?: string;
+      corporateUsername?: string | null;
+      corporateDisplayName?: string | null;
       expiresAt: string;
     } | null;
     /** Optional policy returned by the native join-policy discovery command. */
@@ -6863,6 +6865,7 @@ async function handleGetProfile(config: E2eConfig | undefined) {
 async function handleUpdateProfile(
   args: {
     displayName?: string;
+    name?: string;
     avatarUrl?: string;
     about?: string;
     nip05Handle?: string;
@@ -6887,10 +6890,12 @@ async function handleUpdateProfile(
 
     const profile = ensureMockProfile(config);
     const hasDisplayNameUpdate = typeof args.displayName === "string";
+    const hasNameUpdate = typeof args.name === "string";
     const hasAvatarUrlUpdate = typeof args.avatarUrl === "string";
     const hasAboutUpdate = typeof args.about === "string";
     const hasNip05HandleUpdate = typeof args.nip05Handle === "string";
     const nextDisplayName = args.displayName?.trim() ?? "";
+    const nextName = args.name?.trim() ?? "";
     const nextAvatarUrl = args.avatarUrl?.trim() ?? "";
     const nextAbout = args.about?.trim() ?? "";
     const nextNip05Handle = args.nip05Handle?.trim() ?? "";
@@ -6898,6 +6903,9 @@ async function handleUpdateProfile(
     if (hasDisplayNameUpdate && nextDisplayName !== profile.display_name) {
       profile.display_name = nextDisplayName || null;
       applyMockDisplayName(profile.pubkey, profile.display_name);
+    }
+    if (hasNameUpdate && nextName !== profile.name) {
+      profile.name = nextName || null;
     }
     if (hasAvatarUrlUpdate && nextAvatarUrl !== profile.avatar_url) {
       profile.avatar_url = nextAvatarUrl || null;
@@ -6921,7 +6929,7 @@ async function handleUpdateProfile(
     : {};
   const profileContent = JSON.stringify({
     display_name: args.displayName ?? currentContent.display_name ?? undefined,
-    name: currentContent.display_name ?? undefined,
+    name: args.name ?? currentContent.name ?? undefined,
     picture: args.avatarUrl ?? currentContent.picture ?? undefined,
     about: args.about ?? currentContent.about ?? undefined,
     nip05: args.nip05Handle ?? currentContent.nip05 ?? undefined,

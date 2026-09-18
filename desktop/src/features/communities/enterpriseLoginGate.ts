@@ -25,6 +25,7 @@ export async function enterpriseLoginGate(
 export type EnsureEnterpriseLoginOptions = {
   loginAttemptId?: string;
   onBrowserLoginStarted?: () => void;
+  onEnterpriseLoginRequired?: () => Promise<boolean> | boolean;
 };
 
 export async function ensureEnterpriseLoginForRelay(
@@ -44,6 +45,11 @@ export async function ensureEnterpriseLoginForRelay(
   } catch {
     // Invalid/expired in-memory credentials are cleared by the native command.
     // Fall through to a fresh browser login.
+  }
+
+  const mayContinue = await options?.onEnterpriseLoginRequired?.();
+  if (mayContinue === false) {
+    throw new Error("Enterprise sign-in canceled");
   }
 
   options?.onBrowserLoginStarted?.();
