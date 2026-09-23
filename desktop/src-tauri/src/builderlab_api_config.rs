@@ -23,7 +23,16 @@ pub(crate) fn validate_api_base_url(raw: &str, kind: ApiBaseUrlKind) -> Result<S
     let url =
         url::Url::parse(trimmed).map_err(|error| format!("{env} is not a valid URL: {error}"))?;
     match url.scheme() {
-        "https" | "http" => {}
+        "https" => {}
+        "http" => {
+            if matches!(kind, ApiBaseUrlKind::EnterpriseAuthAdapter)
+                && !url.host().is_some_and(is_loopback_host)
+            {
+                return Err(format!(
+                    "{env} must use https:// unless it points to localhost, 127.0.0.0/8, or ::1 for local development"
+                ));
+            }
+        }
         _ => {
             return Err(format!("{env} must use http:// or https://"));
         }
@@ -38,6 +47,14 @@ pub(crate) fn validate_api_base_url(raw: &str, kind: ApiBaseUrlKind) -> Result<S
         return Err(format!("{env} must not include a query or fragment"));
     }
     Ok(trimmed.to_owned())
+}
+
+fn is_loopback_host(host: url::Host<&str>) -> bool {
+    match host {
+        url::Host::Domain(domain) => domain.eq_ignore_ascii_case("localhost"),
+        url::Host::Ipv4(addr) => addr.is_loopback(),
+        url::Host::Ipv6(addr) => addr.is_loopback(),
+    }
 }
 
 pub(crate) fn validate_builderlab_api_base_url(raw: &str) -> Result<String, String> {
@@ -115,6 +132,67 @@ mod tests {
             )
             .unwrap(),
             Some("https://identity.example/buzz-auth".to_owned()),
+        );
+    }
+
+    #[test]
+    fn enterprise_adapter_base_url_rejects_remote_plaintext_http() {
+        for raw in [
+            "http://identity.example/buzz-auth",
+            "http://192.0.2.10/buzz-auth",
+            "http://[2001:db8::1]/buzz-auth",
+        ] {
+            let error = resolve_enterprise_auth_adapter_base_url(
+                Some(raw),
+                Some("wss://buzz.block.example"),
+            )
+            .expect_err("remote plaintext adapter URLs must fail closed");
+
+            assert!(error.contains("must use https://"), "{raw:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn enterprise_adapter_base_url_allows_plaintext_loopback_for_development() {
+        for (raw, expected) in [
+            (
+                "http://localhost:8787/buzz-auth/",
+                "http://localhost:8787/buzz-auth",
+            ),
+            (
+                "http://LOCALHOST:8787/buzz-auth/",
+                "http://LOCALHOST:8787/buzz-auth",
+            ),
+            (
+                "http://127.0.0.1:8787/buzz-auth/",
+                "http://127.0.0.1:8787/buzz-auth",
+            ),
+            (
+                "http://127.42.0.9:8787/buzz-auth/",
+                "http://127.42.0.9:8787/buzz-auth",
+            ),
+            (
+                "http://[::1]:8787/buzz-auth/",
+                "http://[::1]:8787/buzz-auth",
+            ),
+        ] {
+            assert_eq!(
+                resolve_enterprise_auth_adapter_base_url(
+                    Some(raw),
+                    Some("wss://buzz.block.example"),
+                )
+                .unwrap(),
+                Some(expected.to_owned()),
+                "{raw:?} should be accepted as loopback development HTTP",
+            );
+        }
+    }
+
+    #[test]
+    fn builderlab_api_base_url_still_allows_remote_plaintext_http() {
+        assert_eq!(
+            validate_builderlab_api_base_url("http://builderlab.example/api/goose/").unwrap(),
+            "http://builderlab.example/api/goose",
         );
     }
 

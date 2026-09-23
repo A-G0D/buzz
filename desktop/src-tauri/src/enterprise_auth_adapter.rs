@@ -187,6 +187,17 @@ fn bearer_value(token: &str) -> String {
     format!("Bearer {token}")
 }
 
+fn clear_enterprise_session_if_token_matches(
+    session: &EnterpriseAuthSession,
+    token: &str,
+) -> Result<(), String> {
+    let mut stored = session.0.lock().map_err(|error| error.to_string())?;
+    if stored.as_ref().is_some_and(|stored| stored.token == token) {
+        *stored = None;
+    }
+    Ok(())
+}
+
 fn remember_canceled_attempt(state: &mut EnterpriseAuthLoginState, attempt_id: String) {
     if state
         .canceled_attempts
@@ -522,10 +533,7 @@ pub(crate) async fn get_enterprise_auth(
     match authenticated_enterprise_user(&app_state.http_client, &token).await {
         Ok(session_response) => Ok(Some(auth_info_from_session(session_response))),
         Err(error) => {
-            *session
-                .0
-                .lock()
-                .map_err(|lock_error| lock_error.to_string())? = None;
+            clear_enterprise_session_if_token_matches(&session, &token)?;
             Err(error)
         }
     }
@@ -650,6 +658,31 @@ mod tests {
         );
         assert!(request.headers().get("X-BB-Session-Credential").is_none());
         assert!(request.headers().get("Nostr-Federated-Identity").is_none());
+    }
+
+    #[test]
+    fn stale_session_check_failure_only_clears_the_token_it_checked() {
+        let session = EnterpriseAuthSession::default();
+        *session.0.lock().unwrap() = Some(StoredSession {
+            token: "old-token".to_owned(),
+        });
+
+        clear_enterprise_session_if_token_matches(&session, "old-token").unwrap();
+        assert!(session.0.lock().unwrap().is_none());
+
+        *session.0.lock().unwrap() = Some(StoredSession {
+            token: "fresh-token".to_owned(),
+        });
+        clear_enterprise_session_if_token_matches(&session, "old-token").unwrap();
+        assert_eq!(
+            session
+                .0
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|stored| stored.token.as_str()),
+            Some("fresh-token"),
+        );
     }
 
     #[test]

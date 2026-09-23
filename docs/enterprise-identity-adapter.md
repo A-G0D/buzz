@@ -17,8 +17,10 @@ Enterprise builds set:
 
 - `BUZZ_BUILD_ENTERPRISE_AUTH_RELAYS`: comma-separated allowlist of relay URLs
   for which Desktop will honor NIP-FI enterprise login.
-- `BUZZ_BUILD_ENTERPRISE_AUTH_ADAPTER_BASE_URL`: HTTPS/HTTP base URL of the
-  adapter implementing this document. Required when the relay allowlist is set.
+- `BUZZ_BUILD_ENTERPRISE_AUTH_ADAPTER_BASE_URL`: base URL of the adapter
+  implementing this document. Remote adapter URLs must use HTTPS. Plaintext
+  HTTP is accepted only for loopback development hosts (`localhost`,
+  `127.0.0.0/8`, or `::1`). Required when the relay allowlist is set.
 - `BUZZ_BUILD_ENTERPRISE_PROFILE_PROJECTION`: optional `1`/`true` opt-in. When
   unset, adapter identity fields are private login state only and are never
   projected into a public Nostr profile.
