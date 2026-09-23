@@ -17,7 +17,7 @@ use tokio::{net::TcpListener, sync::oneshot};
 use url::Url;
 
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
-const ENTERPRISE_LOGIN_ATTEMPT_PREFIX: &str = "enterprise-login-";
+const BUILDERLAB_LOGIN_ATTEMPT_PREFIX: &str = "builderlab-login-";
 const CANCELED_LOGIN_ATTEMPT_TOMBSTONE_LIMIT: usize = 64;
 const BB_SESSION_CREDENTIAL_HEADER: &str = "X-BB-Session-Credential";
 // Builderlab enforces an Origin check on the identity bind endpoints. Browsers
@@ -249,6 +249,10 @@ fn login_url(return_to: &str) -> Result<Url, String> {
     Ok(login_url)
 }
 
+fn login_exchange_body(code: &str) -> serde_json::Value {
+    serde_json::json!({ "code": code })
+}
+
 fn remember_canceled_attempt(state: &mut BuilderlabLoginState, attempt_id: String) {
     if state
         .canceled_attempts
@@ -286,18 +290,18 @@ fn register_pending_builderlab_login(
     login: &BuilderlabLogin,
     login_id: &str,
     cancel: oneshot::Sender<()>,
-    is_enterprise_attempt: bool,
+    is_guarded_attempt: bool,
 ) -> Result<bool, String> {
     let mut state = login.0.lock().map_err(|error| error.to_string())?;
-    if is_enterprise_attempt && is_canceled_attempt(&state, login_id) {
+    if is_guarded_attempt && is_canceled_attempt(&state, login_id) {
         return Ok(false);
     }
     if state.pending.is_some() {
-        if is_enterprise_attempt
+        if is_guarded_attempt
             && !state
                 .pending
                 .as_ref()
-                .is_some_and(|pending| pending.id.starts_with(ENTERPRISE_LOGIN_ATTEMPT_PREFIX))
+                .is_some_and(|pending| pending.id.starts_with(BUILDERLAB_LOGIN_ATTEMPT_PREFIX))
         {
             return Err("Builderlab authentication is already in progress".to_owned());
         }
@@ -412,10 +416,9 @@ pub(crate) async fn start_builderlab_login(
     let login_id = attempt_id
         .clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let is_enterprise_attempt = attempt_id.is_some();
+    let is_guarded_attempt = attempt_id.is_some();
     let (cancel_sender, mut cancel_receiver) = oneshot::channel();
-    match register_pending_builderlab_login(&login, &login_id, cancel_sender, is_enterprise_attempt)
-    {
+    match register_pending_builderlab_login(&login, &login_id, cancel_sender, is_guarded_attempt) {
         Ok(true) => {}
         Ok(false) => {
             server.abort();
@@ -488,7 +491,7 @@ pub(crate) async fn start_builderlab_login(
     let response = match app_state
         .http_client
         .post(exchange_url)
-        .json(&serde_json::json!({ "code": exchange_code }))
+        .json(&login_exchange_body(&exchange_code))
         .timeout(Duration::from_secs(30))
         .send()
         .await
@@ -867,13 +870,13 @@ mod tests {
     }
 
     #[test]
-    fn cancel_before_registration_tombstones_enterprise_attempt() {
+    fn cancel_before_registration_tombstones_builderlab_attempt() {
         let login = BuilderlabLogin::default();
-        assert!(!cancel_builderlab_login_attempt(&login, Some("enterprise-login-a")).unwrap());
+        assert!(!cancel_builderlab_login_attempt(&login, Some("builderlab-login-a")).unwrap());
 
         let (cancel, _receiver) = oneshot::channel();
         assert!(
-            !register_pending_builderlab_login(&login, "enterprise-login-a", cancel, true,)
+            !register_pending_builderlab_login(&login, "builderlab-login-a", cancel, true,)
                 .unwrap()
         );
         assert!(login.0.lock().unwrap().pending.is_none());
@@ -902,7 +905,7 @@ mod tests {
     fn canceled_attempt_tombstones_are_bounded() {
         let login = BuilderlabLogin::default();
         for index in 0..(CANCELED_LOGIN_ATTEMPT_TOMBSTONE_LIMIT + 5) {
-            let attempt_id = format!("enterprise-login-{index}");
+            let attempt_id = format!("builderlab-login-{index}");
             assert!(!cancel_builderlab_login_attempt(&login, Some(&attempt_id)).unwrap());
         }
 
@@ -913,7 +916,7 @@ mod tests {
         );
         assert_eq!(
             state.canceled_attempts.front().map(String::as_str),
-            Some("enterprise-login-5"),
+            Some("builderlab-login-5"),
         );
     }
 
@@ -923,14 +926,14 @@ mod tests {
         let session = BuilderlabSession::default();
         let (cancel, _receiver) = oneshot::channel();
         login.0.lock().unwrap().pending = Some(PendingLogin {
-            id: "enterprise-login-new".to_owned(),
+            id: "builderlab-login-new".to_owned(),
             cancel,
         });
 
         let result = commit_builderlab_login_session(
             &login,
             &session,
-            "enterprise-login-old",
+            "builderlab-login-old",
             "stale-credential".to_owned(),
         );
 
@@ -944,7 +947,7 @@ mod tests {
                 .pending
                 .as_ref()
                 .map(|pending| pending.id.as_str()),
-            Some("enterprise-login-new"),
+            Some("builderlab-login-new"),
         );
     }
 
@@ -954,14 +957,14 @@ mod tests {
         let session = BuilderlabSession::default();
         let (cancel, _receiver) = oneshot::channel();
         login.0.lock().unwrap().pending = Some(PendingLogin {
-            id: "enterprise-login-a".to_owned(),
+            id: "builderlab-login-a".to_owned(),
             cancel,
         });
 
         commit_builderlab_login_session_with_hook(
             &login,
             &session,
-            "enterprise-login-a",
+            "builderlab-login-a",
             "fresh-credential".to_owned(),
             || {
                 assert!(
@@ -1085,5 +1088,15 @@ mod tests {
             Some("http://127.0.0.1:1234/callback/nonce")
         );
         assert!(!query.contains_key("screen_hint"));
+        assert!(!query.contains_key("handoff_challenge"));
+        assert!(!query.contains_key("handoff_challenge_method"));
+    }
+
+    #[test]
+    fn builderlab_login_exchange_remains_bare_code_without_handoff_secret() {
+        assert_eq!(
+            login_exchange_body("callback-code"),
+            serde_json::json!({ "code": "callback-code" })
+        );
     }
 }

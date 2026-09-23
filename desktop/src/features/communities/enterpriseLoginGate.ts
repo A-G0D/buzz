@@ -1,5 +1,8 @@
-import type { BuilderlabAuth } from "./hostedCommunityApi";
-import { getBuilderlabAuth, startBuilderlabLogin } from "./hostedCommunityApi";
+import type { EnterpriseAuth } from "./enterpriseAuthApi";
+import {
+  getEnterpriseAuth,
+  startEnterpriseAuthLogin,
+} from "./enterpriseAuthApi";
 import { invokeTauri } from "@/shared/api/tauri";
 
 export type EnterpriseLoginGateStatus =
@@ -31,14 +34,14 @@ export type EnsureEnterpriseLoginOptions = {
 export async function ensureEnterpriseLoginForRelay(
   relayUrl: string,
   options?: EnsureEnterpriseLoginOptions,
-): Promise<BuilderlabAuth | null> {
+): Promise<EnterpriseAuth | null> {
   const gate = await enterpriseLoginGate(relayUrl);
   if (gate.status === "notRequired") {
     return null;
   }
 
   try {
-    const auth = await getBuilderlabAuth();
+    const auth = await getEnterpriseAuth();
     if (auth !== null) {
       return auth;
     }
@@ -53,7 +56,7 @@ export async function ensureEnterpriseLoginForRelay(
   }
 
   options?.onBrowserLoginStarted?.();
-  return startBuilderlabLogin(
+  return startEnterpriseAuthLogin(
     options?.loginAttemptId ? { attemptId: options.loginAttemptId } : undefined,
   );
 }

@@ -46,7 +46,7 @@ import { clearMarkdownNodeCache } from "@/shared/ui/markdown/nodeCache";
 import { ensureEnterpriseLoginForRelay } from "./enterpriseLoginGate";
 import { authoritativeEnterpriseProfile } from "./enterpriseProfile";
 import type { EnterpriseProfileSeed } from "./enterpriseProfile";
-import { cancelBuilderlabLogin } from "./hostedCommunityApi";
+import { cancelEnterpriseAuthLogin } from "./enterpriseAuthApi";
 import { resetMessageLinkMetadataCache } from "@/shared/ui/markdown/useMessageLinkMetadata";
 import { resetVideoPlayerState } from "@/shared/ui/videoPlayerState";
 
@@ -363,7 +363,7 @@ export function useCommunityInit(
         }
       }
       enterpriseProfileRef.current = null;
-      const enterpriseLoginAttemptId = `enterprise-login-${
+      const enterpriseLoginAttemptId = `enterprise-auth-${
         globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`
       }`;
       try {
@@ -508,7 +508,7 @@ export function useCommunityInit(
         resolveEnterpriseLogin(false);
       }
       if (ownedEnterpriseLoginAttemptId !== null) {
-        void cancelBuilderlabLogin({
+        void cancelEnterpriseAuthLogin({
           attemptId: ownedEnterpriseLoginAttemptId,
         }).catch(() => {
           // Best-effort cleanup for a browser login this hook invocation owns.

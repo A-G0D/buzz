@@ -10,6 +10,7 @@ mod channel_head_cache;
 mod commands;
 mod deep_link;
 mod egress_guard;
+mod enterprise_auth_adapter;
 mod event_sync;
 mod events;
 #[cfg_attr(not(test), allow(dead_code))]
@@ -69,6 +70,7 @@ use deep_link::{
     take_pending_navigation_deep_link, PendingCommunityDeepLinks, PendingEntityDeepLinks,
     PendingNavigationDeepLinks,
 };
+use enterprise_auth_adapter::*;
 use huddle::{
     add_agent_to_huddle,
     audio_output::{get_audio_output_device, list_audio_output_devices, set_audio_output_device},
@@ -232,6 +234,8 @@ pub fn run() {
         .manage(PendingEntityDeepLinks::default())
         .manage(BuilderlabSession::default())
         .manage(BuilderlabLogin::default())
+        .manage(EnterpriseAuthSession::default())
+        .manage(EnterpriseAuthLogin::default())
         .manage(commands::pairing::PairingHandle::new())
         .manage(terminal_runtime::TerminalSessions::default())
         .manage(archive::sync::ArchiveSyncState::default())
@@ -549,6 +553,10 @@ pub fn run() {
             cancel_builderlab_login,
             get_builderlab_auth,
             clear_builderlab_auth,
+            start_enterprise_auth_login,
+            cancel_enterprise_auth_login,
+            get_enterprise_auth,
+            clear_enterprise_auth,
             get_builderlab_nostr_identity,
             bind_builderlab_nostr_identity,
             delete_builderlab_nostr_identity,

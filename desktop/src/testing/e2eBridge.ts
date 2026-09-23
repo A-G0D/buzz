@@ -228,6 +228,17 @@ type E2eConfig = {
     projectRepoSnapshotDelayMs?: number;
     /** Enterprise login gate result for the selected relay. Defaults to not required. */
     enterpriseLoginGate?: { status: "notRequired" } | { status: "required" };
+    /** Enterprise adapter account returned by the provider-neutral login contract. Null/omitted = signed out. */
+    enterpriseAuth?: {
+      email?: string | null;
+      expiresAt: string;
+      profileProjection?: {
+        username: string;
+        displayName: string;
+      } | null;
+    } | null;
+    /** Delay enterprise adapter login completion so cancellation/retry UI can be tested. */
+    enterpriseLoginDelayMs?: number;
     /** Builderlab account returned by hosted-community onboarding. Null/omitted = signed out. */
     builderlabAuth?: {
       email?: string;
@@ -12546,6 +12557,24 @@ export function maybeInstallE2eTauriMocks() {
         return (
           activeConfig?.mock?.enterpriseLoginGate ?? { status: "notRequired" }
         );
+      case "get_enterprise_auth":
+        return activeConfig?.mock?.enterpriseAuth ?? null;
+      case "start_enterprise_auth_login": {
+        const delayMs = activeConfig?.mock?.enterpriseLoginDelayMs ?? 0;
+        if (delayMs > 0)
+          await new Promise((resolve) => window.setTimeout(resolve, delayMs));
+        const nextAuth = activeConfig?.mock?.enterpriseAuth ?? {
+          email: "employee@example.com",
+          expiresAt: "2099-01-01T00:00:00Z",
+        };
+        if (activeConfig?.mock) activeConfig.mock.enterpriseAuth = nextAuth;
+        return nextAuth;
+      }
+      case "cancel_enterprise_auth_login":
+        return null;
+      case "clear_enterprise_auth":
+        if (activeConfig?.mock) activeConfig.mock.enterpriseAuth = null;
+        return null;
       case "get_builderlab_auth":
         return activeConfig?.mock?.builderlabAuth ?? null;
       case "start_builderlab_login": {

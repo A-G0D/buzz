@@ -202,7 +202,7 @@ test("useCommunityInit blocks community apply when enterprise login gate fails",
   }
 });
 
-test("useCommunityInit cancels an owned pending Builderlab login on superseded init", async () => {
+test("useCommunityInit cancels an owned pending enterprise authentication login on superseded init", async () => {
   const { cleanup, renderHook, waitFor, act } = await import(
     "@testing-library/react"
   );
@@ -227,13 +227,13 @@ test("useCommunityInit cancels an owned pending Builderlab login on superseded i
         ? { status: "required" }
         : { status: "notRequired" };
     }
-    if (command === "get_builderlab_auth") {
+    if (command === "get_enterprise_auth") {
       return null;
     }
-    if (command === "start_builderlab_login") {
+    if (command === "start_enterprise_auth_login") {
       return neverSettles();
     }
-    if (command === "cancel_builderlab_login") {
+    if (command === "cancel_enterprise_auth_login") {
       return null;
     }
     if (command === "apply_workspace") {
@@ -254,12 +254,12 @@ test("useCommunityInit cancels an owned pending Builderlab login on superseded i
     });
     await waitFor(() => {
       assert.equal(
-        calls.some(([command]) => command === "start_builderlab_login"),
+        calls.some(([command]) => command === "start_enterprise_auth_login"),
         true,
       );
     });
     const startCall = calls.find(
-      ([command]) => command === "start_builderlab_login",
+      ([command]) => command === "start_enterprise_auth_login",
     );
     assert.equal(typeof startCall?.[1]?.attemptId, "string");
 
@@ -267,7 +267,7 @@ test("useCommunityInit cancels an owned pending Builderlab login on superseded i
 
     await waitFor(() => assert.equal(hook.result.current.isReady, true));
     const cancelIndex = calls.findIndex(
-      ([command]) => command === "cancel_builderlab_login",
+      ([command]) => command === "cancel_enterprise_auth_login",
     );
     const applyIndex = calls.findIndex(
       ([command, args]) =>
@@ -278,7 +278,7 @@ test("useCommunityInit cancels an owned pending Builderlab login on superseded i
     assert.notEqual(applyIndex, -1);
     assert.ok(cancelIndex < applyIndex);
     assert.deepEqual(calls[cancelIndex], [
-      "cancel_builderlab_login",
+      "cancel_enterprise_auth_login",
       { attemptId: startCall[1].attemptId },
     ]);
     assert.equal(
@@ -310,8 +310,8 @@ test("useCommunityInit waits for explicit enterprise browser consent", async () 
     }
     if (command === "set_agent_avatar_communities") return null;
     if (command === "enterprise_login_gate") return { status: "required" };
-    if (command === "get_builderlab_auth") return null;
-    if (command === "start_builderlab_login") {
+    if (command === "get_enterprise_auth") return null;
+    if (command === "start_enterprise_auth_login") {
       return { expiresAt: "2026-09-18T21:00:00Z" };
     }
     if (command === "apply_workspace") return null;
@@ -335,7 +335,7 @@ test("useCommunityInit waits for explicit enterprise browser consent", async () 
         "get_identity",
         "set_agent_avatar_communities",
         "enterprise_login_gate",
-        "get_builderlab_auth",
+        "get_enterprise_auth",
       ],
     );
 
@@ -350,8 +350,8 @@ test("useCommunityInit waits for explicit enterprise browser consent", async () 
         "get_identity",
         "set_agent_avatar_communities",
         "enterprise_login_gate",
-        "get_builderlab_auth",
-        "start_builderlab_login",
+        "get_enterprise_auth",
+        "start_enterprise_auth_login",
         "apply_workspace",
       ],
     );
@@ -376,12 +376,14 @@ test("useCommunityInit exposes authoritative enterprise profile when both identi
     }
     if (command === "set_agent_avatar_communities") return null;
     if (command === "enterprise_login_gate") return { status: "required" };
-    if (command === "get_builderlab_auth") return null;
-    if (command === "start_builderlab_login") {
+    if (command === "get_enterprise_auth") return null;
+    if (command === "start_enterprise_auth_login") {
       return {
         expiresAt: "2026-09-18T21:00:00Z",
-        username: " seiler ",
-        name: " Brad Seiler ",
+        profileProjection: {
+          username: " seiler ",
+          displayName: " Brad Seiler ",
+        },
       };
     }
     if (command === "apply_workspace") return null;

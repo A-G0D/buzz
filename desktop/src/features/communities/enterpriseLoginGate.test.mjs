@@ -37,7 +37,7 @@ test("enterpriseLoginGate forwards the selected relay URL to native discovery", 
   }
 });
 
-test("ensureEnterpriseLoginForRelay skips Builderlab when enterprise login is not required", async () => {
+test("ensureEnterpriseLoginForRelay skips enterprise auth when enterprise login is not required", async () => {
   const calls = [];
   const restore = installTauriInvoke(async (command, args) => {
     calls.push([command, args]);
@@ -58,7 +58,7 @@ test("ensureEnterpriseLoginForRelay skips Builderlab when enterprise login is no
   }
 });
 
-test("ensureEnterpriseLoginForRelay reuses an existing Builderlab session", async () => {
+test("ensureEnterpriseLoginForRelay reuses an existing enterprise auth session", async () => {
   const auth = {
     email: "person@example.com",
     expiresAt: "2026-09-17T17:00:00Z",
@@ -67,7 +67,7 @@ test("ensureEnterpriseLoginForRelay reuses an existing Builderlab session", asyn
   const restore = installTauriInvoke(async (command, args) => {
     calls.push([command, args]);
     if (command === "enterprise_login_gate") return { status: "required" };
-    if (command === "get_builderlab_auth") return auth;
+    if (command === "get_enterprise_auth") return auth;
     throw new Error(`unexpected command: ${command}`);
   });
 
@@ -78,7 +78,7 @@ test("ensureEnterpriseLoginForRelay reuses an existing Builderlab session", asyn
     );
     assert.deepEqual(
       calls.map(([command]) => command),
-      ["enterprise_login_gate", "get_builderlab_auth"],
+      ["enterprise_login_gate", "get_enterprise_auth"],
     );
   } finally {
     restore();
@@ -86,14 +86,17 @@ test("ensureEnterpriseLoginForRelay reuses an existing Builderlab session", asyn
 });
 
 test("ensureEnterpriseLoginForRelay starts browser login when no valid session exists", async () => {
-  const auth = { name: "Person", expiresAt: "2026-09-17T17:00:00Z" };
+  const auth = {
+    email: "person@example.com",
+    expiresAt: "2026-09-17T17:00:00Z",
+  };
   const calls = [];
   const started = [];
   const restore = installTauriInvoke(async (command, args) => {
     calls.push([command, args]);
     if (command === "enterprise_login_gate") return { status: "required" };
-    if (command === "get_builderlab_auth") throw new Error("expired");
-    if (command === "start_builderlab_login") return auth;
+    if (command === "get_enterprise_auth") throw new Error("expired");
+    if (command === "start_enterprise_auth_login") return auth;
     throw new Error(`unexpected command: ${command}`);
   });
 
@@ -109,12 +112,12 @@ test("ensureEnterpriseLoginForRelay starts browser login when no valid session e
       calls.map(([command]) => command),
       [
         "enterprise_login_gate",
-        "get_builderlab_auth",
-        "start_builderlab_login",
+        "get_enterprise_auth",
+        "start_enterprise_auth_login",
       ],
     );
     assert.deepEqual(calls.at(-1), [
-      "start_builderlab_login",
+      "start_enterprise_auth_login",
       { attemptId: "attempt-1" },
     ]);
     assert.deepEqual(started, ["started"]);
@@ -129,8 +132,8 @@ test("ensureEnterpriseLoginForRelay waits for explicit consent before browser lo
   const restore = installTauriInvoke(async (command, args) => {
     calls.push([command, args]);
     if (command === "enterprise_login_gate") return { status: "required" };
-    if (command === "get_builderlab_auth") return null;
-    if (command === "start_builderlab_login") {
+    if (command === "get_enterprise_auth") return null;
+    if (command === "start_enterprise_auth_login") {
       return { expiresAt: "2026-09-18T21:00:00Z" };
     }
     throw new Error(`unexpected command: ${command}`);
@@ -146,7 +149,7 @@ test("ensureEnterpriseLoginForRelay waits for explicit consent before browser lo
     await new Promise((resolve) => setTimeout(resolve, 0));
     assert.deepEqual(
       calls.map(([command]) => command),
-      ["enterprise_login_gate", "get_builderlab_auth"],
+      ["enterprise_login_gate", "get_enterprise_auth"],
     );
     continueLogin(true);
     await pending;
@@ -154,8 +157,8 @@ test("ensureEnterpriseLoginForRelay waits for explicit consent before browser lo
       calls.map(([command]) => command),
       [
         "enterprise_login_gate",
-        "get_builderlab_auth",
-        "start_builderlab_login",
+        "get_enterprise_auth",
+        "start_enterprise_auth_login",
       ],
     );
   } finally {
@@ -168,7 +171,7 @@ test("ensureEnterpriseLoginForRelay does not open browser when consent is cancel
   const restore = installTauriInvoke(async (command, args) => {
     calls.push([command, args]);
     if (command === "enterprise_login_gate") return { status: "required" };
-    if (command === "get_builderlab_auth") return null;
+    if (command === "get_enterprise_auth") return null;
     throw new Error(`unexpected command: ${command}`);
   });
 
@@ -181,7 +184,7 @@ test("ensureEnterpriseLoginForRelay does not open browser when consent is cancel
     );
     assert.deepEqual(
       calls.map(([command]) => command),
-      ["enterprise_login_gate", "get_builderlab_auth"],
+      ["enterprise_login_gate", "get_enterprise_auth"],
     );
   } finally {
     restore();

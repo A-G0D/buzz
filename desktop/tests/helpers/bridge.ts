@@ -163,6 +163,17 @@ type MockBridgeOptions = {
   huddle?: MockHuddleSeed;
   /** Enterprise login gate result for the selected relay. Defaults to not required. */
   enterpriseLoginGate?: { status: "notRequired" } | { status: "required" };
+  /** Enterprise adapter account returned by the provider-neutral login contract. Null/omitted = signed out. */
+  enterpriseAuth?: {
+    email?: string | null;
+    expiresAt: string;
+    profileProjection?: {
+      username: string;
+      displayName: string;
+    } | null;
+  } | null;
+  /** Delay enterprise adapter login completion so cancellation/retry UI can be tested. */
+  enterpriseLoginDelayMs?: number;
   /** Builderlab account returned by hosted-community onboarding. Null/omitted = signed out. */
   builderlabAuth?: {
     email?: string;

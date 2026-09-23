@@ -5,25 +5,20 @@ const { authoritativeEnterpriseProfile } = await import(
   "./enterpriseProfile.ts"
 );
 
-test("authoritativeEnterpriseProfile requires independent username and display name", () => {
+test("authoritativeEnterpriseProfile uses only explicit adapter profile projection", () => {
   assert.deepEqual(
     authoritativeEnterpriseProfile({
-      username: " seiler ",
-      name: " Brad Seiler ",
+      profileProjection: {
+        username: " seiler ",
+        displayName: " Brad Seiler ",
+      },
       expiresAt: "2026-09-18T21:00:00Z",
     }),
     { username: "seiler", displayName: "Brad Seiler" },
   );
   assert.equal(
     authoritativeEnterpriseProfile({
-      username: "seiler",
-      expiresAt: "2026-09-18T21:00:00Z",
-    }),
-    null,
-  );
-  assert.equal(
-    authoritativeEnterpriseProfile({
-      name: "Brad Seiler",
+      profileProjection: { username: "seiler", displayName: "   " },
       expiresAt: "2026-09-18T21:00:00Z",
     }),
     null,

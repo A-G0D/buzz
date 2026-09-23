@@ -1684,11 +1684,13 @@ test("authoritative corporate profile save failure stays non-editable and retrie
     page,
     {
       enterpriseLoginGate: { status: "required" },
-      builderlabAuth: {
+      enterpriseAuth: {
         email: "brad@example.com",
-        username: "seiler",
-        name: "Brad Seiler",
         expiresAt: "2099-01-01T00:00:00Z",
+        profileProjection: {
+          username: "seiler",
+          displayName: "Brad Seiler",
+        },
       },
       profileUpdateErrors: ["Temporary corporate profile sync failure.", null],
     },
