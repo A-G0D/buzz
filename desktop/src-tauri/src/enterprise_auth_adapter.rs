@@ -187,6 +187,21 @@ fn bearer_value(token: &str) -> String {
     format!("Bearer {token}")
 }
 
+fn build_enterprise_auth_adapter_client() -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .resolve("localhost", std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+        .pool_idle_timeout(Duration::from_secs(10))
+        .pool_max_idle_per_host(1)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+}
+
+fn enterprise_auth_adapter_client() -> Result<reqwest::Client, String> {
+    build_enterprise_auth_adapter_client().map_err(|error| {
+        format!("could not initialize enterprise authentication adapter HTTP client: {error}")
+    })
+}
+
 fn clear_enterprise_session_if_token_matches(
     session: &EnterpriseAuthSession,
     token: &str,
@@ -311,6 +326,44 @@ fn auth_info_from_session(value: EnterpriseSessionResponse) -> EnterpriseAuthInf
     }
 }
 
+fn enterprise_login_exchange_request_builder(
+    client: &reqwest::Client,
+    exchange_url: Url,
+    code: &str,
+    handoff_secret: &str,
+) -> reqwest::RequestBuilder {
+    client
+        .post(exchange_url)
+        .json(&enterprise_login_exchange_body(code, handoff_secret))
+        .timeout(Duration::from_secs(30))
+}
+
+async fn exchange_enterprise_login_code(
+    client: &reqwest::Client,
+    exchange_url: Url,
+    code: &str,
+    handoff_secret: &str,
+) -> Result<EnterpriseExchangeResponse, String> {
+    let response =
+        enterprise_login_exchange_request_builder(client, exchange_url, code, handoff_secret)
+            .send()
+            .await
+            .map_err(|error| format!("Enterprise authentication code exchange failed: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "Enterprise authentication code exchange failed with HTTP {}",
+            response.status()
+        ));
+    }
+    let exchanged: EnterpriseExchangeResponse = response.json().await.map_err(|error| {
+        format!("invalid enterprise authentication code exchange response: {error}")
+    })?;
+    if exchanged.session_token.is_empty() {
+        return Err("Enterprise authentication code exchange returned an empty token".to_owned());
+    }
+    Ok(exchanged)
+}
+
 fn enterprise_session_request_builder(
     client: &reqwest::Client,
     session_url: Url,
@@ -322,15 +375,15 @@ fn enterprise_session_request_builder(
         .timeout(Duration::from_secs(30))
 }
 
-async fn authenticated_enterprise_user(
+async fn authenticated_enterprise_user_at_url(
     client: &reqwest::Client,
+    session_url: Url,
     token: &str,
 ) -> Result<EnterpriseSessionResponse, String> {
-    let response =
-        enterprise_session_request_builder(client, enterprise_api_url("/v1/session")?, token)
-            .send()
-            .await
-            .map_err(|error| format!("Enterprise authentication session check failed: {error}"))?;
+    let response = enterprise_session_request_builder(client, session_url, token)
+        .send()
+        .await
+        .map_err(|error| format!("Enterprise authentication session check failed: {error}"))?;
     if !response.status().is_success() {
         return Err(format!(
             "Enterprise authentication session check failed with HTTP {}",
@@ -343,10 +396,17 @@ async fn authenticated_enterprise_user(
         .map_err(|error| format!("invalid enterprise authentication session response: {error}"))
 }
 
+async fn authenticated_enterprise_user(
+    client: &reqwest::Client,
+    token: &str,
+) -> Result<EnterpriseSessionResponse, String> {
+    authenticated_enterprise_user_at_url(client, enterprise_api_url("/v1/session")?, token).await
+}
+
 #[tauri::command]
 pub(crate) async fn start_enterprise_auth_login(
     app: tauri::AppHandle,
-    app_state: tauri::State<'_, crate::app_state::AppState>,
+    _app_state: tauri::State<'_, crate::app_state::AppState>,
     session: tauri::State<'_, EnterpriseAuthSession>,
     login: tauri::State<'_, EnterpriseAuthLogin>,
     attempt_id: Option<String>,
@@ -450,49 +510,30 @@ pub(crate) async fn start_enterprise_auth_login(
             return Err(error);
         }
     };
-    let response = match app_state
-        .http_client
-        .post(exchange_url)
-        .json(&enterprise_login_exchange_body(
-            &exchange_code,
-            &handoff_secret,
-        ))
-        .timeout(Duration::from_secs(30))
-        .send()
-        .await
-    {
-        Ok(response) => response,
+    let enterprise_client = match enterprise_auth_adapter_client() {
+        Ok(client) => client,
         Err(error) => {
             clear_matching_pending_login(&login, &login_id)?;
-            return Err(format!(
-                "Enterprise authentication code exchange failed: {error}"
-            ));
+            return Err(error);
         }
     };
-    if !response.status().is_success() {
-        let status = response.status();
-        clear_matching_pending_login(&login, &login_id)?;
-        return Err(format!(
-            "Enterprise authentication code exchange failed with HTTP {status}"
-        ));
-    }
-    let exchanged: EnterpriseExchangeResponse = match response.json().await {
+    let exchanged = match exchange_enterprise_login_code(
+        &enterprise_client,
+        exchange_url,
+        &exchange_code,
+        &handoff_secret,
+    )
+    .await
+    {
         Ok(exchanged) => exchanged,
         Err(error) => {
             clear_matching_pending_login(&login, &login_id)?;
-            return Err(format!(
-                "invalid enterprise authentication code exchange response: {error}"
-            ));
+            return Err(error);
         }
     };
-    if exchanged.session_token.is_empty() {
-        clear_matching_pending_login(&login, &login_id)?;
-        return Err("Enterprise authentication code exchange returned an empty token".to_owned());
-    }
 
     let session_response =
-        match authenticated_enterprise_user(&app_state.http_client, &exchanged.session_token).await
-        {
+        match authenticated_enterprise_user(&enterprise_client, &exchanged.session_token).await {
             Ok(session_response) => session_response,
             Err(error) => {
                 clear_matching_pending_login(&login, &login_id)?;
@@ -518,7 +559,7 @@ pub(crate) async fn start_enterprise_auth_login(
 
 #[tauri::command]
 pub(crate) async fn get_enterprise_auth(
-    app_state: tauri::State<'_, crate::app_state::AppState>,
+    _app_state: tauri::State<'_, crate::app_state::AppState>,
     session: tauri::State<'_, EnterpriseAuthSession>,
 ) -> Result<Option<EnterpriseAuthInfo>, String> {
     let stored = session
@@ -530,7 +571,14 @@ pub(crate) async fn get_enterprise_auth(
     let Some(token) = stored else {
         return Ok(None);
     };
-    match authenticated_enterprise_user(&app_state.http_client, &token).await {
+    let enterprise_client = match enterprise_auth_adapter_client() {
+        Ok(client) => client,
+        Err(error) => {
+            clear_enterprise_session_if_token_matches(&session, &token)?;
+            return Err(error);
+        }
+    };
+    match authenticated_enterprise_user(&enterprise_client, &token).await {
         Ok(session_response) => Ok(Some(auth_info_from_session(session_response))),
         Err(error) => {
             clear_enterprise_session_if_token_matches(&session, &token)?;
@@ -579,6 +627,94 @@ pub(crate) fn clear_enterprise_auth(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{
+        body::Bytes,
+        http::{header::LOCATION, HeaderMap},
+        routing::any,
+    };
+    use tokio::sync::oneshot as tokio_oneshot;
+
+    #[derive(Debug, Clone)]
+    struct CapturedAdapterRequest {
+        authorization: Option<String>,
+        body: Vec<u8>,
+    }
+
+    async fn spawn_capture_server(
+        captured: std::sync::Arc<Mutex<Vec<CapturedAdapterRequest>>>,
+    ) -> (Url, tokio_oneshot::Sender<()>) {
+        async fn capture(
+            AxumState(captured): AxumState<std::sync::Arc<Mutex<Vec<CapturedAdapterRequest>>>>,
+            headers: HeaderMap,
+            body: Bytes,
+        ) -> StatusCode {
+            captured
+                .lock()
+                .expect("captured requests poisoned")
+                .push(CapturedAdapterRequest {
+                    authorization: headers
+                        .get(reqwest::header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_owned),
+                    body: body.to_vec(),
+                });
+            StatusCode::OK
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind capture server");
+        let port = listener.local_addr().expect("capture local addr").port();
+        let (shutdown_tx, shutdown_rx) = tokio_oneshot::channel();
+        let router = Router::new()
+            .route("/target", any(capture))
+            .with_state(captured);
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await;
+        });
+
+        (
+            Url::parse(&format!("http://127.0.0.1:{port}/target")).unwrap(),
+            shutdown_tx,
+        )
+    }
+
+    async fn spawn_redirect_server(
+        path: &'static str,
+        status: StatusCode,
+        location: Url,
+    ) -> (Url, tokio_oneshot::Sender<()>) {
+        async fn redirect(
+            AxumState((status, location)): AxumState<(StatusCode, String)>,
+        ) -> Response {
+            ([(LOCATION, location)], status).into_response()
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind redirect server");
+        let port = listener.local_addr().expect("redirect local addr").port();
+        let (shutdown_tx, shutdown_rx) = tokio_oneshot::channel();
+        let router = Router::new()
+            .route(path, any(redirect))
+            .with_state((status, location.to_string()));
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await;
+        });
+
+        (
+            Url::parse(&format!("http://127.0.0.1:{port}{path}")).unwrap(),
+            shutdown_tx,
+        )
+    }
 
     #[test]
     fn enterprise_login_url_uses_provider_neutral_contract_and_handoff_challenge() {
@@ -658,6 +794,77 @@ mod tests {
         );
         assert!(request.headers().get("X-BB-Session-Credential").is_none());
         assert!(request.headers().get("Nostr-Federated-Identity").is_none());
+    }
+
+    #[tokio::test]
+    async fn exchange_rejects_307_308_without_replaying_handoff_payload() {
+        for status in [
+            StatusCode::TEMPORARY_REDIRECT,
+            StatusCode::PERMANENT_REDIRECT,
+        ] {
+            let captured = std::sync::Arc::new(Mutex::new(Vec::new()));
+            let (target_url, target_shutdown) = spawn_capture_server(captured.clone()).await;
+            let (exchange_url, redirect_shutdown) =
+                spawn_redirect_server("/v1/login/exchange", status, target_url).await;
+            let client = build_enterprise_auth_adapter_client().unwrap();
+
+            let error = exchange_enterprise_login_code(
+                &client,
+                exchange_url,
+                "callback-code",
+                "handoff-secret",
+            )
+            .await
+            .unwrap_err();
+
+            assert!(
+                error.contains(&format!("HTTP {status}")),
+                "unexpected error for {status}: {error}"
+            );
+            let captured_requests = captured.lock().unwrap();
+            assert!(
+                captured_requests.is_empty(),
+                "redirect target received exchange payload for {status}: {captured_requests:?}"
+            );
+            let _ = redirect_shutdown.send(());
+            let _ = target_shutdown.send(());
+        }
+    }
+
+    #[tokio::test]
+    async fn session_check_rejects_307_308_without_replaying_bearer_credential() {
+        for status in [
+            StatusCode::TEMPORARY_REDIRECT,
+            StatusCode::PERMANENT_REDIRECT,
+        ] {
+            let captured = std::sync::Arc::new(Mutex::new(Vec::new()));
+            let (target_url, target_shutdown) = spawn_capture_server(captured.clone()).await;
+            let (session_url, redirect_shutdown) =
+                spawn_redirect_server("/v1/session", status, target_url).await;
+            let client = build_enterprise_auth_adapter_client().unwrap();
+
+            let error = authenticated_enterprise_user_at_url(&client, session_url, "session-token")
+                .await
+                .unwrap_err();
+
+            assert!(
+                error.contains(&format!("HTTP {status}")),
+                "unexpected error for {status}: {error}"
+            );
+            let captured_requests = captured.lock().unwrap();
+            assert!(
+                captured_requests.is_empty(),
+                "redirect target received session credential for {status}: {captured_requests:?}"
+            );
+            assert!(
+                captured_requests.iter().all(|request| {
+                    request.authorization.is_none() && request.body.is_empty()
+                }),
+                "redirect target captured credential-bearing request for {status}: {captured_requests:?}"
+            );
+            let _ = redirect_shutdown.send(());
+            let _ = target_shutdown.send(());
+        }
     }
 
     #[test]

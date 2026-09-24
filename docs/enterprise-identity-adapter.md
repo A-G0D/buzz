@@ -47,11 +47,15 @@ completed browser login to `handoff_challenge`, and redirects to:
 ```
 
 The code alone is not a credential. The adapter MUST accept it only when the
-exchange presents the matching handoff secret.
+exchange presents the matching handoff secret. Browser navigation may follow the
+adapter's identity-provider redirects; the non-browser adapter calls below must
+not depend on redirect handling.
 
 ## Code exchange
 
-Desktop exchanges the browser code with:
+Desktop exchanges the browser code with a no-redirect HTTP client. Any 3xx is
+treated as a failed exchange so `{code, handoff_secret}` is never replayed to a
+redirect target.
 
 ```http
 POST /v1/login/exchange
@@ -83,7 +87,9 @@ those fields as the user's public Buzz profile.
 
 ## Session check
 
-Desktop checks or reuses an in-memory enterprise adapter session with:
+Desktop checks or reuses an in-memory enterprise adapter session with the same
+no-redirect HTTP client. Any 3xx is treated as a failed session check so Bearer
+session credentials are never replayed to a redirect target.
 
 ```http
 GET /v1/session
