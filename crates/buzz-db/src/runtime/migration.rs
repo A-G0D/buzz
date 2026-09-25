@@ -2319,9 +2319,9 @@ mod postgres_tests {
             .await
             .expect("connect migrated probe database");
         MIGRATOR
-            .run_to(47, &migrated)
+            .run_to(51, &migrated)
             .await
-            .expect("apply migrations 1-47");
+            .expect("apply migrations 1-51");
 
         for table in [
             "relay_admin_actions",
