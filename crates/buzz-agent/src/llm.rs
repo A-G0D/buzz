@@ -61,7 +61,7 @@ const LLM_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 
 impl Llm {
     pub fn new(cfg: &Config) -> Result<Self, AgentError> {
-        let http = Client::builder()
+        let http = crate::sandbox_runtime::http_builder()?
             .connect_timeout(LLM_CONNECT_TIMEOUT)
             // No client-level read_timeout: we apply a per-request total
             // timeout via RequestBuilder::timeout() so that escalated budgets
@@ -2096,6 +2096,9 @@ pub(crate) fn databricks_pkce_config(
 ///   discovery URL. First request without a cached token triggers a browser
 ///   flow; subsequent requests use the cache + refresh transparently.
 pub(crate) fn build_token_source(cfg: &Config) -> Result<Arc<dyn TokenSource>, AgentError> {
+    if let Some(source) = crate::sandbox_runtime::token_source(cfg)? {
+        return Ok(source);
+    }
     match cfg.provider {
         Provider::Anthropic | Provider::OpenAi | Provider::OpenRouter => {
             Ok(Arc::new(StaticTokenSource::new(cfg.api_key.clone())))

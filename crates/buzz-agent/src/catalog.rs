@@ -143,6 +143,7 @@ pub async fn discover_databricks_models_with_cache_dir(
 ) -> Result<Vec<ModelEntry>, AgentError> {
     let token_source = if matches!(cfg.provider, Provider::Databricks | Provider::DatabricksV2)
         && cfg.api_key.is_empty()
+        && std::env::var_os(crate::sandbox_runtime::BROKER_ENV).is_none()
     {
         crate::auth::PkceOAuthTokenSource::new(crate::llm::databricks_pkce_config(
             &cfg.base_url,
@@ -158,7 +159,10 @@ async fn discover_databricks_models_with_token_source(
     cfg: &Config,
     token_source: Arc<dyn TokenSource>,
 ) -> Result<Vec<ModelEntry>, AgentError> {
-    discover_databricks_models_with_client(cfg, token_source, &Client::new()).await
+    let client = crate::sandbox_runtime::http_builder()?
+        .build()
+        .map_err(|e| AgentError::Llm(format!("catalog http: {e}")))?;
+    discover_databricks_models_with_client(cfg, token_source, &client).await
 }
 
 pub(crate) async fn discover_databricks_models_with_client(

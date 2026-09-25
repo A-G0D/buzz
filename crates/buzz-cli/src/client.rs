@@ -544,7 +544,8 @@ impl BuzzClient {
         auth_tag: Option<Tag>,
         auth_tag_json: Option<String>,
     ) -> Result<Self, CliError> {
-        let http = reqwest::Client::builder()
+        let http = buzz_runtime_support::tls::http_builder()
+            .map_err(|e| CliError::Other(e.to_string()))?
             .timeout(env_duration_secs("BUZZ_TIMEOUT_SECS", 30))
             .connect_timeout(env_duration_secs("BUZZ_CONNECT_TIMEOUT_SECS", 15))
             .build()
@@ -922,7 +923,8 @@ impl BuzzClient {
         let body = serde_json::to_vec(body).map_err(|e| CliError::Other(e.to_string()))?;
         let auth = sign_nip98(&self.keys, "POST", &url, Some(&body))?;
         let unknown = |detail: String| CliError::DeliveryUnknown(detail);
-        let http = reqwest::Client::builder()
+        let http = buzz_runtime_support::tls::http_builder()
+            .map_err(|e| CliError::Other(e.to_string()))?
             .redirect(reqwest::redirect::Policy::none())
             .timeout(env_duration_secs("BUZZ_TIMEOUT_SECS", 30))
             .connect_timeout(env_duration_secs("BUZZ_CONNECT_TIMEOUT_SECS", 15))
@@ -1341,7 +1343,8 @@ impl BuzzClient {
     pub async fn download_media(&self, input: &str) -> Result<bytes::Bytes, CliError> {
         let url = media_url_from_input(&self.relay_url, input)?;
         // Use a dedicated client: 120 s timeout, no redirect forwarding.
-        let client = reqwest::Client::builder()
+        let client = buzz_runtime_support::tls::http_builder()
+            .map_err(|e| CliError::Other(e.to_string()))?
             .timeout(Duration::from_secs(120))
             // Do not forward Authorization or x-auth-tag to redirect targets.
             .redirect(reqwest::redirect::Policy::none())
