@@ -3477,7 +3477,9 @@ mod postgres_tests {
             .await
             .expect("connect test DB");
         let db = buzz_db::Db::from_pool(pool.clone());
-        db.migrate().await.expect("migrate test DB");
+        if std::env::var("BUZZ_TEST_SCHEMA_MODE").as_deref() != Ok("desired") {
+            db.migrate().await.expect("migrate test DB");
+        }
         let host = format!("observer-ingest-{}.example", Uuid::new_v4().simple());
         let community = db
             .ensure_configured_community(&host)
