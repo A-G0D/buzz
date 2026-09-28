@@ -2160,6 +2160,28 @@ async fn author_type_label(
     }
 }
 
+/// Reject when `pubkey` is banned in the community. Fails closed when the
+/// restriction lookup errors.
+async fn reject_if_banned(
+    state: &Arc<AppState>,
+    tenant: &TenantContext,
+    pubkey: &nostr::PublicKey,
+) -> Result<(), IngestError> {
+    match state
+        .db
+        .moderation_restriction_state(tenant.community(), pubkey.as_bytes())
+        .await
+    {
+        Ok(r) if r.banned => Err(IngestError::AuthFailed(
+            "blocked: agent owner is banned from this community".to_string(),
+        )),
+        Ok(_) => Ok(()),
+        Err(e) => Err(IngestError::Internal(format!(
+            "error: internal error checking restriction state: {e}"
+        ))),
+    }
+}
+
 /// Reject writes from a pubkey that is banned or currently timed out in the
 /// community. Fails closed when the restriction lookup errors.
 async fn enforce_write_restrictions(
@@ -2427,6 +2449,13 @@ async fn ingest_event_inner(
         // here so a restricted owner cannot keep sending control frames over
         // HTTP.
         enforce_write_restrictions(state, tenant, auth.pubkey()).await?;
+        // Agent-signed telemetry names its owner. Mirror the auth-seam cascade:
+        // an owner ban blocks the owner's agents (timeouts do not cascade).
+        if let Some(owner) = super::event::agent_observer_frame_owner(&event) {
+            if &owner != auth.pubkey() {
+                reject_if_banned(state, tenant, &owner).await?;
+            }
+        }
         super::event::ingest_agent_observer_event(state, tenant, &event, None).await?;
         emit(
             tracer,
@@ -3727,6 +3756,27 @@ mod postgres_tests {
         assert!(matches!(
             ingest_observer_test_event(&state, &tenant, &owner, owner_control_event(&agent, &owner)).await,
             Err(IngestError::AuthFailed(message)) if message.contains("banned")
+        ));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres and Redis"]
+    async fn http_observer_frame_rejects_agent_telemetry_for_banned_owner() {
+        let (state, tenant, agent, owner) = observer_ingest_fixture().await;
+        state
+            .db
+            .ban_community_member(
+                tenant.community(),
+                &owner.public_key().to_bytes(),
+                &Keys::generate().public_key().to_bytes(),
+                None,
+                None,
+            )
+            .await
+            .expect("ban owner");
+        assert!(matches!(
+            ingest_observer_test_event(&state, &tenant, &agent, observer_event(&agent, &owner)).await,
+            Err(IngestError::AuthFailed(message)) if message.contains("owner is banned")
         ));
     }
 

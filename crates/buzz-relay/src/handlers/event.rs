@@ -1170,6 +1170,17 @@ pub(crate) async fn ingest_agent_observer_event(
     Ok(())
 }
 
+/// Owner pubkey named by a well-formed observer frame, if any.
+///
+/// Used by the HTTP ingest path to apply the owner-to-agent ban cascade that
+/// the WebSocket auth seam enforces structurally.
+pub(crate) fn agent_observer_frame_owner(event: &Event) -> Option<PublicKey> {
+    agent_observer_route(event)
+        .ok()
+        .flatten()
+        .map(|route| route.owner)
+}
+
 fn agent_observer_route(event: &Event) -> Result<Option<AgentObserverRoute>, String> {
     if !content_looks_like_nip44(&event.content) {
         return Err("invalid: observer content must be NIP-44 encrypted".into());
