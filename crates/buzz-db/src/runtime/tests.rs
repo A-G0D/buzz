@@ -3295,3 +3295,74 @@ async fn floor_guard_blocks_updates_that_move_rows_below_the_fence() {
 
 #[path = "tests/thread_window_postgres_tests.rs"]
 mod thread_window_postgres_tests;
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn migration_schema_channel_received_prebuild_validation() {
+    const INDEX: &str = "idx_events_community_channel_received";
+    const COLUMNS: &str = "(community_id, channel_id, received_at DESC, id, created_at)";
+    let admin = PgPool::connect(&admin_url().await).await.unwrap();
+    let (pool, name) = create_scratch_db_through(&admin, "received_prebuild", Some(50)).await;
+    let partitions: Vec<String> = sqlx::query_scalar(
+        "SELECT c.relname::text FROM pg_inherits i JOIN pg_class c ON c.oid=i.inhrelid \
+         WHERE i.inhparent='events'::regclass ORDER BY 1",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert!(partitions.len() > 1, "must exercise a partitioned parent");
+    for setup in [
+        // Wrong definition: ascending receipt order cannot serve the window.
+        format!("CREATE INDEX {INDEX} ON events (community_id, channel_id, received_at, id, created_at)"),
+        // Incomplete brownfield prebuild: parent exists, no partition attached.
+        format!("CREATE INDEX {INDEX} ON ONLY events {COLUMNS}"),
+    ] {
+        sqlx::raw_sql(sqlx::AssertSqlSafe(setup)).execute(&pool).await.unwrap();
+        let error = migration::run_migrations(&pool).await.unwrap_err();
+        assert!(
+            error.to_string().contains("invalid or wrong definition"),
+            "must reject catalog shape, not merely time out: {error}"
+        );
+        let version: i64 = sqlx::query_scalar("SELECT max(version) FROM _sqlx_migrations")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(version, 50);
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP INDEX {INDEX}")))
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    // The documented brownfield procedure: parent ON ONLY, each partition
+    // CONCURRENTLY, then ATTACH. The migration must adopt it, not rebuild it.
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "CREATE INDEX {INDEX} ON ONLY events {COLUMNS}"
+    )))
+    .execute(&pool)
+    .await
+    .unwrap();
+    for partition in &partitions {
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "CREATE INDEX CONCURRENTLY {partition}_channel_received ON {partition} {COLUMNS}"
+        )))
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "ALTER INDEX {INDEX} ATTACH PARTITION {partition}_channel_received"
+        )))
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    let oid = || {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT 'idx_events_community_channel_received'::regclass::oid::bigint",
+        )
+        .fetch_one(&pool)
+    };
+    let prebuilt = oid().await.unwrap();
+    migration::run_migrations(&pool).await.unwrap();
+    assert_eq!(prebuilt, oid().await.unwrap());
+    drop_scratch_db(&admin, pool, &name).await;
+}

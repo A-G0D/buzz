@@ -34,6 +34,9 @@ pub struct RelayInfo {
     /// Host-bound atomic read-state snapshot capability; absent on unresolved hosts.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub read_state_snapshot: Option<serde_json::Value>,
+    /// Opt-in, host-bound private accessory API; separate from legacy NIP-RS.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub buzz_v1: Option<BuzzV1Descriptor>,
     /// Relay operator's public key (hex), if published.
     pub pubkey: Option<String>,
     /// Contact address for the relay operator.
@@ -70,6 +73,25 @@ pub struct RelayInfo {
     /// Relay's own signing pubkey (NIP-11 `self` field, NIP-43).
     #[serde(rename = "self", skip_serializing_if = "Option::is_none")]
     pub relay_self: Option<String>,
+}
+
+/// Private read-state accessory contract and enforced client request limits.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BuzzV1Descriptor {
+    /// Accessory contract version, not a Nostr protocol number.
+    pub version: u32,
+    /// Relay-relative API prefix; callers retain the requesting origin.
+    pub base_path: String,
+    /// Receipt-time unread horizon; does not expire messages or frontiers.
+    pub retention_seconds: u32,
+    /// Maximum joined channels per sidebar page.
+    pub max_channels: usize,
+    /// Maximum independent write intents per request.
+    pub max_intents: usize,
+    /// Maximum explicit contexts per read request.
+    pub max_contexts: usize,
+    /// Maximum message selectors across one context request.
+    pub max_context_messages: usize,
 }
 
 /// Public capability descriptor for relay-proxied GIF search.
@@ -207,6 +229,7 @@ impl RelayInfo {
             description: "Buzz — private team communication relay".to_string(),
             icon: icon.filter(|s| !s.is_empty()).map(|s| s.to_string()),
             read_state_snapshot: None,
+            buzz_v1: None,
             pubkey: None,
             contact: None,
             supported_nips,
@@ -298,6 +321,20 @@ pub(crate) async fn nip11_document(state: &crate::state::AppState, raw_host: &st
         state.config.klipy.as_ref().map(|_| "klipy"),
     );
     if let Ok(tenant) = crate::tenant::bind_community(&state.db, raw_host).await {
+        if state.config.buzz_v1_enabled {
+            use buzz_db::personal_read::{
+                MAX_CHANNELS, MAX_CONTEXTS, MAX_CONTEXT_MESSAGES, MAX_INTENTS,
+            };
+            info.buzz_v1 = Some(BuzzV1Descriptor {
+                version: 1,
+                base_path: crate::api::buzz_v1::BASE_PATH.to_owned(),
+                retention_seconds: state.config.buzz_v1_retention_seconds,
+                max_channels: MAX_CHANNELS,
+                max_intents: MAX_INTENTS,
+                max_contexts: MAX_CONTEXTS,
+                max_context_messages: MAX_CONTEXT_MESSAGES,
+            });
+        }
         info.read_state_snapshot = Some(serde_json::json!({
             "version": 1,
             "community_id": tenant.community().as_uuid(),

@@ -8,7 +8,7 @@ use nostr::{EventBuilder, Keys, Kind};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-async fn fixture() -> (Db, PgPool, CommunityId, Uuid, Keys, nostr::Event) {
+pub(super) async fn fixture() -> (Db, PgPool, CommunityId, Uuid, Keys, nostr::Event) {
     let pool = PgPool::connect(&crate::test_support::database_url())
         .await
         .unwrap();
@@ -41,11 +41,11 @@ async fn fixture() -> (Db, PgPool, CommunityId, Uuid, Keys, nostr::Event) {
     (db, pool, community, channel, actor, event)
 }
 
-async fn add_history(db: &Db, community: CommunityId, channel: Uuid) -> nostr::Event {
+async fn add_history(db: &Db, community: CommunityId, channel: Uuid, count: usize) -> nostr::Event {
     let author = Keys::generate();
     let mut last = None;
     let base = nostr::Timestamp::now().as_secs();
-    for i in 0..300 {
+    for i in 0..count as u64 {
         let event = EventBuilder::new(Kind::Custom(9), format!("history {i}"))
             .custom_created_at(nostr::Timestamp::from(base + i))
             .sign_with_keys(&author)
@@ -62,7 +62,7 @@ async fn add_history(db: &Db, community: CommunityId, channel: Uuid) -> nostr::E
 #[ignore = "requires Postgres"]
 async fn personal_read_sidebar_marked_history_keeps_latest_but_unscanned_threads_are_unknown() {
     let (db, _pool, community, channel, actor, _) = fixture().await;
-    let last = add_history(&db, community, channel).await;
+    let last = add_history(&db, community, channel, MAX_RECEIPT_SCAN + 44).await;
     db.apply_personal_read_intent(
         community,
         &actor.public_key(),
@@ -86,10 +86,16 @@ async fn personal_read_sidebar_marked_history_keeps_latest_but_unscanned_threads
         )
         .await
         .unwrap();
-    assert!(matches!(
-        page.channels[0].unread,
-        ReadCount::AtLeast { value: 0 }
-    ));
+    assert!(matches!(page.channels[0].unread, ReadCount::Unknown));
+    let wire = serde_json::to_value(&page).unwrap();
+    assert_eq!(
+        wire["channels"][0]["unread"],
+        serde_json::json!({"status":"unknown"})
+    );
+    assert_eq!(
+        wire["channels"][0]["attention"],
+        serde_json::json!({"status":"unknown"})
+    );
     assert_eq!(
         page.channels[0].latest_message_id.as_deref(),
         Some(last.id.to_hex().as_str())
@@ -99,9 +105,9 @@ async fn personal_read_sidebar_marked_history_keeps_latest_but_unscanned_threads
 
 #[tokio::test]
 #[ignore = "requires Postgres"]
-async fn personal_read_sidebar_expired_unopened_tail_remains_unproved() {
+async fn personal_read_sidebar_receipt_window_excludes_expired_but_keeps_fresh_backfill() {
     let (db, pool, community, channel, actor, _) = fixture().await;
-    let latest = add_history(&db, community, channel).await;
+    let latest = add_history(&db, community, channel, MAX_RECEIPT_SCAN + 44).await;
     sqlx::query(
         "UPDATE events SET received_at=clock_timestamp()-interval '31 days' WHERE community_id=$1",
     )
@@ -120,16 +126,16 @@ async fn personal_read_sidebar_expired_unopened_tail_remains_unproved() {
         .await
         .unwrap();
     assert!(
-        matches!(page.channels[0].unread, ReadCount::AtLeast { value: 0 }),
-        "receipt expiry of the scanned window cannot prove expiry of the author-ordered tail"
+        matches!(page.channels[0].unread, ReadCount::Exact { value: 0 }),
+        "receipt-ordered window proves exhaustion independent of author time"
     );
     assert_eq!(
         page.channels[0].latest_message_id.as_deref(),
         Some(latest.id.to_hex().as_str())
     );
     assert!(page.channels[0].latest_message_complete);
-    // A fresh receipt with old author time belongs to retention even if it is
-    // invisible below this bounded window. Never certify that channel as read.
+    // A fresh receipt with old author time belongs to retention even below
+    // the author-ordered history. The receipt window must find it.
     let backfill = EventBuilder::new(Kind::Custom(9), "recently imported old message")
         .custom_created_at(nostr::Timestamp::from(
             nostr::Timestamp::now().as_secs() - 40 * 86400,
@@ -151,8 +157,91 @@ async fn personal_read_sidebar_expired_unopened_tail_remains_unproved() {
         .unwrap();
     assert!(matches!(
         page.channels[0].unread,
-        ReadCount::AtLeast { value: 0 }
+        ReadCount::Exact { value: 1 }
     ));
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn personal_read_sidebar_receipt_budget_counts_boundary_and_ineligible_tail() {
+    let (db, pool, community, channel, actor, _) = fixture().await;
+    // The fixture contributes one event, so this is exactly the evidence budget.
+    add_history(&db, community, channel, MAX_RECEIPT_SCAN - 1).await;
+    let page = db
+        .personal_read_sidebar(
+            community,
+            &actor.public_key(),
+            DEFAULT_RETENTION_SECONDS,
+            20,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(page.channels[0].unread, ReadCount::Exact { value } if value == MAX_RECEIPT_SCAN as u32)
+    );
+    let overflow = EventBuilder::new(Kind::Custom(9), "one beyond the budget")
+        .sign_with_keys(&Keys::generate())
+        .unwrap();
+    db.insert_event(community, &overflow, Some(channel))
+        .await
+        .unwrap();
+    let page = db
+        .personal_read_sidebar(
+            community,
+            &actor.public_key(),
+            DEFAULT_RETENTION_SECONDS,
+            20,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(page.channels[0].unread, ReadCount::AtLeast { value } if value == MAX_RECEIPT_SCAN as u32)
+    );
+    // Expire all but 601 receipts. Of these, 300 are own and 300 deleted.
+    // Eligibility is downstream of the bounded receipt window, not the old 256 cap.
+    sqlx::query("WITH ranked AS (SELECT created_at,id,row_number() OVER (ORDER BY received_at DESC,id) AS n FROM events WHERE community_id=$1 AND channel_id=$2)
+        UPDATE events e SET received_at=CASE WHEN r.n>601 THEN now()-interval '31 days' ELSE e.received_at END,
+          pubkey=CASE WHEN r.n<=300 THEN $3 ELSE e.pubkey END,
+          deleted_at=CASE WHEN r.n>300 AND r.n<=600 THEN now() ELSE NULL END
+        FROM ranked r WHERE e.community_id=$1 AND e.created_at=r.created_at AND e.id=r.id")
+        .bind(community.as_uuid()).bind(channel).bind(actor.public_key().to_bytes().as_slice()).execute(&pool).await.unwrap();
+    let page = db
+        .personal_read_sidebar(
+            community,
+            &actor.public_key(),
+            DEFAULT_RETENTION_SECONDS,
+            20,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        page.channels[0].unread,
+        ReadCount::Exact { value: 1 }
+    ));
+    // Filtering ineligible evidence must not erase the raw-window overflow.
+    sqlx::query(
+        "UPDATE events SET received_at=now(),pubkey=$2 WHERE community_id=$1 AND channel_id=$3",
+    )
+    .bind(community.as_uuid())
+    .bind(actor.public_key().to_bytes().as_slice())
+    .bind(channel)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let page = db
+        .personal_read_sidebar(
+            community,
+            &actor.public_key(),
+            DEFAULT_RETENTION_SECONDS,
+            20,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(page.channels[0].unread, ReadCount::Unknown));
 }
 
 #[tokio::test]
@@ -384,7 +473,7 @@ async fn personal_read_latest_old_message_is_not_an_empty_channel() {
         .execute(&pool)
         .await
         .unwrap();
-    add_history(&db, community, channel).await;
+    add_history(&db, community, channel, MAX_RECEIPT_SCAN + 44).await;
     sqlx::query("UPDATE events SET kind=7 WHERE community_id=$1")
         .bind(community.as_uuid())
         .execute(&pool)
@@ -633,7 +722,7 @@ async fn personal_read_contexts_bound_selectors_and_use_only_matching_frontiers(
     assert_eq!(page["contexts"][0]["messages"][2]["status"], "unavailable");
     assert_eq!(page["contexts"][1]["messages"][0]["status"], "unavailable");
     assert_eq!(page["contexts"][1]["messages"][1]["status"], "unread");
-    assert!(page["contexts"][1]["messages"][1]["attention"].is_null());
+    assert_eq!(page["contexts"][1]["messages"][1]["attention"], false);
     let accounts: i64 =
         sqlx::query_scalar("SELECT count(*) FROM personal_read_accounts WHERE community_id=$1")
             .bind(community.as_uuid())
@@ -819,4 +908,99 @@ async fn personal_read_context_receipt_horizon_unknown_ancestry_and_deletion() {
     .unwrap();
     assert_eq!(page["contexts"][0]["messages"][0]["status"], "not_counted");
     assert_eq!(page["contexts"][0]["messages"][2]["status"], "not_counted");
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn personal_read_covered_corruption_requires_canonical_matching_frontier() {
+    let (db, pool, community, channel, actor, root) = fixture().await;
+    let reply = EventBuilder::new(Kind::Custom(9), "canonical reply")
+        .custom_created_at(nostr::Timestamp::from(root.created_at.as_secs() - 1))
+        .sign_with_keys(&Keys::generate())
+        .unwrap();
+    db.insert_event(community, &reply, Some(channel))
+        .await
+        .unwrap();
+    for (event, depth) in [(&root, 0), (&reply, 1)] {
+        sqlx::query("INSERT INTO thread_metadata (community_id,event_id,event_created_at,channel_id,root_event_id,parent_event_id,depth)
+            VALUES ($1,$2,to_timestamp($3),$4,$5,$5,$6)")
+            .bind(community.as_uuid()).bind(event.id.as_bytes().as_slice())
+            .bind(event.created_at.as_secs() as f64).bind(channel)
+            .bind(root.id.as_bytes().as_slice()).bind(depth).execute(&pool).await.unwrap();
+    }
+    db.apply_personal_read_intent(
+        community,
+        &actor.public_key(),
+        &ReadIntent::MarkThrough {
+            target: ReadTarget {
+                channel_id: channel,
+                root_id: None,
+            },
+            message_id: root.id.to_hex(),
+        },
+    )
+    .await
+    .unwrap();
+    // Corrupt both stored payloads. Only canonical evidence plus its matching
+    // frontier can make their tags irrelevant, never the channel prefix alone.
+    sqlx::query("UPDATE events SET tags=$2 WHERE community_id=$1")
+        .bind(community.as_uuid())
+        .bind(serde_json::json!([["p", 42]]))
+        .execute(&pool)
+        .await
+        .unwrap();
+    let page = db
+        .personal_read_sidebar(
+            community,
+            &actor.public_key(),
+            DEFAULT_RETENTION_SECONDS,
+            20,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(page.channels[0].unread, ReadCount::Unknown));
+    sqlx::query("INSERT INTO personal_read_frontiers (community_id,actor,channel_id,root_id,through_timestamp)
+        VALUES ($1,$2,$3,$4,$5)")
+        .bind(community.as_uuid()).bind(actor.public_key().to_bytes().as_slice()).bind(channel)
+        .bind(root.id.as_bytes().as_slice()).bind(root.created_at.as_secs() as i64)
+        .execute(&pool).await.unwrap();
+    let page = db
+        .personal_read_sidebar(
+            community,
+            &actor.public_key(),
+            DEFAULT_RETENTION_SECONDS,
+            20,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        page.channels[0].unread,
+        ReadCount::Exact { value: 0 }
+    ));
+    assert!(matches!(
+        page.channels[0].attention,
+        ReadCount::Exact { value: 0 }
+    ));
+    // Removing canonical metadata must not let a channel frontier hide unknown
+    // ancestry/corruption, even though both timestamp frontiers cover the row.
+    sqlx::query("DELETE FROM thread_metadata WHERE community_id=$1 AND event_id=$2")
+        .bind(community.as_uuid())
+        .bind(reply.id.as_bytes().as_slice())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let page = db
+        .personal_read_sidebar(
+            community,
+            &actor.public_key(),
+            DEFAULT_RETENTION_SECONDS,
+            20,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(page.channels[0].unread, ReadCount::Unknown));
+    assert!(matches!(page.channels[0].attention, ReadCount::Unknown));
 }

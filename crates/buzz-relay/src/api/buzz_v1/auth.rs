@@ -22,6 +22,12 @@ impl Error {
     pub(super) fn unavailable() -> Self {
         Self::new(StatusCode::SERVICE_UNAVAILABLE, "unavailable")
     }
+    pub(super) fn terminal_denial(&self) -> bool {
+        matches!(
+            self.status,
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+        )
+    }
     pub(super) fn invalid() -> Self {
         Self::new(StatusCode::BAD_REQUEST, "invalid_request")
     }
@@ -69,7 +75,7 @@ pub(super) async fn authorize(
     state: &Arc<AppState>,
     headers: &HeaderMap,
     uri: &Uri,
-    method: &str,
+    method: &'static str,
     body: Option<&[u8]>,
 ) -> Result<Principal, Error> {
     let host = headers
@@ -88,19 +94,32 @@ pub(super) async fn authorize(
         .unwrap_or(uri.path());
     let url = bridge::nip98_expected_url(&state.config.relay_url, &tenant, path);
     // Private state always requires cryptographic identity, even on a dev relay.
-    let verified =
-        bridge::verify_bridge_auth_with_options(headers, method, &url, body, true, body.is_some())
-            .map_err(bridge_error)?;
-    bridge::enforce_http_admission(state, &tenant, &verified.pubkey)
+    // NIP-FI admission owns NIP-98 extraction, assertion pairing and deny map.
+    let admission = crate::nip_fi_http::admit_nip_fi_http_on_state(
+        state,
+        headers,
+        bridge::make_nip98_closure_for_admission(
+            headers.clone(),
+            method,
+            url,
+            body.map(<[u8]>::to_vec),
+            true,
+            body.is_some(),
+        ),
+    )
+    .map_err(|r| bridge_error((r.status(), Json(Value::Null))))?;
+    let actor = *admission.proven_pubkey();
+    let (event_id, signed_at) = admission.into_extra();
+    bridge::enforce_http_admission(state, &tenant, &actor)
         .await
         .map_err(bridge_error)?;
-    bridge::check_nip98_replay(state, &tenant, verified.event_id_bytes)
+    bridge::check_nip98_replay(state, &tenant, event_id)
         .await
         .map_err(bridge_error)?;
     let principal = Principal {
         tenant,
-        actor: verified.pubkey,
-        signed_at: verified.signed_created_at,
+        actor,
+        signed_at,
     };
     recheck(state, headers, &principal).await?;
     Ok(principal)

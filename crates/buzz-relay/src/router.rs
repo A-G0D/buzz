@@ -289,7 +289,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     let admin_router = admin_enabled
         .then(|| Router::new().nest("/api/admin/v1", api::admin::router(state.clone())));
 
-    let accessory_router = Router::new().nest("/buzz/v1", api::buzz_v1::router(state.clone()));
+    let accessory_router =
+        Router::new().nest(api::buzz_v1::BASE_PATH, api::buzz_v1::router(state.clone()));
 
     let api_router = Router::new()
         // WebSocket + NIP-11

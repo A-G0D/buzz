@@ -94,19 +94,14 @@ pub(super) async fn write(
         };
         // A deadline/DB failure after commit is ambiguous, not a false failure.
         // Earlier acknowledged commits survive all later projection/item failures.
-        let result = tokio::time::timeout_at(deadline, async {
-            auth::recheck(&state, &headers, &principal).await?;
-            state
-                .db
-                .apply_personal_read_intent(principal.tenant.community(), &principal.actor, &intent)
-                .await
-                .map_err(|_| Error::unavailable())
-        })
-        .await;
-        outcomes.push(match result {
-            Ok(Ok(outcome)) => serde_json::to_value(outcome).map_err(|_| Error::unavailable())?,
-            _ => json!({"status":"unknown","retryable":true}),
-        });
+        outcomes.push(
+            tokio::time::timeout_at(
+                deadline,
+                write_intent(&state, &headers, &principal, &intent),
+            )
+            .await
+            .unwrap_or_else(|_| json!({"status":"unknown","retryable":true})),
+        );
     }
     auth::response(json!({"outcomes":outcomes,"projection_status":"not_requested"}))
 }
@@ -176,4 +171,29 @@ pub(super) async fn contexts(
     })
     .await
     .map_err(|_| Error::unavailable())?
+}
+
+// Preserve earlier committed outcomes while distinguishing a definite denial
+// before the transaction from an ambiguous storage/timeout failure.
+pub(super) async fn write_intent(
+    state: &AppState,
+    headers: &HeaderMap,
+    principal: &auth::Principal,
+    intent: &ReadIntent,
+) -> Value {
+    if let Err(error) = auth::recheck(state, headers, principal).await {
+        return if error.terminal_denial() {
+            json!({"status":"blocked"})
+        } else {
+            json!({"status":"unknown","retryable":true})
+        };
+    }
+    match state
+        .db
+        .apply_personal_read_intent(principal.tenant.community(), &principal.actor, intent)
+        .await
+    {
+        Ok(outcome) => json!(outcome),
+        Err(_) => json!({"status":"unknown","retryable":true}),
+    }
 }

@@ -703,7 +703,12 @@ mod postgres_tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 50);
+        assert_eq!(migrations.len(), 51);
+        assert_eq!(migrations[50].version, 51);
+        assert!(migrations[50]
+            .sql
+            .as_str()
+            .contains("idx_events_community_channel_received"));
         assert_eq!(migrations[49].version, 50);
         assert!(migrations[49]
             .sql

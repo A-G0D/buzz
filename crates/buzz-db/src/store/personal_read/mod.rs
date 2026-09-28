@@ -3,8 +3,10 @@
 //! Timestamp prefixes use author time; retention uses persisted relay receipt
 //! time. Only fixed context intents advance prefixes, never a query scan cap.
 
+mod classification;
 mod context;
 mod model;
+mod participation;
 mod projection;
 mod writes;
 
@@ -12,3 +14,9 @@ pub use model::*;
 
 #[cfg(test)]
 mod postgres_tests;
+
+#[cfg(test)]
+mod participation_postgres_tests;
+
+#[cfg(test)]
+mod projection_postgres_tests;

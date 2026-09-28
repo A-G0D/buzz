@@ -7,6 +7,9 @@ use crate::state::AppState;
 use axum::{routing::get, Router};
 use std::sync::Arc;
 
+/// Public accessory prefix, shared by routing and capability discovery.
+pub const BASE_PATH: &str = "/buzz/v1";
+
 /// Narrow versioned router; unknown accessory paths never return SPA HTML.
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()

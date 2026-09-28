@@ -1,5 +1,5 @@
 //! Explicit selectors over the same private frontier authority. No history API.
-use super::{model::*, projection::read_account, writes};
+use super::{classification, model::*, participation, projection::read_account, writes};
 use crate::{observability, Db, DbError, Result};
 use buzz_core::CommunityId;
 use chrono::{DateTime, Utc};
@@ -85,6 +85,7 @@ impl Db {
                 .into_iter()
                 .map(|row| Ok((row.try_get::<String, _>("id")?, row)))
                 .collect::<Result<_>>()?;
+            let mut participation = None;
             let mut messages = Vec::with_capacity(ids.len());
             for id in &query.message_ids {
                 let state = if let Some(row) = by_id.get(&id.to_ascii_lowercase()) {
@@ -112,27 +113,40 @@ impl Db {
                             let created: DateTime<Utc> = row.try_get("created_at")?;
                             let received: DateTime<Utc> = row.try_get("received_at")?;
                             let kind: i32 = row.try_get("kind")?;
-                            if row.try_get::<bool, _>("own")?
-                                || row.try_get::<bool, _>("deleted")?
-                                || !ELIGIBLE_KINDS.contains(&kind)
-                                || received.timestamp_millis() < account.cutoff_ms
-                            {
+                            if !classification::eligible(
+                                kind,
+                                row.try_get("own")?,
+                                row.try_get("deleted")?,
+                                received.timestamp_millis(),
+                                account.cutoff_ms,
+                            ) {
                                 MessageReadState::NotCounted
                             } else if prefix.is_some_and(|p| created.timestamp() <= p) {
                                 MessageReadState::Read
                             } else {
-                                let directed = row.try_get::<String, _>("channel_type")? == "dm"
-                                    || tags.iter().any(|t| {
-                                        t.len() >= 2
-                                            && ((t[0] == "p"
-                                                && t[1].eq_ignore_ascii_case(&actor.to_hex()))
-                                                || (t[0] == "broadcast" && t[1] == "1"))
-                                    });
+                                let directed = classification::directed(
+                                    &row.try_get::<String, _>("channel_type")?,
+                                    &actor.to_hex(),
+                                    &tags,
+                                );
+                                if !directed && is_reply && participation.is_none() {
+                                    participation = Some(
+                                        participation::resolve(
+                                            &mut tx,
+                                            community,
+                                            &actor_bytes,
+                                            &[(query.target.channel_id, root.clone())],
+                                        )
+                                        .await?
+                                        .remove(&(query.target.channel_id, root.clone()))
+                                        .flatten(),
+                                    );
+                                }
                                 MessageReadState::Unread {
                                     attention: if directed {
                                         Some(true)
                                     } else if is_reply {
-                                        None
+                                        participation.flatten()
                                     } else {
                                         Some(false)
                                     },

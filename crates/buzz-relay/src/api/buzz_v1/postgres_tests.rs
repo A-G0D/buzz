@@ -253,3 +253,125 @@ async fn accessory_context_get_signed_query_and_independent_batch_outcomes() {
     let result = request(state.clone(), &host, &path, "GET", Some(&auth), b"").await;
     assert_eq!(result.1["contexts"][0]["messages"][0]["status"], "read");
 }
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn accessory_write_revocation_is_terminal_before_persistence() {
+    let fixture = crate::api::bridge::postgres_tests::bridge_handler_test_state()
+        .await
+        .unwrap();
+    let mut state = (*fixture).clone();
+    let config = Arc::make_mut(&mut state.config);
+    config.buzz_v1_enabled = true;
+    config.require_relay_membership = true;
+    let state = Arc::new(state);
+    let host = format!("bff-revocation-{}.local", uuid::Uuid::new_v4());
+    let community = state
+        .db
+        .ensure_configured_community(&host)
+        .await
+        .unwrap()
+        .id;
+    let actor = Keys::generate();
+    state
+        .db
+        .add_relay_member(community, &actor.public_key().to_hex(), "member", None)
+        .await
+        .unwrap();
+    let path = "/buzz/v1/me/read-state";
+    let body = br#"{"intents":[{"type":"complete_import"}]}"#;
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert("host", host.parse().unwrap());
+    headers.insert(
+        "authorization",
+        proof(&actor, &host, path, "POST", Some(body))
+            .parse()
+            .unwrap(),
+    );
+    let principal =
+        super::auth::authorize(&state, &headers, &path.parse().unwrap(), "POST", Some(body))
+            .await
+            .ok()
+            .expect("admitted before revoke");
+    state
+        .db
+        .remove_relay_member(community, &actor.public_key().to_hex())
+        .await
+        .unwrap();
+    // Exercise the same per-item function the batch handler uses after admission.
+    let result = super::handlers::write_intent(
+        &state,
+        &headers,
+        &principal,
+        &buzz_db::personal_read::ReadIntent::CompleteImport,
+    )
+    .await;
+    assert_eq!(result, json!({"status":"blocked"}));
+    let page = state
+        .db
+        .personal_read_sidebar(community, &actor.public_key(), 86400, 1, None)
+        .await
+        .unwrap();
+    assert!(
+        page.account.imported_at_ms.is_none(),
+        "denied intent must not persist"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn accessory_discovery_is_host_bound_and_opt_in() {
+    let fixture = crate::api::bridge::postgres_tests::bridge_handler_test_state()
+        .await
+        .unwrap();
+    let host = format!("bff-discovery-{}.local", uuid::Uuid::new_v4());
+    fixture.db.ensure_configured_community(&host).await.unwrap();
+    for enabled in [false, true] {
+        let mut state = (*fixture).clone();
+        let config = Arc::make_mut(&mut state.config);
+        config.buzz_v1_enabled = enabled;
+        config.buzz_v1_retention_seconds = 1234;
+        let state = Arc::new(state);
+        for known_host in [true, false] {
+            let request_host = if known_host {
+                host.as_str()
+            } else {
+                "unknown.invalid"
+            };
+            for path in ["/", "/info"] {
+                let response = crate::router::build_router(state.clone())
+                    .oneshot(
+                        Request::builder()
+                            .uri(path)
+                            .header("host", request_host)
+                            .header("accept", "application/nostr+json")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+                let doc: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(
+                    doc.get("buzz_v1").is_some(),
+                    enabled && known_host,
+                    "enabled={enabled} known_host={known_host} path={path}"
+                );
+                if enabled && known_host {
+                    let d = &doc["buzz_v1"];
+                    assert_eq!(d["version"], 1);
+                    assert_eq!(d["base_path"], "/buzz/v1");
+                    assert_eq!(d["retention_seconds"], 1234);
+                    assert_eq!(d["max_channels"], buzz_db::personal_read::MAX_CHANNELS);
+                    assert_eq!(d["max_intents"], buzz_db::personal_read::MAX_INTENTS);
+                    assert_eq!(d["max_contexts"], buzz_db::personal_read::MAX_CONTEXTS);
+                    assert_eq!(
+                        d["max_context_messages"],
+                        buzz_db::personal_read::MAX_CONTEXT_MESSAGES
+                    );
+                }
+            }
+        }
+    }
+}

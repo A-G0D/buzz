@@ -5033,18 +5033,39 @@ pub(crate) mod postgres_tests {
         Some(Arc::new(state))
     }
 
-    // EC P-256 test key constants shared by positive-control and cardinality tests.
-    // Private key (PKCS#8 PEM) + public key coordinates (JWK x/y/kid).
-    // Used by `nip_fi_enforce_test_state_with_verifier()` and
-    // `signed_assertion_for_pubkey()`.
     const HANDLER_TEST_ISSUER: &str = "https://issuer.example";
     const HANDLER_TEST_AUDIENCE: &str = "https://relay.example";
     const HANDLER_TEST_KID: &str = "test-key-1";
-    const HANDLER_TEST_EC_PEM: &str = "-----BEGIN PRIVATE KEY-----\n\
-        MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgcnxDM4EiirH9dHUE\n\
-        WZc759TX4s5PAn8kO5ovXSnGxCWhRANCAARFb6ZnsfkqOOXyEhj3KBQphGKF4vTa\n\
-        zhebbavbZ1ZoklqkF1cGg+jTO7rONAVEzXvXUWtV6CdDV+rybiVmFP2w\n\
-        -----END PRIVATE KEY-----\n";
+
+    /// Ephemeral signing material shared by the test signer and verifier.
+    /// Never persist a private key fixture in source or on disk.
+    fn handler_test_key() -> &'static (jsonwebtoken::EncodingKey, jsonwebtoken::jwk::JwkSet) {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
+        static KEY: std::sync::OnceLock<(jsonwebtoken::EncodingKey, jsonwebtoken::jwk::JwkSet)> =
+            std::sync::OnceLock::new();
+        KEY.get_or_init(|| {
+            let rng = ring::rand::SystemRandom::new();
+            let algorithm = &ECDSA_P256_SHA256_FIXED_SIGNING;
+            let der = EcdsaKeyPair::generate_pkcs8(algorithm, &rng).expect("generate test key");
+            let pair = EcdsaKeyPair::from_pkcs8(algorithm, der.as_ref(), &rng)
+                .expect("parse generated test key");
+            // P-256 public keys use uncompressed SEC1: 0x04 || x || y.
+            let public = pair.public_key().as_ref();
+            assert_eq!(public.len(), 65);
+            assert_eq!(public[0], 4);
+            let jwks = serde_json::from_value(serde_json::json!({
+                "keys": [{
+                    "kty": "EC", "crv": "P-256", "use": "sig", "alg": "ES256",
+                    "kid": HANDLER_TEST_KID,
+                    "x": URL_SAFE_NO_PAD.encode(&public[1..33]),
+                    "y": URL_SAFE_NO_PAD.encode(&public[33..65])
+                }]
+            }))
+            .expect("valid generated JWKS");
+            (jsonwebtoken::EncodingKey::from_ec_der(der.as_ref()), jwks)
+        })
+    }
 
     /// Build a NIP-FI Enforce AppState with a real injected P-256 verifier.
     ///
@@ -5056,19 +5077,11 @@ pub(crate) mod postgres_tests {
             AssertionKeySet, FederatedAssertionVerifier, FreshnessClass, IssuerPolicy,
             IssuerRegistry, StaticIssuerKeySource, TokenClass, VerifyAssertion,
         };
-        use jsonwebtoken::{jwk::JwkSet, Algorithm};
+        use jsonwebtoken::Algorithm;
 
         let mut state = (*nip_fi_enforce_test_state().await?).clone();
 
-        let jwks: JwkSet = serde_json::from_value(serde_json::json!({
-            "keys": [{
-                "kty": "EC", "crv": "P-256", "use": "sig", "alg": "ES256",
-                "kid": HANDLER_TEST_KID,
-                "x": "RW-mZ7H5Kjjl8hIY9ygUKYRiheL02s4Xm22r22dWaJI",
-                "y": "WqQXVwaD6NM7us40BUTNe9dRa1XoJ0NX6vJuJWYU_bA"
-            }]
-        }))
-        .expect("valid test JWKS");
+        let jwks = handler_test_key().1.clone();
         let hard_deadline = chrono::Utc::now() + chrono::Duration::seconds(3600);
         let key_set =
             AssertionKeySet::new_for_test(HANDLER_TEST_ISSUER.to_owned(), 1, jwks, hard_deadline)
@@ -5104,7 +5117,7 @@ pub(crate) mod postgres_tests {
     /// Mint a signed NIP-FI assertion whose `nostr_pubkey` = `pubkey_hex`,
     /// using the shared HANDLER_TEST_* key material.
     fn signed_assertion_for_pubkey(pubkey_hex: &str) -> String {
-        use jsonwebtoken::{Algorithm, EncodingKey, Header};
+        use jsonwebtoken::{Algorithm, Header};
         let now = chrono::Utc::now().timestamp();
         let claims = serde_json::json!({
             "iss": HANDLER_TEST_ISSUER,
@@ -5117,9 +5130,8 @@ pub(crate) mod postgres_tests {
         let mut header = Header::new(Algorithm::ES256);
         header.kid = Some(HANDLER_TEST_KID.to_owned());
         header.typ = Some("nip-fi+jwt".to_owned());
-        let key =
-            EncodingKey::from_ec_pem(HANDLER_TEST_EC_PEM.as_bytes()).expect("valid test EC PEM");
-        jsonwebtoken::encode(&header, &claims, &key).expect("sign assertion")
+        let key = &handler_test_key().0;
+        jsonwebtoken::encode(&header, &claims, key).expect("sign assertion")
     }
 
     /// Build a HeaderMap containing a valid NIP-98 Authorization header +
@@ -6026,6 +6038,54 @@ pub(crate) mod postgres_tests {
     // Mirror of the GIF case through the moderation route.
     // Falsifying mutation: remove key-pairing check → admission passes → 403 from
     // moderation authz (not NIP-FI) with different JSON body.
+    // BFF admission must pair the asserted identity with the signed request.
+    #[test]
+    #[ignore = "requires Postgres"]
+    fn nip_fi_enforce_buzz_v1_sidebar_pairs_request_identity() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current_thread runtime");
+        let Some(state) = rt.block_on(nip_fi_enforce_test_state_with_verifier()) else {
+            panic!("local Postgres not reachable");
+        };
+        let mut s = (*state).clone();
+        std::sync::Arc::make_mut(&mut s.config).buzz_v1_enabled = true;
+        let state = std::sync::Arc::new(s);
+        let host = format!("bffv1-{}.local", uuid::Uuid::new_v4().simple());
+        rt.block_on(state.db.ensure_configured_community(&host))
+            .expect("ensure community");
+        let path = "/buzz/v1/me/sidebar?limit=1";
+        let url = format!("https://{host}{path}");
+        let key_nip98 = Keys::generate();
+        let key_assertion = Keys::generate();
+        let mut results = Vec::new();
+        for (label, akey) in [("paired", &key_nip98), ("mismatched", &key_assertion)] {
+            let assertion = signed_assertion_for_pubkey(&akey.public_key().to_hex());
+            let mut headers = make_nip98_headers(&key_nip98, &url, "GET", b"");
+            headers.insert(
+                buzz_auth::CLIENT_ATTACHED_HEADER,
+                format!("Bearer {assertion}").parse().expect("valid header"),
+            );
+            let (status, _h, body) = rt.block_on(oneshot_request_full(
+                state.clone(),
+                "GET",
+                path,
+                &host,
+                headers,
+                b"",
+            ));
+            assert!(!body.is_empty(), "{label} response");
+            results.push(status);
+        }
+        assert_eq!(results[0], axum::http::StatusCode::OK, "paired control");
+        assert_eq!(
+            results[1],
+            axum::http::StatusCode::FORBIDDEN,
+            "mismatched assertion key must be denied on /buzz/v1"
+        );
+    }
+
     #[test]
     #[ignore = "requires Postgres"]
     fn nip_fi_enforce_moderation_mismatched_key_is_403() {
@@ -6463,7 +6523,7 @@ pub(crate) mod postgres_tests {
             AssertionKeySet, FederatedAssertionVerifier, FreshnessClass, IssuerPolicy,
             IssuerRegistry, StaticIssuerKeySource, TokenClass, VerifyAssertion,
         };
-        use jsonwebtoken::{jwk::JwkSet, Algorithm};
+        use jsonwebtoken::Algorithm;
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -6525,29 +6585,15 @@ pub(crate) mod postgres_tests {
 
         // ── 2. Build the verifier with StaticIssuerKeySource + test key ───────
         //
-        // The verifier is seeded with a known P-256 public key.  Tokens that
-        // claim `iss=https://issuer.test` will be verified against this key.
+        // The verifier is seeded with an ephemeral P-256 public key. Tokens that
+        // claim `iss=https://issuer.example` will be verified against this key.
         // A token with an all-zero signature will fail `InvalidSignatureOrClaims`
         // → DenialClass::EvidenceRejected → 403.
         //
-        // Key constants match the canonical test key in buzz-auth
-        // (verifier/tests.rs): TEST_JWK_X / TEST_JWK_Y / TEST_KID / ISSUER.
         const TEST_ISSUER: &str = "https://issuer.example";
         const TEST_AUDIENCE: &str = "https://relay.example";
-        const TEST_KID: &str = "test-key-1";
 
-        let jwks: JwkSet = serde_json::from_value(serde_json::json!({
-            "keys": [{
-                "kty": "EC",
-                "crv": "P-256",
-                "use": "sig",
-                "alg": "ES256",
-                "kid": TEST_KID,
-                "x": "RW-mZ7H5Kjjl8hIY9ygUKYRiheL02s4Xm22r22dWaJI",
-                "y": "WqQXVwaD6NM7us40BUTNe9dRa1XoJ0NX6vJuJWYU_bA"
-            }]
-        }))
-        .expect("valid test JWKS");
+        let jwks = handler_test_key().1.clone();
 
         let hard_deadline = chrono::Utc::now() + chrono::Duration::seconds(3600);
         let key_set = AssertionKeySet::new_for_test(TEST_ISSUER.to_owned(), 1, jwks, hard_deadline)
@@ -6706,7 +6752,7 @@ pub(crate) mod postgres_tests {
             AssertionKeySet, FederatedAssertionVerifier, FreshnessClass, IssuerPolicy,
             IssuerRegistry, StaticIssuerKeySource, TokenClass, VerifyAssertion,
         };
-        use jsonwebtoken::{jwk::JwkSet, Algorithm};
+        use jsonwebtoken::Algorithm;
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -6913,27 +6959,12 @@ pub(crate) mod postgres_tests {
             panic!("local Postgres not reachable (enforce)");
         };
 
-        // Inject the real verifier with the static test key.
+        // Inject the real verifier with the ephemeral test key.
         const TEST_ISSUER: &str = "https://issuer.example";
         const TEST_AUDIENCE: &str = "https://relay.example";
         const TEST_KID: &str = "test-key-1";
-        // PKCS#8 private key matching TEST_JWK_X/Y — same key used by
-        // nip_fi_guard_rejects_crypto_invalid_assertion_before_handler_fires.
-        const TEST_EC_PKCS8_PEM: &str = "-----BEGIN PRIVATE KEY-----\n\
-            MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgcnxDM4EiirH9dHUE\n\
-            WZc759TX4s5PAn8kO5ovXSnGxCWhRANCAARFb6ZnsfkqOOXyEhj3KBQphGKF4vTa\n\
-            zhebbavbZ1ZoklqkF1cGg+jTO7rONAVEzXvXUWtV6CdDV+rybiVmFP2w\n\
-            -----END PRIVATE KEY-----\n";
 
-        let jwks: JwkSet = serde_json::from_value(serde_json::json!({
-            "keys": [{
-                "kty": "EC", "crv": "P-256", "use": "sig", "alg": "ES256",
-                "kid": TEST_KID,
-                "x": "RW-mZ7H5Kjjl8hIY9ygUKYRiheL02s4Xm22r22dWaJI",
-                "y": "WqQXVwaD6NM7us40BUTNe9dRa1XoJ0NX6vJuJWYU_bA"
-            }]
-        }))
-        .expect("valid test JWKS");
+        let jwks = handler_test_key().1.clone();
 
         let hard_deadline = chrono::Utc::now() + chrono::Duration::seconds(3600);
         let key_set = AssertionKeySet::new_for_test(TEST_ISSUER.to_owned(), 1, jwks, hard_deadline)
@@ -6975,7 +7006,7 @@ pub(crate) mod postgres_tests {
         // Mint a valid signed assertion for an arbitrary test pubkey.
         let assertion_pubkey_hex = nostr::Keys::generate().public_key().to_hex();
         let valid_assertion = {
-            use jsonwebtoken::{Algorithm, EncodingKey, Header};
+            use jsonwebtoken::{Algorithm, Header};
             let now = chrono::Utc::now().timestamp();
             let claims = serde_json::json!({
                 "iss": TEST_ISSUER,
@@ -6988,9 +7019,8 @@ pub(crate) mod postgres_tests {
             let mut header = Header::new(Algorithm::ES256);
             header.kid = Some(TEST_KID.to_owned());
             header.typ = Some("nip-fi+jwt".to_owned());
-            let key =
-                EncodingKey::from_ec_pem(TEST_EC_PKCS8_PEM.as_bytes()).expect("valid test EC PEM");
-            jsonwebtoken::encode(&header, &claims, &key).expect("sign assertion")
+            let key = &handler_test_key().0;
+            jsonwebtoken::encode(&header, &claims, key).expect("sign assertion")
         };
 
         // Pre-condition: verifier accepts the token.
@@ -7016,7 +7046,7 @@ pub(crate) mod postgres_tests {
 
         // Mint a same-key assertion: nostr_pubkey = keys2's public key.
         let same_key_assertion = {
-            use jsonwebtoken::{Algorithm, EncodingKey, Header};
+            use jsonwebtoken::{Algorithm, Header};
             let now = chrono::Utc::now().timestamp();
             let claims = serde_json::json!({
                 "iss": TEST_ISSUER,
@@ -7029,9 +7059,8 @@ pub(crate) mod postgres_tests {
             let mut header = Header::new(Algorithm::ES256);
             header.kid = Some(TEST_KID.to_owned());
             header.typ = Some("nip-fi+jwt".to_owned());
-            let key =
-                EncodingKey::from_ec_pem(TEST_EC_PKCS8_PEM.as_bytes()).expect("valid test EC PEM");
-            jsonwebtoken::encode(&header, &claims, &key).expect("sign same-key assertion")
+            let key = &handler_test_key().0;
+            jsonwebtoken::encode(&header, &claims, key).expect("sign same-key assertion")
         };
         // Pre-condition: same-key assertion is accepted.
         assert!(

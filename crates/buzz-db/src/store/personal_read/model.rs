@@ -65,6 +65,8 @@ pub struct ReadAccount {
 pub const MAX_CHANNELS: usize = 20;
 /// Bounded event evidence per channel; exhaustion is never inferred at this cap.
 pub const MAX_CHANNEL_SCAN: usize = 256;
+/// Receipt-window work budget per channel, before eligibility/ancestry joins.
+pub const MAX_RECEIPT_SCAN: usize = 4096;
 /// Conversation kinds eligible for ordinary unread state (not edits/reactions).
 pub const ELIGIBLE_KINDS: [i32; 4] = [9, 40002, 45001, 45003];
 
@@ -77,11 +79,25 @@ pub enum ReadCount {
         /// Total within the tracking horizon.
         value: u32,
     },
+    /// Incomplete evidence establishes no positive lower bound. No numeric value.
+    Unknown,
     /// More evidence exists or ancestry/participation could not be proved.
     AtLeast {
         /// Proven lower bound, not a fabricated badge cap.
         value: u32,
     },
+}
+
+impl ReadCount {
+    pub(super) fn from_evidence(value: u32, complete: bool) -> Self {
+        if complete {
+            Self::Exact { value }
+        } else if value == 0 {
+            Self::Unknown
+        } else {
+            Self::AtLeast { value }
+        }
+    }
 }
 
 /// One joined-channel summary, not a second conversation/history API.
@@ -99,7 +115,10 @@ pub struct ChannelReadSummary {
     pub hidden: bool,
     /// Ordinary unread lower bound or exact count.
     pub unread: ReadCount,
-    /// Directed unread (DM, mention/broadcast, participating-thread reply).
+    /// Directed unread: DM, direct mention/broadcast, or a reply in a thread
+    /// with a live eligible message authored by this actor (including the root).
+    /// This is not Desktop notification eligibility: follows, mutes and prior
+    /// mentions elsewhere in a thread do not change this count.
     pub attention: ReadCount,
     /// Latest eligible nondeleted event ID, independent of read progress, author,
     /// and the unread-tracking horizon.
