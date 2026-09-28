@@ -429,8 +429,9 @@ pub(crate) async fn handle_active_audio_connection(
             );
             let _ = crate::connection::send_exit_frames_bounded(
                 &mut ws_send,
-                [crate::nip_fi_session::authorization_denied_frame(
+                [crate::nip_fi_session::denial_frame(
                     crate::nip_fi_session::NipFiWsRoute::Audio,
+                    buzz_auth::DenialClass::AuthorizationDenied,
                 )],
             )
             .await;
@@ -521,12 +522,24 @@ pub(crate) async fn handle_active_audio_connection(
                 Ok(ctx) => ctx,
                 Err(e) => {
                     warn!(channel_id = %channel_id, "audio auth failed: {e}");
-                    let _ = crate::connection::send_exit_frames_bounded(&mut ws_send, [WsMessage::Text(
+                    // Under NIP-FI the failure is classified exactly as on the
+                    // root route; Off-mode keeps the legacy bespoke frame.
+                    let frame = if nip_fi_assertion.is_some() {
+                        crate::nip_fi_session::denial_frame(
+                            crate::nip_fi_session::NipFiWsRoute::Audio,
+                            crate::handlers::auth::nip42_denial_class(&e),
+                        )
+                    } else {
+                        WsMessage::Text(
                             serde_json::json!({"type":"error","message":"auth failed"})
                                 .to_string()
                                 .into(),
-                        )])
-                        .await;
+                        )
+                    };
+                    crate::connection::send_exit_frames_bounded(&mut ws_send, [frame]).await;
+                    if nip_fi_assertion.is_some() {
+                        cancel.cancel();
+                    }
                     return;
                 }
             }
@@ -580,8 +593,9 @@ pub(crate) async fn handle_active_audio_connection(
             );
             let _ = crate::connection::send_exit_frames_bounded(
                 &mut ws_send,
-                [crate::nip_fi_session::authorization_denied_frame(
+                [crate::nip_fi_session::denial_frame(
                     crate::nip_fi_session::NipFiWsRoute::Audio,
+                    buzz_auth::DenialClass::AuthorizationDenied,
                 )],
             )
             .await;
@@ -608,8 +622,9 @@ pub(crate) async fn handle_active_audio_connection(
             // Fix 4b: route through the canonical constructor when FI assertion
             // is present — emits `{"type":"restricted",...}`, byte-exact denial.
             // [FI-TRACE-DENIAL-ORACLE, NIP-FI §authorization_denied]
-            crate::nip_fi_session::authorization_denied_frame(
+            crate::nip_fi_session::denial_frame(
                 crate::nip_fi_session::NipFiWsRoute::Audio,
+                buzz_auth::DenialClass::AuthorizationDenied,
             )
         } else {
             WsMessage::Text(
@@ -640,8 +655,9 @@ pub(crate) async fn handle_active_audio_connection(
                 // Fix 4b: route through the canonical constructor when FI assertion
                 // is present — emits `{"type":"restricted",...}`, byte-exact denial.
                 // [FI-TRACE-DENIAL-ORACLE, NIP-FI §authorization_denied]
-                crate::nip_fi_session::authorization_denied_frame(
+                crate::nip_fi_session::denial_frame(
                     crate::nip_fi_session::NipFiWsRoute::Audio,
+                    buzz_auth::DenialClass::AuthorizationDenied,
                 )
             } else {
                 WsMessage::Text(
@@ -1510,8 +1526,9 @@ pub(crate) async fn handle_active_audio_connection(
             // every other local-policy denial and the specific reason cannot be
             // distinguished by the client. [FI-TRACE-DENIAL-ORACLE]
             let deny_frame = if nip_fi_assertion.is_some() {
-                crate::nip_fi_session::authorization_denied_frame(
+                crate::nip_fi_session::denial_frame(
                     crate::nip_fi_session::NipFiWsRoute::Audio,
+                    buzz_auth::DenialClass::AuthorizationDenied,
                 )
             } else {
                 WsMessage::Text(
@@ -3657,13 +3674,118 @@ mod tests {
         let _ = server.await;
     }
 
+    /// Drive `handle_active_audio_connection` through a NIP-42 proof signed
+    /// over the wrong challenge; return every text frame received after the
+    /// challenge (until close) and whether the connection token was cancelled.
+    async fn run_audio_bad_nip42_proof(
+        assertion: Option<buzz_auth::VerifiedAssertion>,
+    ) -> (Vec<String>, bool) {
+        use std::sync::Arc;
+        let key = nostr::Keys::generate();
+        let state = audio_test_state().await;
+        let tenant = buzz_core::tenant::TenantContext::resolved(
+            buzz_core::tenant::CommunityId::from_uuid(uuid::Uuid::nil()),
+            "test.local".to_string(),
+        );
+        let conn_cancel = CancellationToken::new();
+        let cancel_for_assert = conn_cancel.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let app = Router::new().route(
+            "/",
+            get(move |ws: WebSocketUpgrade| {
+                let (state, tenant, assertion) =
+                    (Arc::clone(&state), tenant.clone(), assertion.clone());
+                let control = crate::state::CommunityConnectionControl::new(conn_cancel.clone());
+                async move {
+                    ws.on_upgrade(move |socket| async move {
+                        handle_active_audio_connection(
+                            socket,
+                            state,
+                            tenant,
+                            uuid::Uuid::new_v4(),
+                            control,
+                            assertion,
+                            chrono::Utc::now(),
+                            None,
+                        )
+                        .await
+                    })
+                }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let (mut client, _) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("connect");
+        let _challenge = tokio::time::timeout(std::time::Duration::from_secs(2), client.next())
+            .await
+            .expect("challenge timeout");
+        let auth_event = nostr::EventBuilder::new(nostr::Kind::Authentication, "")
+            .tag(nostr::Tag::parse(["relay", "ws://test.local"]).unwrap())
+            .tag(nostr::Tag::parse(["challenge", "not-the-issued-challenge"]).unwrap())
+            .sign_with_keys(&key)
+            .unwrap();
+        client
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                serde_json::json!({"type": "auth", "event": auth_event})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .expect("send auth");
+        let mut frames = Vec::new();
+        while let Ok(Some(Ok(msg))) =
+            tokio::time::timeout(std::time::Duration::from_secs(3), client.next()).await
+        {
+            match msg {
+                tokio_tungstenite::tungstenite::Message::Text(t) => frames.push(t.to_string()),
+                tokio_tungstenite::tungstenite::Message::Close(_) => break,
+                _ => {}
+            }
+        }
+        server.abort();
+        (frames, cancel_for_assert.is_cancelled())
+    }
+
+    /// Under NIP-FI a failed NIP-42 proof is classified like the root route:
+    /// exactly one canonical `restricted: evidence rejected`, then cancel.
+    ///
+    /// Mutation oracle: send the bespoke `auth failed` frame on the FI branch
+    /// → the frame comparison goes RED.
+    #[tokio::test]
+    async fn audio_bad_nip42_proof_with_fi_emits_one_evidence_rejected_then_cancels() {
+        let assertion = buzz_auth::VerifiedAssertion::for_test(
+            Some(nostr::Keys::generate().public_key()),
+            vec![chrono::Utc::now() + chrono::Duration::hours(1)],
+        );
+        let (frames, cancelled) = run_audio_bad_nip42_proof(Some(assertion)).await;
+        let expected = serde_json::json!({
+            "type": "restricted",
+            "message": buzz_auth::DenialClass::EvidenceRejected.nostr_text()
+        })
+        .to_string();
+        assert_eq!(frames, vec![expected]);
+        assert!(cancelled, "FI NIP-42 denial must cancel the connection");
+    }
+
+    /// Off-mode control: a failed NIP-42 proof keeps the legacy frame bytes.
+    #[tokio::test]
+    async fn audio_bad_nip42_proof_off_mode_keeps_auth_failed_frame() {
+        let (frames, _) = run_audio_bad_nip42_proof(None).await;
+        assert_eq!(
+            frames,
+            vec![serde_json::json!({"type":"error","message":"auth failed"}).to_string()]
+        );
+    }
+
     // ── W5 (B1 audio): already-expired deadline rejects before auth challenge ─────
     //
     // When the NIP-FI session deadline is already past at upgrade time, the pre-auth
     // fast path in `handle_active_audio_connection` sends the canonical `restricted`
     // denial frame DIRECTLY and closes the connection — before a challenge is ever
     // sent to the client. The race against the spawned expiry task (try_recv) is
-    // eliminated: the fast path calls `authorization_denied_frame` synchronously.
+    // eliminated: the fast path calls `denial_frame` synchronously.
     //
     // This test gives the handler the same key in both the assertion and the
     // NIP-42 event so pairing would pass, but sets an already-expired deadline.
@@ -3674,7 +3796,7 @@ mod tests {
     //      first received message is Text (challenge JSON), not restricted JSON →
     //      the Text match arm finds challenge content, not "restricted" → assertion
     //      on `expected_restricted` panics.
-    //   B) Remove the `authorization_denied_frame` send from the fast-path →
+    //   B) Remove the `denial_frame` send from the fast-path →
     //      connection closes without any frame → timeout panics.
     //   C) Omit `cancel.cancel()` in the fast-path → `cancel_for_assert.is_cancelled()`
     //      panics.
@@ -9188,7 +9310,7 @@ mod tests {
         // When `require_relay_membership = true` and the connecting pubkey is NOT
         // in `relay_members`, `enforce_relay_membership` returns `Denied`.
         // The handler must send `{"type":"restricted","message":"restricted:
-        // authorization denied"}` — byte-exact via `authorization_denied_frame(Audio)`.
+        // authorization denied"}` — byte-exact via `denial_frame(Audio, AuthorizationDenied)`.
         //
         // ## Mutation oracle
         //
@@ -10243,10 +10365,10 @@ mod tests {
             let expired_at = tokio::time::Instant::now();
             tokio::spawn(async move {
                 gate.expire(|| {
-                    let _ =
-                        terminal_tx.try_send(crate::nip_fi_session::authorization_denied_frame(
-                            crate::nip_fi_session::NipFiWsRoute::Audio,
-                        ));
+                    let _ = terminal_tx.try_send(crate::nip_fi_session::denial_frame(
+                        crate::nip_fi_session::NipFiWsRoute::Audio,
+                        buzz_auth::DenialClass::AuthorizationDenied,
+                    ));
                 })
                 .await;
             });
@@ -11000,8 +11122,9 @@ mod tests {
         };
         let (terminal_tx, mut terminal_ctrl_rx) = tokio::sync::mpsc::channel::<WsMessage>(1);
         terminal_tx
-            .try_send(crate::nip_fi_session::authorization_denied_frame(
+            .try_send(crate::nip_fi_session::denial_frame(
                 crate::nip_fi_session::NipFiWsRoute::Audio,
+                buzz_auth::DenialClass::AuthorizationDenied,
             ))
             .expect("queue terminal frame");
         let cancel = CancellationToken::new();

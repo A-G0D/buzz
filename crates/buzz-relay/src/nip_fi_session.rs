@@ -8,7 +8,7 @@
 //!   auth-state transition (Root), and cancellation for both ingresses.
 //! * [`spawn_nip_fi_expiry_task`] — the shared session-lifetime enforcement
 //!   constructor used by both root and audio routes.
-//! * [`authorization_denied_frame`] — route-specific frame builder used by
+//! * [`denial_frame`] — route- and class-specific frame builder used by
 //!   both the pairing seam and the expiry seam.
 //!
 //! **Invariant**: both production call sites call `enforce_nip_fi_key_pairing`
@@ -107,9 +107,10 @@ pub(crate) async fn enforce_nip_fi_key_pairing(
             conn.reject_auth(crate::metrics::AuthOutcome::PairingMismatch);
             // Use the dedicated terminal channel — guaranteed one free slot even
             // when ctrl_tx (capacity 8) is saturated by ordinary control traffic.
-            let _ = conn
-                .terminal_ctrl_tx
-                .try_send(authorization_denied_frame(NipFiWsRoute::Root));
+            let _ = conn.terminal_ctrl_tx.try_send(denial_frame(
+                NipFiWsRoute::Root,
+                buzz_auth::DenialClass::AuthorizationDenied,
+            ));
             conn.cancel.cancel();
         }
         PairingDenialTarget::Audio {
@@ -125,7 +126,10 @@ pub(crate) async fn enforce_nip_fi_key_pairing(
             );
             crate::connection::send_exit_frames_bounded(
                 ws_send,
-                [authorization_denied_frame(NipFiWsRoute::Audio)],
+                [denial_frame(
+                    NipFiWsRoute::Audio,
+                    buzz_auth::DenialClass::AuthorizationDenied,
+                )],
             )
             .await;
             cancel.cancel();
@@ -137,29 +141,21 @@ pub(crate) async fn enforce_nip_fi_key_pairing(
 
 // ── Shared frame constructor ───────────────────────────────────────────────────
 
-/// Build the exact NIP-FI authorization-denied frame for the given route.
+/// Build the canonical NIP-FI denial frame for `route` and `class`.
 ///
-/// * Root: a Nostr NOTICE — `["NOTICE","restricted: authorization denied"]`.
+/// * Root: a Nostr NOTICE, e.g. `["NOTICE","restricted: authorization denied"]`.
 /// * Audio: `{"type":"restricted","message":"restricted: authorization denied"}`.
-pub(crate) fn authorization_denied_frame(route: NipFiWsRoute) -> WsMessage {
-    use buzz_auth::DenialClass;
+pub(crate) fn denial_frame(route: NipFiWsRoute, class: buzz_auth::DenialClass) -> WsMessage {
     match route {
-        NipFiWsRoute::Root => root_denial_frame(DenialClass::AuthorizationDenied),
+        NipFiWsRoute::Root => {
+            WsMessage::Text(crate::protocol::RelayMessage::notice(class.nostr_text()).into())
+        }
         NipFiWsRoute::Audio => WsMessage::Text(
-            serde_json::json!({
-                "type": "restricted",
-                "message": DenialClass::AuthorizationDenied.nostr_text()
-            })
-            .to_string()
-            .into(),
+            serde_json::json!({"type": "restricted", "message": class.nostr_text()})
+                .to_string()
+                .into(),
         ),
     }
-}
-
-/// Build the canonical post-establishment Root NOTICE for any NIP-FI denial
-/// class, e.g. `["NOTICE","restricted: authorization unavailable"]`.
-pub(crate) fn root_denial_frame(class: buzz_auth::DenialClass) -> WsMessage {
-    WsMessage::Text(crate::protocol::RelayMessage::notice(class.nostr_text()).into())
 }
 
 // ── Shared expiry task constructor ────────────────────────────────────────────
@@ -206,7 +202,10 @@ pub(crate) fn spawn_nip_fi_expiry_task(
                 // handle before remove_connection) cannot start until pre-expiry
                 // effects have finished their bounded commits.
                 gate.expire(|| {
-                    let _ = terminal_ctrl_tx.try_send(authorization_denied_frame(route));
+                    let _ = terminal_ctrl_tx.try_send(denial_frame(
+                        route,
+                        buzz_auth::DenialClass::AuthorizationDenied,
+                    ));
                     metrics::counter!("buzz_nip_fi_lease_expirations_total").increment(1);
                     warn!(
                         route = ?route,

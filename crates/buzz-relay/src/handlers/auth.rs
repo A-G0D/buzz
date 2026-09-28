@@ -75,7 +75,7 @@ fn ban_denial(outcome: BanOutcome) -> Option<(&'static str, &'static str, AuthOu
 /// NIP-FI class for a failed NIP-42 proof: a bad proof is client evidence
 /// (`evidence rejected`); only a relay-internal verifier failure is
 /// `authorization unavailable`.
-fn nip42_denial_class(error: &buzz_auth::AuthError) -> buzz_auth::DenialClass {
+pub(crate) fn nip42_denial_class(error: &buzz_auth::AuthError) -> buzz_auth::DenialClass {
     match error {
         buzz_auth::AuthError::Internal(_) => buzz_auth::DenialClass::AuthorizationUnavailable,
         _ => buzz_auth::DenialClass::EvidenceRejected,
@@ -89,7 +89,10 @@ fn nip42_denial_class(error: &buzz_auth::AuthError) -> buzz_auth::DenialClass {
 fn deny_nip_fi_auth(conn: &ConnectionState, class: buzz_auth::DenialClass) {
     let _ = conn
         .terminal_ctrl_tx
-        .try_send(crate::nip_fi_session::root_denial_frame(class));
+        .try_send(crate::nip_fi_session::denial_frame(
+            crate::nip_fi_session::NipFiWsRoute::Root,
+            class,
+        ));
     conn.cancel.cancel();
 }
 
@@ -909,7 +912,10 @@ mod tests {
         fn assert_fi_terminal(mut self, class: buzz_auth::DenialClass) {
             assert_eq!(
                 self.terminal_rx.try_recv().expect("terminal denial frame"),
-                crate::nip_fi_session::root_denial_frame(class),
+                crate::nip_fi_session::denial_frame(
+                    crate::nip_fi_session::NipFiWsRoute::Root,
+                    class
+                ),
             );
             assert!(
                 self.terminal_rx.try_recv().is_err(),
@@ -1345,8 +1351,9 @@ mod tests {
             // NOTICE frame (byte-identical to expiry/pairing-mismatch denials),
             // NOT an OK envelope. The denial arrives on terminal_ctrl_tx.
             // The cancel token must be triggered (connection terminates).
-            let expected_frame = crate::nip_fi_session::authorization_denied_frame(
+            let expected_frame = crate::nip_fi_session::denial_frame(
                 crate::nip_fi_session::NipFiWsRoute::Root,
+                buzz_auth::DenialClass::AuthorizationDenied,
             );
             // Ordinary channel must NOT contain the denial (no OK fallthrough).
             while let Ok(frame) = send_rx.try_recv() {
@@ -1367,7 +1374,7 @@ mod tests {
                 .expect("Fix 4a: canonical denial must be on terminal_ctrl_rx");
             assert_eq!(
                 terminal_frame, expected_frame,
-                "Fix 4a: terminal frame must be the exact canonical authorization_denied_frame"
+                "Fix 4a: terminal frame must be the exact canonical denial_frame"
             );
             // Cancel must have fired — connection terminates.
             assert!(

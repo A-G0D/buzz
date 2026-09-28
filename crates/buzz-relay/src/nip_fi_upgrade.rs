@@ -241,7 +241,7 @@ mod tests {
         // wire frames on both ingresses.
         //
         // With `enforce_nip_fi_key_pairing` owning the full denial path, both
-        // conditions reach the exact same `authorization_denied_frame(route)`
+        // conditions reach the exact same `denial_frame(route, AuthorizationDenied)`
         // call.  This test pins that call against the production frame builder
         // and asserts that:
         //   1. Root and audio denial frames carry the correct denial text.
@@ -250,18 +250,21 @@ mod tests {
         //      (private-state) — the oracle property.
         //
         // Mutation evidence:
-        //   A) Change `DenialClass::AuthorizationDenied` in `authorization_denied_frame`
+        //   A) Change `DenialClass::AuthorizationDenied` in `denial_frame`
         //      → `nostr_text()` differs → root/audio text assertions panic.
         //   B) Swap the root NOTICE with a raw string → JSON parse fails or
         //      content assertion panics.
         //   C) Map `EvidenceRejected` to the same body → distinctness assert panics.
-        use crate::nip_fi_session::{authorization_denied_frame, NipFiWsRoute};
+        use crate::nip_fi_session::{denial_frame, NipFiWsRoute};
         use axum::extract::ws::Message as WsMessage;
 
         let expected_text = buzz_auth::DenialClass::AuthorizationDenied.nostr_text();
 
         // Root frame: NOTICE JSON, content == nostr_text().
-        let root_frame = authorization_denied_frame(NipFiWsRoute::Root);
+        let root_frame = denial_frame(
+            NipFiWsRoute::Root,
+            buzz_auth::DenialClass::AuthorizationDenied,
+        );
         match root_frame {
             WsMessage::Text(t) => {
                 let v: serde_json::Value =
@@ -276,7 +279,10 @@ mod tests {
         }
 
         // Audio frame: JSON object with type/message fields.
-        let audio_frame = authorization_denied_frame(NipFiWsRoute::Audio);
+        let audio_frame = denial_frame(
+            NipFiWsRoute::Audio,
+            buzz_auth::DenialClass::AuthorizationDenied,
+        );
         match audio_frame {
             WsMessage::Text(t) => {
                 let v: serde_json::Value =

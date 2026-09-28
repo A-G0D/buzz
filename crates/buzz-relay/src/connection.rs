@@ -2115,8 +2115,9 @@ pub(crate) mod tests {
 
         // Queue a FI denial on the terminal channel — simulates an expiry
         // task firing and queuing a denial just before cancellation.
-        let denial = crate::nip_fi_session::authorization_denied_frame(
+        let denial = crate::nip_fi_session::denial_frame(
             crate::nip_fi_session::NipFiWsRoute::Root,
+            buzz_auth::DenialClass::AuthorizationDenied,
         );
         terminal_ctrl_tx
             .try_send(denial)
@@ -2172,8 +2173,9 @@ pub(crate) mod tests {
         let cancel = CancellationToken::new();
         let ready_polled = Arc::new(Notify::new());
 
-        let denial = crate::nip_fi_session::authorization_denied_frame(
+        let denial = crate::nip_fi_session::denial_frame(
             crate::nip_fi_session::NipFiWsRoute::Root,
+            buzz_auth::DenialClass::AuthorizationDenied,
         );
         terminal_ctrl_tx.try_send(denial).expect("queue FI denial");
 
@@ -2708,8 +2710,9 @@ pub(crate) mod tests {
         // Enqueue the denial frame on the terminal channel, then cancel.
         // This is the queue-then-cancel pattern the pairing denial path uses.
         terminal_ctrl_tx
-            .try_send(crate::nip_fi_session::authorization_denied_frame(
+            .try_send(crate::nip_fi_session::denial_frame(
                 NipFiWsRoute::Root,
+                buzz_auth::DenialClass::AuthorizationDenied,
             ))
             .expect("terminal channel is empty");
         cancel.cancel();

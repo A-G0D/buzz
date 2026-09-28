@@ -41,7 +41,7 @@
 //! | **W5** (audio B1 expired-at-pairing) | `audio/handler.rs`, B1 deadline check after NIP-42 auth | Remove the already-expired deadline check | frame text changes to "not a relay member" → byte assertion panics |
 //! | **W6** (audio B1 mid-admission) | `audio/handler.rs`, biased `cancel.cancelled()` in auth select | Remove `_ = cancel.cancelled() => return` | handler proceeds to auth exchange; close assertion fires on 3s timeout |
 //! | **B1-pre-auth** (audio already-expired pre-auth fast path) | `audio/handler.rs` — synchronous fast-path before NIP-42 challenge | Remove pre-auth already-expired block | challenge sent before denial → first received message is Text challenge → restricted frame never arrives → timeout panics |
-//! | **B1-pre-auth** (audio already-expired pre-auth fast path) | same | Remove `authorization_denied_frame` send from fast-path | no restricted frame → timeout panics |
+//! | **B1-pre-auth** (audio already-expired pre-auth fast path) | same | Remove `denial_frame` send from fast-path | no restricted frame → timeout panics |
 //! | **B1-pre-auth** (audio already-expired pre-auth fast path) | same | Remove `cancel.cancel()` from fast-path | `cancel_for_assert.is_cancelled()` panics |
 //! | **P2-verify-fence** (audio verify_auth_event cancel fence) | `audio/handler.rs` — biased `select!` around `verify_auth_event` | Remove the select (bare `.await`) | verify completes post-cancel → pairing bookkeeping reached → `pairing_reached_after_cancel` counter > 0 → assertion panics |
 //! | **P2-verify-fence** (audio verify_auth_event cancel fence) | same | Delete `before_auth_verify(...)` call | `arrived_rx` times out → test panics |
