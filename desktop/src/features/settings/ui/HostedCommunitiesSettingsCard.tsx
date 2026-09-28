@@ -486,11 +486,8 @@ export function HostedCommunitiesSettingsCard() {
           <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-border/70 p-4">
             <div>
               <p className="text-sm font-medium">
-                {auth.name || auth.email || "Builderlab account"}
+                {auth.email || "Builderlab account"}
               </p>
-              {auth.name && auth.email ? (
-                <p className="text-xs text-muted-foreground">{auth.email}</p>
-              ) : null}
             </div>
             <Button
               variant="outline"
