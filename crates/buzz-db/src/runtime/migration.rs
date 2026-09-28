@@ -705,7 +705,7 @@ mod postgres_tests {
 
         assert_eq!(migrations.len(), 50);
         assert_eq!(migrations[48].version, 49);
-        assert_eq!(migrations[49].version, 50);
+        assert_eq!(migrations[49].version, 51);
         assert!(migrations[48]
             .sql
             .as_str()
@@ -1770,10 +1770,10 @@ mod postgres_tests {
             .expect("embedded migration 0029")
             .sql
             .as_ref();
-        let migration_0050: &str = MIGRATOR
+        let migration_0051: &str = MIGRATOR
             .iter()
-            .find(|migration| migration.version == 50)
-            .expect("embedded migration 0050")
+            .find(|migration| migration.version == 51)
+            .expect("embedded migration 0051")
             .sql
             .as_ref();
         let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1784,7 +1784,7 @@ mod postgres_tests {
             .expect("read schema/schema.sql");
 
         let migration = surface(migration_0029);
-        let owner_admission_migration = surface(migration_0050);
+        let owner_admission_migration = surface(migration_0051);
         let schema = surface(&schema_sql);
 
         assert_eq!(
@@ -1830,7 +1830,7 @@ mod postgres_tests {
             owner_admission_migration
                 .functions
                 .get("prevent_community_deletion_request_retargeting")
-                .expect("0050 deletion retargeting guard"),
+                .expect("0051 deletion retargeting guard"),
             "schema.sql must carry the latest immutable owner-provenance guard"
         );
         let request_table = schema
