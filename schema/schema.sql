@@ -278,6 +278,10 @@ CREATE INDEX idx_events_not_before ON events (community_id, not_before)
 -- EXPLAIN before its work lands (Quinn option A; Max's index-spelling caveat).
 CREATE INDEX idx_events_search_tsv ON events USING GIN (search_tsv);
 
+-- e-tag containment (`tags @> '[["e","<hex>"]]'`) for the aux closure and #e
+-- reads. Mirrors migrations/0004; jsonb_path_ops supports exactly @>.
+CREATE INDEX idx_events_tags_gin ON events USING GIN (tags jsonb_path_ops);
+
 -- ── Event mentions ────────────────────────────────────────────────────────────
 -- Conformance: "Channel-less global events and DMs" (#p fan-out). The join to
 -- events MUST carry the community tuple (e.community_id = m.community_id AND
@@ -1232,6 +1236,11 @@ CREATE TABLE community_deletion_requests (
         'logically_verified', 'retention_pending', 'aborted'
     )),
     requested_by TEXT NOT NULL,
+    request_origin TEXT NOT NULL DEFAULT 'operator'
+        CHECK (request_origin IN ('operator', 'owner')),
+    owner_pubkey TEXT,
+    mediating_operator_pubkey TEXT,
+    acknowledgement_version INTEGER,
     reason TEXT,
     schema_manifest JSONB,
     storage_manifest JSONB,
@@ -1268,6 +1277,21 @@ CREATE TABLE community_deletion_requests (
     CHECK ((aborted_at IS NULL) = (aborted_by IS NULL)),
     CHECK ((aborted_at IS NULL) = (abort_reason IS NULL)),
     CHECK ((inventory_frozen_at IS NULL) = (inventory_digest IS NULL)),
+    CONSTRAINT community_deletion_owner_provenance CHECK (
+        (request_origin = 'operator'
+            AND owner_pubkey IS NULL
+            AND mediating_operator_pubkey IS NULL
+            AND acknowledgement_version IS NULL)
+        OR
+        (request_origin = 'owner'
+            AND NOT (owner_pubkey IS NULL)
+            AND NOT (mediating_operator_pubkey IS NULL)
+            AND NOT (acknowledgement_version IS NULL)
+            AND owner_pubkey ~ '^[0-9a-f]{64}$'
+            AND mediating_operator_pubkey ~ '^[0-9a-f]{64}$'
+            AND acknowledgement_version BETWEEN 1 AND 32767
+            AND requested_by = owner_pubkey)
+    ),
     UNIQUE (id, community_id, inventory_digest)
 );
 CREATE UNIQUE INDEX community_deletion_requests_active_community
@@ -1293,7 +1317,7 @@ CREATE TABLE community_deletion_approvals (
         ON DELETE RESTRICT
 );
 
-CREATE FUNCTION prevent_community_deletion_request_retargeting()
+CREATE OR REPLACE FUNCTION prevent_community_deletion_request_retargeting()
 RETURNS trigger
 LANGUAGE plpgsql
 AS $$
@@ -1302,6 +1326,14 @@ BEGIN
         OR NEW.community_host IS DISTINCT FROM OLD.community_host
     THEN
         RAISE EXCEPTION 'community deletion target identity is immutable'
+            USING ERRCODE = 'integrity_constraint_violation';
+    END IF;
+    IF NEW.request_origin IS DISTINCT FROM OLD.request_origin
+        OR NEW.owner_pubkey IS DISTINCT FROM OLD.owner_pubkey
+        OR NEW.mediating_operator_pubkey IS DISTINCT FROM OLD.mediating_operator_pubkey
+        OR NEW.acknowledgement_version IS DISTINCT FROM OLD.acknowledgement_version
+    THEN
+        RAISE EXCEPTION 'community deletion request provenance is immutable'
             USING ERRCODE = 'integrity_constraint_violation';
     END IF;
     IF OLD.inventory_frozen_at IS NOT NULL AND (
@@ -1494,7 +1526,7 @@ LANGUAGE SQL IMMUTABLE STRICT PARALLEL SAFE AS $$
         'community_deletion_requests', 'community_deletion_approvals',
         'community_deletion_checkpoints', 'community_serving_write_leases',
         'community_deletion_executor_heartbeats', 'product_feedback',
-        'rate_limit_violations'
+        'rate_limit_violations', 'operator_listener_outbox'
     ]::TEXT[])
 $$;
 
@@ -1877,6 +1909,51 @@ CREATE INDEX idx_relay_admin_outbox_pending
 
 INSERT INTO _operator_global_tables (table_name, reason) VALUES
     ('relay_admin_outbox', 'deployment-global enforcement artifact delivery queue');
+
+-- ── Operator-listener mention delivery ──────────────────────────────────────
+-- Listener registrations are deployment-global. The outbox records community
+-- provenance for the event, but is intentionally not tenant-owned.
+
+CREATE TABLE operator_listener_pubkeys (
+    listener_pubkey BYTEA NOT NULL CHECK (length(listener_pubkey) = 32),
+    target_pubkey   BYTEA NOT NULL CHECK (length(target_pubkey) = 32),
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (listener_pubkey, target_pubkey)
+);
+CREATE INDEX operator_listener_pubkeys_target
+    ON operator_listener_pubkeys (target_pubkey, listener_pubkey);
+CREATE INDEX operator_listener_pubkeys_created_at
+    ON operator_listener_pubkeys (created_at);
+
+CREATE TABLE operator_listener_outbox (
+    id                UUID NOT NULL PRIMARY KEY DEFAULT gen_random_uuid(),
+    listener_pubkey   BYTEA NOT NULL CHECK (length(listener_pubkey) = 32),
+    target_pubkey     BYTEA NOT NULL CHECK (length(target_pubkey) = 32),
+    community_id      UUID NOT NULL,
+    event_id          BYTEA NOT NULL CHECK (length(event_id) = 32),
+    event_kind        INTEGER NOT NULL,
+    event_created_at  TIMESTAMPTZ NOT NULL,
+    state             TEXT NOT NULL DEFAULT 'pending'
+                      CHECK (state IN ('pending', 'sending')),
+    attempts          INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    next_attempt_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    lease_until       TIMESTAMPTZ,
+    claim_id          UUID,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (listener_pubkey, target_pubkey, community_id, event_id)
+);
+CREATE INDEX operator_listener_outbox_due
+    ON operator_listener_outbox (next_attempt_at, created_at, id)
+    WHERE state = 'pending';
+CREATE INDEX operator_listener_outbox_recovery
+    ON operator_listener_outbox (lease_until, created_at, id)
+    WHERE state = 'sending';
+CREATE INDEX operator_listener_outbox_created_at
+    ON operator_listener_outbox (created_at);
+
+INSERT INTO _operator_global_tables (table_name, reason) VALUES
+    ('operator_listener_pubkeys', 'deployment-global target registrations for operator listeners'),
+    ('operator_listener_outbox', 'deployment-global mention delivery queue; community_id is event provenance');
 
 -- ── Relay operator audit (append-only roster mutation trail) ─────────────────
 -- One row per PUT/DELETE /operators/{pubkey} mutation. The roster is the
