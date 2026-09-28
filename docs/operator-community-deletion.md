@@ -82,8 +82,10 @@ reports their objects with the `null` version id.
      -l app.kubernetes.io/component=deletion-drain,app.kubernetes.io/instance=<release>
    ```
 
-   The name is `<fullname>-deletion-drain`. `buzz.fullname` collapses to the
-   release name when the release name already contains the chart name, so
+   The name is `<bounded-fullname>-deletion-drain`. The chart truncates only the
+   fullname portion when needed so the suffix remains stable within Kubernetes'
+   52-character CronJob name limit. `buzz.fullname` collapses to the release
+   name when the release name already contains the chart name, so
    `helm install buzz ...` renders `buzz-deletion-drain`, not
    `buzz-buzz-deletion-drain`.
 5. Start one staffed manual run with

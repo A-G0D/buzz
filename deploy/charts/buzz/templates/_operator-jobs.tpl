@@ -12,7 +12,7 @@
 apiVersion: batch/v1
 kind: CronJob
 metadata:
-  name: {{ include "buzz.fullname" $root }}-deletion-drain
+  name: {{ include "buzz.cronJobName" (dict "root" $root "suffix" "deletion-drain") }}
   labels:
     {{- include "buzz.labels" $root | nindent 4 }}
     app.kubernetes.io/component: deletion-drain

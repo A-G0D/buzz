@@ -307,3 +307,22 @@ tests:
     asserts:
       - failedTemplate:
           errorPattern: "operatorJobs.deletionDrain requires Redis"
+
+  - it: preserves the deletion suffix while bounding a long release and name override
+    release:
+      name: very-long-release-name-for-operator-jobs
+    set:
+      nameOverride: custom-buzz-name
+      relayUrl: wss://buzz.example.com
+      ownerPubkey: "0000000000000000000000000000000000000000000000000000000000000000"
+      externalPostgresql.url: postgres://u:p@h:5432/d
+      externalRedis.url: redis://h:6379
+      s3.endpoint: https://s3.example.com
+      s3.bucket: buzz-media-example
+      s3.accessKey: test
+      s3.secretKey: test
+      operatorJobs.deletionDrain.enabled: true
+    asserts:
+      - equal:
+          path: metadata.name
+          value: very-long-release-name-for-operator-j-deletion-drain
