@@ -3963,6 +3963,64 @@ mod tests {
         );
     }
 
+    /// Caller-seam witness: the production handler sends its challenge through
+    /// the cancel-aware helper, so a connection already cancelled at that
+    /// point exits without ever writing the challenge.
+    ///
+    /// Mutation oracle: replace the handler's `send_challenge_unless_cancelled`
+    /// call with a plain `ws_send.send(..)` → the client receives the challenge
+    /// → RED.
+    #[tokio::test]
+    async fn cancelled_connection_exits_without_sending_challenge() {
+        use std::sync::Arc;
+        let state = audio_test_state().await;
+        let tenant = buzz_core::tenant::TenantContext::resolved(
+            buzz_core::tenant::CommunityId::from_uuid(uuid::Uuid::nil()),
+            "test.local".to_string(),
+        );
+        let conn_cancel = CancellationToken::new();
+        conn_cancel.cancel();
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let app = Router::new().route(
+            "/",
+            get(move |ws: WebSocketUpgrade| {
+                let (state, tenant) = (Arc::clone(&state), tenant.clone());
+                let control = crate::state::CommunityConnectionControl::new(conn_cancel.clone());
+                async move {
+                    ws.on_upgrade(move |socket| async move {
+                        handle_active_audio_connection(
+                            socket,
+                            state,
+                            tenant,
+                            uuid::Uuid::new_v4(),
+                            control,
+                            None,
+                            chrono::Utc::now(),
+                            None,
+                        )
+                        .await
+                    })
+                }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let (mut client, _) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("connect");
+        let first = tokio::time::timeout(std::time::Duration::from_secs(2), client.next())
+            .await
+            .expect("handler must end the stream promptly");
+        assert!(
+            !matches!(
+                first,
+                Some(Ok(tokio_tungstenite::tungstenite::Message::Text(_)))
+            ),
+            "cancelled connection must not send the challenge; got {first:?}"
+        );
+        server.abort();
+    }
+
     // ── W5 (B1 audio): already-expired deadline rejects before auth challenge ─────
     //
     // When the NIP-FI session deadline is already past at upgrade time, the pre-auth
