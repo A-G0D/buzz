@@ -2236,6 +2236,7 @@ mod postgres_tests {
         let dropped = Arc::new(AtomicBool::new(false));
         let observed = Arc::clone(&dropped);
         let shutdown = CancellationToken::new();
+        let (inventory_started_tx, inventory_started_rx) = tokio::sync::oneshot::channel();
         let preparation = prepare_owner_claim_with(
             &services,
             LoopMode::Drain,
@@ -2244,11 +2245,14 @@ mod postgres_tests {
             Duration::from_millis(10),
             move |_| async move {
                 let _drop_signal = DropSignal(observed);
+                inventory_started_tx
+                    .send(())
+                    .expect("signal inventory started");
                 std::future::pending::<Result<FrozenInventory>>().await
             },
         );
         let revoke = async {
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            inventory_started_rx.await.expect("inventory started");
             services
                 .store
                 .stop_executor(Some(&token), &token.owner)
