@@ -2384,6 +2384,27 @@ async fn ingest_event_inner(
     }
 
     if kind_u32 == KIND_AGENT_OBSERVER_FRAME {
+        // Observer frames return before the write-path ban gate below, and
+        // NIP-98 auth never consults bans. Re-check the authoring pubkey here so
+        // a banned owner cannot keep sending control frames over HTTP.
+        match state
+            .db
+            .moderation_restriction_state(tenant.community(), auth.pubkey().as_bytes())
+            .await
+        {
+            Ok(r) if r.banned => {
+                return Err(IngestError::AuthFailed(
+                    "blocked: you are banned from this community".to_string(),
+                ));
+            }
+            Ok(_) => {}
+            Err(e) => {
+                // Fail closed: a DB error must not let a banned actor through.
+                return Err(IngestError::Internal(format!(
+                    "error: internal error checking restriction state: {e}"
+                )));
+            }
+        }
         super::event::ingest_agent_observer_event(state, tenant, &event, None).await?;
         emit(
             tracer,
@@ -3660,6 +3681,52 @@ mod postgres_tests {
         assert!(matches!(
             ingest_observer_test_event(&state, &tenant, &agent, event).await,
             Err(IngestError::Rejected(message)) if message.contains("timestamp")
+        ));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres and Redis"]
+    async fn http_observer_frame_rejects_banned_owner_control_frame() {
+        let (state, tenant, agent, owner) = observer_ingest_fixture().await;
+        let encrypted = buzz_core::observer::encrypt_observer_payload(
+            &owner,
+            &agent.public_key(),
+            &serde_json::json!({"kind": "cancel"}),
+        )
+        .expect("encrypt control payload");
+        let control = || {
+            buzz_sdk::build_agent_observer_frame(
+                &agent.public_key().to_hex(),
+                &agent.public_key().to_hex(),
+                buzz_core::observer::OBSERVER_FRAME_CONTROL,
+                &encrypted,
+            )
+            .expect("build control frame")
+            .sign_with_keys(&owner)
+            .expect("sign control frame")
+        };
+
+        assert!(
+            ingest_observer_test_event(&state, &tenant, &owner, control())
+                .await
+                .is_ok(),
+            "unbanned owner control frame should be accepted"
+        );
+
+        state
+            .db
+            .ban_community_member(
+                tenant.community(),
+                &owner.public_key().to_bytes(),
+                &Keys::generate().public_key().to_bytes(),
+                None,
+                None,
+            )
+            .await
+            .expect("ban owner");
+        assert!(matches!(
+            ingest_observer_test_event(&state, &tenant, &owner, control()).await,
+            Err(IngestError::AuthFailed(message)) if message.contains("banned")
         ));
     }
 
