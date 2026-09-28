@@ -1169,6 +1169,26 @@ mod postgres_tests {
             "membership and request deduplicate"
         );
 
+        sqlx::query("UPDATE community_deletion_requests SET stage = 'aborted' WHERE id = $1")
+            .bind(request_id)
+            .execute(&db.pool)
+            .await
+            .expect("abort quota fixture");
+        let aborted = db
+            .list_communities_owned_by(&owner)
+            .await
+            .expect("aborted quota");
+        assert_eq!(aborted.communities.len(), 1, "abort restores the live row");
+        assert_eq!(
+            aborted.quota_used, 1,
+            "abort must fall back to the preserved membership"
+        );
+        sqlx::query("UPDATE community_deletion_requests SET stage = 'submitted' WHERE id = $1")
+            .bind(request_id)
+            .execute(&db.pool)
+            .await
+            .expect("restore pending quota fixture");
+
         sqlx::query("DELETE FROM relay_members WHERE community_id = $1")
             .bind(created.id.as_uuid())
             .execute(&db.pool)
