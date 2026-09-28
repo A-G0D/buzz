@@ -239,6 +239,34 @@ void main() {
     });
   });
 
+  test('ignores thread-only typing for channel working state', () async {
+    final relaySession = _MembershipRelaySessionNotifier([
+      _membershipEvent(role: 'admin'),
+    ]);
+    final container = ProviderContainer(
+      overrides: [
+        relaySessionProvider.overrideWith(() => relaySession),
+        knownAgentPubkeysProvider.overrideWithValue(const {_agentPubkey}),
+        channelTypingProvider(_channelId).overrideWith(
+          () => _StaticTypingNotifier([
+            const TypingEntry(
+              pubkey: _agentPubkey,
+              threadHeadId: 'thread-root',
+              expiresAtMs: 9999999999999,
+            ),
+          ]),
+        ),
+      ],
+    );
+    addTearDown(container.dispose);
+
+    expect(
+      await container.read(channelMembersProvider(_channelId).future),
+      hasLength(1),
+    );
+    expect(container.read(workingAgentPubkeysProvider(_channelId)), isEmpty);
+  });
+
   test(
     'ignores working state from a verified agent outside the channel',
     () async {

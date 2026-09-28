@@ -33,7 +33,8 @@ final workingAgentPubkeysProvider = Provider.autoDispose
 
       return <String>{
         for (final entry in typingEntries)
-          if (memberPubkeys.contains(entry.pubkey.toLowerCase()) &&
+          if (entry.threadHeadId == null &&
+              memberPubkeys.contains(entry.pubkey.toLowerCase()) &&
               agentPubkeys.contains(entry.pubkey.toLowerCase()))
             entry.pubkey.toLowerCase(),
       };

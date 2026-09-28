@@ -181,6 +181,8 @@ export function MembersSidebar({
   const memberProfilesQuery = useUsersBatchQuery(allMemberPubkeys, {
     enabled: open && rawMembers.length > 0,
   });
+  const profileIdentitySettled =
+    memberProfilesQuery.isSuccess && !memberProfilesQuery.isPlaceholderData;
   const profileAgentPubkeys = React.useMemo(
     () =>
       new Set(
@@ -643,7 +645,11 @@ export function MembersSidebar({
     return (
       <MembersSidebarMemberCard
         canChangeRole={canManageMembers && member.pubkey !== currentPubkey}
-        canModerate={canModerate && member.pubkey !== currentPubkey}
+        canModerate={
+          canModerate &&
+          member.pubkey !== currentPubkey &&
+          profileIdentitySettled
+        }
         canRemoveMember={canRemoveMember(member)}
         isActionPending={
           isActionPending || changeRoleMutation.isPending || isModerationPending
