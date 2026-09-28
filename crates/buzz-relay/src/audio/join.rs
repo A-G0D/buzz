@@ -399,28 +399,59 @@ const OWNER_READY_MAX_ATTEMPTS: u32 = 25;
 /// in-flight attempt (and any lease CAS inside it) is never cut off.
 const OWNER_READY_BUDGET: Duration = Duration::from_secs(2);
 
-/// Worst case of one [`resolve_join`] against the production directory, built
-/// from each await's own bound: Redis pool checkout, the driver's 500 ms
-/// command response timeout, and the serving-write lease SQL bound.
-/// `owner_of` + `acquire` (begin lease, checkout, verify, CAS, verify, finish)
-/// + `validate`.
+/// Per-await bounds of the production [`SessionDirectory`] call chain.
+///
+/// Each constant mirrors the awaits of one directory method, in order, and
+/// each await's own bound: the whole-checkout Redis deadline, the redis 1.2
+/// driver's default 500 ms response timeout for one command (every script is a
+/// single `EVAL`), and the serving-write lease SQL bound.
 #[cfg(test)]
-const RESOLVE_ATTEMPT_WORST_CASE: Duration = {
-    const POOL: Duration = crate::tunnel::directory::POOL_CHECKOUT_TIMEOUT;
+pub(crate) mod worst_case {
+    use std::time::Duration;
+
+    const CHECKOUT: Duration = crate::tunnel::directory::POOL_CHECKOUT_TIMEOUT;
     const REDIS_COMMAND: Duration = Duration::from_millis(500);
     const LEASE_SQL: Duration = buzz_db::deletion::SERVING_WRITE_LEASE_SQL_TIMEOUT;
-    let redis = POOL.saturating_add(REDIS_COMMAND);
-    redis
-        .saturating_add(LEASE_SQL.saturating_mul(4).saturating_add(redis))
-        .saturating_add(redis)
-};
 
-/// Worst case of [`resolve_join_owner_ready`]: the retry budget plus one
-/// attempt that started just before it ran out. This bounds how long the audio
-/// lease permit can delay NIP-FI expiry quiescence.
-#[cfg(test)]
-pub(crate) const OWNER_READY_WORST_CASE: Duration =
-    OWNER_READY_BUDGET.saturating_add(RESOLVE_ATTEMPT_WORST_CASE);
+    const fn max(a: Duration, b: Duration) -> Duration {
+        if a.as_nanos() > b.as_nanos() {
+            a
+        } else {
+            b
+        }
+    }
+
+    /// `lookup` / `validate_fenced_header`: checkout, one command.
+    pub(crate) const REDIS_READ: Duration = CHECKOUT.saturating_add(REDIS_COMMAND);
+
+    /// `acquire` / `release`: begin serving-write lease, checkout, verify,
+    /// `EVAL`, verify, then either `finish` or (acquire, verification failed)
+    /// the exact-generation discard on the same connection.
+    pub(crate) const FENCED_MUTATION: Duration = LEASE_SQL
+        .saturating_add(CHECKOUT)
+        .saturating_add(LEASE_SQL)
+        .saturating_add(REDIS_COMMAND)
+        .saturating_add(LEASE_SQL)
+        .saturating_add(max(LEASE_SQL, REDIS_COMMAND));
+
+    /// One [`super::resolve_join`]: `owner_of`, `acquire` returning `Held`,
+    /// then `validate` of the remote owner.
+    pub(crate) const RESOLVE_ATTEMPT: Duration = REDIS_READ
+        .saturating_add(FENCED_MUTATION)
+        .saturating_add(REDIS_READ);
+
+    /// Permit hold: [`super::resolve_join_owner_ready`]'s retry budget plus one
+    /// attempt that started just before it ran out. This bounds how long the
+    /// audio lease permit can delay NIP-FI expiry quiescence.
+    pub(crate) const PERMIT_HOLD: Duration =
+        super::OWNER_READY_BUDGET.saturating_add(RESOLVE_ATTEMPT);
+
+    /// Expiry to socket close: the permit hold, then the cancel exit's
+    /// `release` of the won lease, then the bounded terminal flush.
+    pub(crate) const EXIT: Duration = PERMIT_HOLD
+        .saturating_add(FENCED_MUTATION)
+        .saturating_add(crate::connection::WS_TERMINAL_FLUSH_TIMEOUT);
+}
 
 /// Resolve a join and, on the steady-state `LocalOwner` reuse arm, ensure a
 /// live owner renewer actually exists before the caller admits a local owner
@@ -2309,8 +2340,10 @@ mod tests {
     /// 2 s retry budget. Raising any per-await bound must revisit this number.
     #[test]
     fn owner_ready_worst_case_is_bounded() {
-        assert_eq!(RESOLVE_ATTEMPT_WORST_CASE, Duration::from_millis(12_500));
-        assert_eq!(OWNER_READY_WORST_CASE, Duration::from_millis(14_500));
+        assert_eq!(worst_case::FENCED_MUTATION, Duration::from_millis(9_500));
+        assert_eq!(worst_case::RESOLVE_ATTEMPT, Duration::from_millis(12_500));
+        assert_eq!(worst_case::PERMIT_HOLD, Duration::from_millis(14_500));
+        assert_eq!(worst_case::EXIT, Duration::from_millis(25_000));
     }
 
     #[test]

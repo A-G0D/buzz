@@ -9711,15 +9711,14 @@ mod tests {
             server.abort();
         }
 
-        // ── I1 witness: stalled lease SQL under the permit stays bounded ───────
+        // ── I1 witnesses: stalled lease SQL under the permit stays bounded ──────
         //
         // Real handler, real `SessionDirectory` (Redis + durable serving-write
         // lease). After the Redis CAS lands, the test row-locks the bookkeeping
         // lease row so `finish()`'s DELETE stalls inside the audio lease permit,
         // then lets the NIP-FI deadline pass. The lease statement bound ends the
-        // stall, the resolver keeps the won lease, expiry reaches quiescence
-        // within `OWNER_READY_WORST_CASE`, and the handler releases the Redis
-        // lease on its cancel exit.
+        // stall, the resolver keeps the won lease, and the handler closes within
+        // `worst_case::EXIT`.
         //
         // Mutation oracles:
         //   a) drop BOTH the lease `SET LOCAL statement_timeout` and the client
@@ -9730,7 +9729,129 @@ mod tests {
         #[tokio::test]
         #[ignore = "requires Postgres — runs in postgres-ci nextest lane"]
         async fn stalled_lease_sql_after_cas_reaches_quiescence_and_releases_lease() {
-            use crate::audio::join::{HuddleOwnerRegistry, OWNER_READY_WORST_CASE};
+            let (lease_left, elapsed) = run_stalled_lease_exit(false).await;
+            assert!(
+                !lease_left,
+                "the won Redis lease must be released on the expiry exit"
+            );
+            assert!(
+                elapsed >= std::time::Duration::from_millis(1000),
+                "the bookkeeping release must actually have stalled; took {elapsed:?}"
+            );
+        }
+
+        // The whole cancel exit stays inside `worst_case::EXIT` when the exit's
+        // own `release` stalls too: holding the exclusive deletion advisory lock
+        // makes release's serving-write lease admission wait out its statement
+        // bound. Release then fails, so the Redis lease is left to its TTL.
+        //
+        // Mutation oracle: drop both SQL bounds from the serving-write lease
+        // admission only (`acquire_serving_write_lease`; the acquire path's
+        // stalled `finish()` stays bounded) → release's admission waits on the
+        // advisory lock → no close within `worst_case::EXIT` → RED.
+        #[tokio::test]
+        #[ignore = "requires Postgres — runs in postgres-ci nextest lane"]
+        async fn stalled_lease_sql_and_stalled_exit_release_close_within_exit_bound() {
+            let (lease_left, elapsed) = run_stalled_lease_exit(true).await;
+            assert!(
+                lease_left,
+                "a failed exit release leaves the lease to its TTL"
+            );
+            assert!(
+                elapsed >= std::time::Duration::from_millis(2500),
+                "finish and the exit release must both have stalled; took {elapsed:?}"
+            );
+        }
+
+        // ── I1 witness: a CAS whose post-write verification fails is discarded ──
+        //
+        // Real `SessionDirectory` (Redis + durable serving-write lease). Once the
+        // Redis CAS reply is in hand, the test holds the exclusive deletion
+        // advisory lock, so the guard's post-write verification waits out its
+        // statement bound and fails. `acquire` must return the fenced outcome,
+        // hand out no lease, and delete the lease its CAS minted.
+        //
+        // Mutation oracle: skip `discard_unverified` → the minted Redis lease
+        // survives the fenced return → RED.
+        #[tokio::test]
+        #[ignore = "requires Postgres — runs in postgres-ci nextest lane"]
+        async fn failed_post_cas_verification_is_fenced_and_discards_the_won_lease() {
+            use crate::tunnel::directory::{DirectoryError, SessionDirectory};
+            use buzz_relay_mesh::{Profile, RuntimeId};
+
+            let state = audio_test_state_real_db()
+                .await
+                .expect("PostgreSQL must be available");
+            let pool = state.db.pool().clone();
+            let (tenant, channel_id, _key) = seed_audio_fixture(&pool).await;
+            let community = tenant.community();
+            let redis_url =
+                std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
+            let redis = deadpool_redis::Config::from_url(&redis_url)
+                .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+                .expect("redis pool");
+            let directory = SessionDirectory::with_db(redis, state.db.clone());
+            let (arrived_rx, release) =
+                crate::nip_fi_test_hooks::directory_cas_hook::arm(community);
+
+            let acquire = tokio::spawn({
+                let directory = directory.clone();
+                async move {
+                    directory
+                        .acquire(
+                            community,
+                            channel_id,
+                            RuntimeId([7; 32]),
+                            Profile::HuddleControl,
+                        )
+                        .await
+                }
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(5), arrived_rx)
+                .await
+                .expect("CAS must land")
+                .expect("hook channel");
+            assert!(
+                directory
+                    .lookup(community, channel_id)
+                    .await
+                    .expect("lookup")
+                    .is_some(),
+                "the CAS must have minted a lease before verification"
+            );
+            let mut blocker = pool.begin().await.expect("blocker tx");
+            sqlx::query("SELECT pg_advisory_xact_lock(community_deletion_lock_key($1))")
+                .bind(community.as_uuid())
+                .execute(&mut *blocker)
+                .await
+                .expect("hold the exclusive deletion lock");
+            release.notify_one();
+
+            let result = tokio::time::timeout(std::time::Duration::from_secs(10), acquire)
+                .await
+                .expect("acquire must end within its SQL bound")
+                .expect("acquire task");
+            blocker.rollback().await.expect("rollback blocker");
+            assert!(
+                matches!(result, Err(DirectoryError::CommunityWriteFenced(_))),
+                "failed verification must be the fenced outcome, got {result:?}"
+            );
+            assert!(
+                directory
+                    .lookup(community, channel_id)
+                    .await
+                    .expect("lookup")
+                    .is_none(),
+                "the unverified lease must be discarded"
+            );
+        }
+
+        /// Drive the handler through a post-CAS `finish()` stall, optionally
+        /// stalling the cancel exit's `release` as well. Asserts the close
+        /// deadline and the single canonical denial; returns whether the Redis
+        /// lease survived and how long the stalled exit took.
+        async fn run_stalled_lease_exit(stall_release: bool) -> (bool, std::time::Duration) {
+            use crate::audio::join::{worst_case, HuddleOwnerRegistry};
             use chrono::{Duration, Utc};
             use futures_util::StreamExt as _;
             use std::sync::Arc;
@@ -9839,6 +9960,13 @@ mod tests {
             .await
             .expect("lock lease row");
             assert_eq!(locked.len(), 1, "exactly the acquire's lease row");
+            if stall_release {
+                sqlx::query("SELECT pg_advisory_xact_lock(community_deletion_lock_key($1))")
+                    .bind(community.as_uuid())
+                    .execute(&mut *blocker)
+                    .await
+                    .expect("hold the exclusive deletion lock");
+            }
             // Let the deadline pass while the permit is still held.
             let wait = (deadline - Utc::now()).to_std().unwrap_or_default();
             tokio::time::sleep(wait + std::time::Duration::from_millis(200)).await;
@@ -9846,7 +9974,7 @@ mod tests {
             let stalled_at = std::time::Instant::now();
             release.notify_one();
             let mut frames = Vec::new();
-            let closed = tokio::time::timeout(OWNER_READY_WORST_CASE, async {
+            let closed = tokio::time::timeout(worst_case::EXIT, async {
                 while let Some(Ok(message)) = client.next().await {
                     if let tokio_tungstenite::tungstenite::Message::Text(t) = message {
                         frames.push(t.to_string());
@@ -9857,11 +9985,8 @@ mod tests {
             let elapsed = stalled_at.elapsed();
             assert!(
                 closed.is_ok(),
-                "handler must quiesce within OWNER_READY_WORST_CASE ({OWNER_READY_WORST_CASE:?})"
-            );
-            assert!(
-                elapsed >= std::time::Duration::from_millis(1000),
-                "the release must actually have stalled; took {elapsed:?}"
+                "handler must close within worst_case::EXIT ({:?})",
+                worst_case::EXIT
             );
             let denial = serde_json::json!({
                 "type": "restricted",
@@ -9869,16 +9994,14 @@ mod tests {
             })
             .to_string();
             assert_eq!(frames, vec![denial], "exactly one canonical expiry denial");
-            assert!(
-                directory
-                    .lookup(community, channel_id)
-                    .await
-                    .expect("lookup")
-                    .is_none(),
-                "the won Redis lease must be released on the expiry exit"
-            );
+            let lease_left = directory
+                .lookup(community, channel_id)
+                .await
+                .expect("lookup")
+                .is_some();
             blocker.rollback().await.expect("rollback blocker");
             server.abort();
+            (lease_left, elapsed)
         }
 
         // ── F4b relay-membership denial wire frame ────────────────────────────
