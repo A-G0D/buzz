@@ -9,10 +9,7 @@ import type {
 } from "@/shared/api/types";
 import { usePanelReturnTarget } from "@/shared/hooks/usePanelReturnTarget";
 import { normalizePubkey, truncateNpub } from "@/shared/lib/pubkey";
-import {
-  channelBotMemberPubkeySet,
-  channelMemberPubkeySet,
-} from "@/shared/lib/rosterDerivations";
+import { channelMemberPubkeySet } from "@/shared/lib/rosterDerivations";
 import {
   type AgentSessionReturnTarget,
   resolveAgentSessionReturnTarget,
@@ -132,9 +129,6 @@ export function getChannelAgentSessionAgents({
   const memberPubkeys = channelMembers
     ? channelMemberPubkeySet(channelMembers)
     : null;
-  const botMemberPubkeys = channelMembers
-    ? channelBotMemberPubkeySet(channelMembers)
-    : null;
 
   return agents.filter((agent) => {
     const normalizedPubkey = normalizePubkey(agent.pubkey);
@@ -147,7 +141,7 @@ export function getChannelAgentSessionAgents({
       channels.includes(activeChannel.name);
 
     if (agent.agentSource === "member-bot") {
-      return botMemberPubkeys?.has(normalizedPubkey) ?? matchesDeclaredChannel;
+      return memberPubkeys?.has(normalizedPubkey) ?? matchesDeclaredChannel;
     }
 
     if (agent.agentSource === "managed") {

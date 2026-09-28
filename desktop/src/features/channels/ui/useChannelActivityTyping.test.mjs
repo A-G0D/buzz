@@ -8,7 +8,10 @@ import {
   resetAgentWorkingSignal,
 } from "../../agents/agentWorkingSignal.ts";
 import { resetActiveAgentTurnsStore } from "../../agents/activeAgentTurnsStore.ts";
-import { buildChannelAgentSessionCandidates } from "./useChannelAgentSessions.ts";
+import {
+  buildChannelAgentSessionCandidates,
+  getChannelAgentSessionAgents,
+} from "./useChannelAgentSessions.ts";
 import {
   channelScopedBotTypingPubkeyKey,
   mergeMemberAgentFlagsIntoProfiles,
@@ -96,6 +99,25 @@ describe("promoted agent typing", () => {
     assert.equal(candidate?.pubkey, AGENT);
     assert.equal(candidate?.name, "Deploy Agent");
     assert.equal(candidate?.agentSource, "member-bot");
+
+    const scopedAgents = getChannelAgentSessionAgents({
+      activeChannel: {
+        id: "chan-1",
+        name: "deployments",
+      },
+      activeChannelId: "chan-1",
+      agents: [candidate],
+      channelMembers: [
+        {
+          pubkey: AGENT,
+          role: "admin",
+          isAgent: true,
+          displayName: "Deploy Agent",
+        },
+      ],
+    });
+
+    assert.deepEqual(scopedAgents, [candidate]);
   });
 });
 
