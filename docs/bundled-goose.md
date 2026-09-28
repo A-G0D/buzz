@@ -23,6 +23,14 @@ keychain credentials remain usable. It excludes optional bundled MCP servers,
 scheduler, HTTP serving, and other extensions disabled by the upstream lean
 configuration. Native developer tools and external MCP remain available.
 
+The pinned revision includes Goose's fix for empty-final-response warnings after
+a successful tool call ([#12468](https://github.com/aaif-goose/goose/pull/12468)).
+It also includes the live model metadata implementation
+([#12560](https://github.com/aaif-goose/goose/pull/12560)), and the build enables
+`online-model-meta`. However, this revision initializes the catalog only in the
+full Goose CLI, not the lean `goose-acp` entry point. The bundled executable still
+uses the embedded catalog until that upstream startup wiring is added.
+
 `squareup/buzz-releases` enables `BUZZ_BUNDLE_GOOSE=1`, builds the sidecar, adds
 it to its Tauri release configuration, and enables `bundled-goose`. It supplies
 `BUZZ_BUILD_BUNDLED_GOOSE_PROVIDER` and `BUZZ_BUILD_BUNDLED_GOOSE_MODEL` together.
@@ -65,7 +73,6 @@ extensions in an existing Goose config can still cause startup errors.
   checksum is for the artifact before signing; signing changes binary bytes.
   The release pipeline checks the packaged binary before and after signing.
 
-The pilot does not resolve upstream empty-final-response warnings after a
-successful Buzz publication, shell process-tree cancellation, or unbounded
+The pilot does not resolve upstream shell process-tree cancellation or unbounded
 shell capture. Track these against the pinned build when collecting feedback;
 bundling Goose does not switch the Buzz Agent default or establish feature parity.
