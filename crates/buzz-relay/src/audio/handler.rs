@@ -353,6 +353,33 @@ macro_rules! check_cancel {
     };
 }
 
+/// Send the NIP-42 challenge. There is no timeout, so a slow handshake behaves
+/// as before, but a client that never reads cannot pin cancellation: when
+/// cancel wins, the queued terminal frames get the bounded exit drain.
+/// Returns `false` when the handler must exit.
+async fn send_challenge_unless_cancelled<S>(
+    ws_send: &mut S,
+    cancel: &CancellationToken,
+    terminal_rx: &mut mpsc::Receiver<WsMessage>,
+    challenge: WsMessage,
+) -> bool
+where
+    S: futures_util::Sink<WsMessage> + Unpin,
+{
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            crate::connection::send_exit_frames_bounded(
+                ws_send,
+                std::iter::from_fn(|| terminal_rx.try_recv().ok()),
+            )
+            .await;
+            false
+        },
+        sent = ws_send.send(challenge) => sent.is_ok(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_active_audio_connection(
     socket: WebSocket,
@@ -427,7 +454,7 @@ pub(crate) async fn handle_active_audio_connection(
                 channel_id = %channel_id,
                 "NIP-FI session deadline already expired at audio upgrade — rejecting before auth"
             );
-            let _ = crate::connection::send_exit_frames_bounded(
+            crate::connection::send_exit_frames_bounded(
                 &mut ws_send,
                 [crate::nip_fi_session::denial_frame(
                     crate::nip_fi_session::NipFiWsRoute::Audio,
@@ -443,10 +470,13 @@ pub(crate) async fn handle_active_audio_connection(
     let challenge = generate_challenge();
     let challenge_msg =
         serde_json::json!({"type": "challenge", "challenge": challenge}).to_string();
-    if ws_send
-        .send(WsMessage::Text(challenge_msg.into()))
-        .await
-        .is_err()
+    if !send_challenge_unless_cancelled(
+        &mut ws_send,
+        &cancel,
+        &mut terminal_ctrl_rx,
+        WsMessage::Text(challenge_msg.into()),
+    )
+    .await
     {
         return;
     }
@@ -591,7 +621,7 @@ pub(crate) async fn handle_active_audio_connection(
                 pubkey = %pubkey_hex,
                 "NIP-FI session deadline already expired at pairing — rejecting audio admission"
             );
-            let _ = crate::connection::send_exit_frames_bounded(
+            crate::connection::send_exit_frames_bounded(
                 &mut ws_send,
                 [crate::nip_fi_session::denial_frame(
                     crate::nip_fi_session::NipFiWsRoute::Audio,
@@ -703,7 +733,7 @@ pub(crate) async fn handle_active_audio_connection(
     match state.mesh() {
         Some(mesh) => {
             if mesh.owners.is_draining() {
-                let _ = crate::connection::send_exit_frames_bounded(
+                crate::connection::send_exit_frames_bounded(
                     &mut ws_send,
                     [WsMessage::Text(
                         serde_json::json!({
@@ -761,7 +791,7 @@ pub(crate) async fn handle_active_audio_connection(
                         pubkey = %pubkey_hex,
                         "huddle join rejected by fence: {e}"
                     );
-                    let _ = crate::connection::send_exit_frames_bounded(
+                    crate::connection::send_exit_frames_bounded(
                         &mut ws_send,
                         [WsMessage::Text(
                             serde_json::json!({
@@ -788,7 +818,7 @@ pub(crate) async fn handle_active_audio_connection(
                     pubkey = %pubkey_hex,
                     "huddle audio unavailable under horizontal scaling — rejecting join"
                 );
-                let _ = crate::connection::send_exit_frames_bounded(
+                crate::connection::send_exit_frames_bounded(
                     &mut ws_send,
                     [WsMessage::Text(
                         serde_json::json!({
@@ -824,7 +854,7 @@ pub(crate) async fn handle_active_audio_connection(
     match state.db.get_channel(tenant.community(), channel_id).await {
         Ok(ch) if ch.archived_at.is_some() => {
             debug!(channel_id = %channel_id, "channel archived before room join");
-            let _ = crate::connection::send_exit_frames_bounded(
+            crate::connection::send_exit_frames_bounded(
                 &mut ws_send,
                 [WsMessage::Text(
                     serde_json::json!({"type":"error","message":"huddle has ended"})
@@ -874,7 +904,7 @@ pub(crate) async fn handle_active_audio_connection(
             current = CURRENT_PROTOCOL_VERSION,
             "audio: client requested unsupported protocol version"
         );
-        let _ = crate::connection::send_exit_frames_bounded(&mut ws_send, [WsMessage::Text(
+        crate::connection::send_exit_frames_bounded(&mut ws_send, [WsMessage::Text(
                 serde_json::json!({
                     "type": "error",
                     "code": "unsupported_version",
@@ -945,7 +975,7 @@ pub(crate) async fn handle_active_audio_connection(
             }
             Err(crate::audio::join::DialError::Rejected(reason)) => {
                 warn!(channel_id = %channel_id, pubkey = %pubkey_hex, "huddle owner rejected registration: {reason:?}");
-                let _ = crate::connection::send_exit_frames_bounded(
+                crate::connection::send_exit_frames_bounded(
                     &mut ws_send,
                     [WsMessage::Text(
                         remote_rejection_ws_error(&reason).to_string().into(),
@@ -965,7 +995,7 @@ pub(crate) async fn handle_active_audio_connection(
             }
             Err(crate::audio::join::DialError::Mesh(e)) => {
                 warn!(channel_id = %channel_id, pubkey = %pubkey_hex, "huddle owner registration failed: {e}");
-                let _ = crate::connection::send_exit_frames_bounded(
+                crate::connection::send_exit_frames_bounded(
                     &mut ws_send,
                     [WsMessage::Text(
                         serde_json::json!({
@@ -1059,7 +1089,7 @@ pub(crate) async fn handle_active_audio_connection(
             Ok(v) => v,
             Err(crate::audio::room::AdmissionError::Full) => {
                 warn!(channel_id = %channel_id, "audio room participant capacity reached");
-                let _ = crate::connection::send_exit_frames_bounded(&mut ws_send, [WsMessage::Text(serde_json::json!({"type":"error","code":"room_full","message":"room participant capacity reached"}).to_string().into())]).await;
+                crate::connection::send_exit_frames_bounded(&mut ws_send, [WsMessage::Text(serde_json::json!({"type":"error","code":"room_full","message":"room participant capacity reached"}).to_string().into())]).await;
                 // IMPORTANT 3: cancel + await expiry task before guard release.
                 cancel.cancel();
                 if let Some(t) = _nip_fi_admission_expiry.take() {
@@ -1070,7 +1100,7 @@ pub(crate) async fn handle_active_audio_connection(
             }
             Err(crate::audio::room::AdmissionError::Ended) => {
                 debug!(channel_id = %channel_id, "room ended before admission");
-                let _ = crate::connection::send_exit_frames_bounded(&mut ws_send, [WsMessage::Text(serde_json::json!({"type":"error","code":"room_ended","message":"huddle has ended"}).to_string().into())]).await;
+                crate::connection::send_exit_frames_bounded(&mut ws_send, [WsMessage::Text(serde_json::json!({"type":"error","code":"room_ended","message":"huddle has ended"}).to_string().into())]).await;
                 // IMPORTANT 3: cancel + await expiry task before guard release.
                 cancel.cancel();
                 if let Some(t) = _nip_fi_admission_expiry.take() {
@@ -1081,7 +1111,7 @@ pub(crate) async fn handle_active_audio_connection(
             }
             Err(crate::audio::room::AdmissionError::VersionMismatch { pinned, requested }) => {
                 info!(channel_id = %channel_id, pubkey = %pubkey_hex, pinned, requested, "audio: protocol version mismatch — upgrade required");
-                let _ = crate::connection::send_exit_frames_bounded(&mut ws_send, [WsMessage::Text(serde_json::json!({
+                crate::connection::send_exit_frames_bounded(&mut ws_send, [WsMessage::Text(serde_json::json!({
                 "type": "error", "code": "upgrade_required",
                 "message": format!("this huddle is using audio protocol v{pinned}; your client requested v{requested}"),
                 "pinned_version": pinned, "requested_version": requested,
@@ -1513,7 +1543,7 @@ pub(crate) async fn handle_active_audio_connection(
                     mesh.owners.release(channel_id, generation);
                 }
             }
-            let _ = crate::connection::send_exit_frames_bounded(
+            crate::connection::send_exit_frames_bounded(
                 &mut ws_send,
                 [WsMessage::Text(
                     serde_json::json!({"type":"error","message":"huddle has ended"})
@@ -1557,7 +1587,7 @@ pub(crate) async fn handle_active_audio_connection(
                         .into(),
                 )
             };
-            let _ = crate::connection::send_exit_frames_bounded(&mut ws_send, [deny_frame]).await;
+            crate::connection::send_exit_frames_bounded(&mut ws_send, [deny_frame]).await;
             return;
         }
         Err(JoinCommitError::HuddleLinkGone) => {
@@ -1578,7 +1608,7 @@ pub(crate) async fn handle_active_audio_connection(
                     mesh.owners.release(channel_id, generation);
                 }
             }
-            let _ = crate::connection::send_exit_frames_bounded(
+            crate::connection::send_exit_frames_bounded(
                 &mut ws_send,
                 [WsMessage::Text(
                     serde_json::json!({"type":"error","message":"huddle has ended"})
@@ -1606,7 +1636,7 @@ pub(crate) async fn handle_active_audio_connection(
                     mesh.owners.release(channel_id, generation);
                 }
             }
-            let _ = crate::connection::send_exit_frames_bounded(
+            crate::connection::send_exit_frames_bounded(
                 &mut ws_send,
                 [WsMessage::Text(
                     serde_json::json!({"type":"error","message":"error: join commit failed"})
@@ -11163,6 +11193,48 @@ mod tests {
         tokio::time::timeout(std::time::Duration::ZERO, ready_polled.notified())
             .await
             .expect("the exit must have attempted the queued denial on the sink");
+    }
+
+    /// Challenge-send witness: a client that never reads the challenge
+    /// cannot pin cancellation; once cancel fires the send returns within the
+    /// flush budget.
+    ///
+    /// Mutation oracle: replace the `select!` with a plain
+    /// `ws_send.send(challenge).await` → the send parks on the never-ready
+    /// sink → the outer timeout fires → RED.
+    #[tokio::test(start_paused = true)]
+    async fn challenge_send_to_never_ready_sink_exits_within_flush_budget_on_cancel() {
+        let mut ws_send = NeverReadyAudioSink {
+            ready_polled: std::sync::Arc::new(tokio::sync::Notify::new()),
+        };
+        let (terminal_tx, mut terminal_rx) = tokio::sync::mpsc::channel::<WsMessage>(1);
+        let cancel = CancellationToken::new();
+        let canceller = {
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                let _ = terminal_tx.try_send(crate::nip_fi_session::denial_frame(
+                    crate::nip_fi_session::NipFiWsRoute::Audio,
+                    buzz_auth::DenialClass::AuthorizationDenied,
+                ));
+                cancel.cancel();
+            })
+        };
+        let proceed = tokio::time::timeout(
+            std::time::Duration::from_secs(1)
+                + crate::connection::WS_TERMINAL_FLUSH_TIMEOUT
+                + std::time::Duration::from_millis(1),
+            send_challenge_unless_cancelled(
+                &mut ws_send,
+                &cancel,
+                &mut terminal_rx,
+                WsMessage::Text("challenge".into()),
+            ),
+        )
+        .await
+        .expect("a stalled challenge send must exit within the flush budget after cancel");
+        assert!(!proceed, "a cancelled challenge send must stop the handler");
+        canceller.await.expect("canceller");
     }
 
     // ── CommitConfirmed send timeout (Item 2): mechanism sanity check ─────────

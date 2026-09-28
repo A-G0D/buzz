@@ -2374,6 +2374,40 @@ pub(crate) mod tests {
         })
     }
 
+    /// Each deny arm (`Ok(false)`, `Err`) runs `on_not_run` exactly once, so
+    /// a queued NIP-FI denial is drained; `Ok(true)` never runs it.
+    ///
+    /// Mutation oracle: delete `on_not_run().await` from either deny arm →
+    /// that arm's count is 0 → RED.
+    #[tokio::test]
+    async fn on_not_run_runs_once_on_each_deny_arm_and_never_on_admit() {
+        use std::sync::atomic::AtomicUsize;
+        async fn not_run_count(check: Result<bool, buzz_db::DbError>) -> usize {
+            let count = Arc::new(AtomicUsize::new(0));
+            let counter = Arc::clone(&count);
+            run_registered_community_connection(
+                &CommunityConnectionRegistry::new(),
+                Uuid::new_v4(),
+                CommunityId::from_uuid(Uuid::from_u128(0xb)),
+                CommunityConnectionControl::new(CancellationToken::new()),
+                || async { check },
+                |_| async {},
+                move || async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                },
+            )
+            .await;
+            count.load(Ordering::SeqCst)
+        }
+        assert_eq!(not_run_count(Ok(false)).await, 1, "inactive arm");
+        assert_eq!(
+            not_run_count(Err(buzz_db::DbError::Sqlx(sqlx::Error::PoolTimedOut))).await,
+            1,
+            "check-error arm"
+        );
+        assert_eq!(not_run_count(Ok(true)).await, 0, "admitted socket");
+    }
+
     /// Admission is fail-closed on both non-affirmative outcomes. A confirmed
     /// `Ok(false)` and a lookup `Err` are different diagnoses — the counter
     /// keeps them apart — but neither is proof of current admission, and

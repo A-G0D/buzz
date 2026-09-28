@@ -515,7 +515,8 @@ test-unit:
                 + test(=handlers::auth::tests::nip42_denial_class_separates_internal_failure_from_bad_evidence)
                 + test(=handlers::event::tests::p1b_agent_observer_event_barrier_expiry_blocks_fanout_and_ack)
                 + test(=handlers::req::tests::p1a_huddle_liveness_req_barrier_expiry_blocks_query_and_emission)
-                + test(=state::tests::f3_cancellation_during_check_terminates_socket_without_waiting_for_check)'
+                + test(=state::tests::f3_cancellation_during_check_terminates_socket_without_waiting_for_check)
+                + test(=state::tests::on_not_run_runs_once_on_each_deny_arm_and_never_on_admit)'
         # ACP author-gate and queue tests protect the trust boundary between
         # relay events and agent prompts. They are infra-free; ignored lifecycle
         # tests remain excluded and run in their dedicated integration lanes.
