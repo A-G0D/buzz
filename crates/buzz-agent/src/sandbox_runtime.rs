@@ -98,9 +98,14 @@ impl BrokerClient {
             .send()
             .await
             .map_err(|_| AgentError::Llm("sandbox sign-in service unavailable".into()))?;
-        if !response.status().is_success() {
+        if response.status() == StatusCode::UNAUTHORIZED {
             return Err(AgentError::LlmAuth(
                 "Refresh sign-in from the desktop model picker".into(),
+            ));
+        }
+        if !response.status().is_success() {
+            return Err(AgentError::Llm(
+                "sandbox sign-in service unavailable".into(),
             ));
         }
         Ok(response
@@ -122,11 +127,12 @@ impl TokenSource for BrokerClient {
 
 /// The launcher fixes the workspace and cache. The child can only request a
 /// bearer or refresh a rejected bearer, never choose a destination or open a browser.
+/// The task handle preserves the server result for the launcher to observe.
 pub fn serve(
     listener: tokio::net::TcpListener,
     host: &str,
     secret: String,
-) -> Result<tokio::task::JoinHandle<()>, AgentError> {
+) -> Result<tokio::task::JoinHandle<std::io::Result<()>>, AgentError> {
     let source =
         crate::auth::PkceOAuthTokenSource::new(crate::llm::databricks_pkce_config(host, None))?;
     Ok(serve_source(listener, secret, source))
@@ -135,16 +141,12 @@ fn serve_source(
     listener: tokio::net::TcpListener,
     secret: String,
     source: Arc<dyn TokenSource>,
-) -> tokio::task::JoinHandle<()> {
+) -> tokio::task::JoinHandle<std::io::Result<()>> {
     let app = Router::new()
         .route("/token", post(token))
         .layer(DefaultBodyLimit::max(16 * 1024))
         .with_state(BrokerState { secret, source });
-    tokio::spawn(async move {
-        if let Err(error) = axum::serve(listener, app).await {
-            tracing::warn!(%error, "sandbox auth broker stopped");
-        }
-    })
+    tokio::spawn(async move { axum::serve(listener, app).await })
 }
 async fn token(
     State(state): State<BrokerState>,
@@ -164,7 +166,10 @@ async fn token(
     })
     .await
     .map_err(|_| StatusCode::GATEWAY_TIMEOUT)?;
-    let token = result.map_err(|_| StatusCode::UNAUTHORIZED)?;
+    let token = result.map_err(|error| match error {
+        AgentError::LlmAuth(_) => StatusCode::UNAUTHORIZED,
+        _ => StatusCode::SERVICE_UNAVAILABLE,
+    })?;
     Ok(Json(Response { token }))
 }
 
@@ -202,6 +207,67 @@ mod tests {
         );
         task.abort();
     }
+    struct FailingSource {
+        authentication: bool,
+    }
+    #[async_trait]
+    impl TokenSource for FailingSource {
+        async fn bearer(&self) -> Result<String, AgentError> {
+            if self.authentication {
+                Err(AgentError::LlmAuth("private auth diagnostic".into()))
+            } else {
+                Err(AgentError::Llm("private infrastructure diagnostic".into()))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn broker_preserves_authentication_and_service_error_classes() {
+        for authentication in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let secret = "test-broker-capability".to_owned();
+            let task = serve_source(
+                listener,
+                secret.clone(),
+                Arc::new(FailingSource { authentication }),
+            );
+            let client = BrokerClient {
+                broker: BrokerConfig {
+                    port,
+                    secret,
+                    host: "unused".into(),
+                },
+                client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            };
+            for result in [client.bearer().await, client.refresh_now("rejected").await] {
+                let error = result.unwrap_err();
+                assert_eq!(matches!(error, AgentError::LlmAuth(_)), authentication);
+                assert_eq!(matches!(error, AgentError::Llm(_)), !authentication);
+                assert!(!error.to_string().contains("private"));
+            }
+            task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn broker_timeout_response_is_a_service_error() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new().route("/token", post(|| async { StatusCode::GATEWAY_TIMEOUT }));
+        let task = tokio::spawn(async move { axum::serve(listener, app).await });
+        let client = BrokerClient {
+            broker: BrokerConfig {
+                port,
+                secret: "test-broker-capability".into(),
+                host: "unused".into(),
+            },
+            client: reqwest::Client::builder().no_proxy().build().unwrap(),
+        };
+        assert!(matches!(client.bearer().await, Err(AgentError::Llm(_))));
+        task.abort();
+    }
+
     #[test]
     fn missing_trust_snapshot_fails_closed() {
         assert!(builder_with_roots(
