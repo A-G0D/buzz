@@ -1,6 +1,6 @@
 # Channel receipt index deployment
 
-Migration `0051_events_channel_received_index.sql` adds the index behind the
+Migration `0052_events_channel_received_index.sql` adds the index behind the
 sidebar's receipt window (`received_at >= cutoff ORDER BY received_at DESC, id,
 created_at LIMIT n` per channel). `events` is partitioned by `created_at`, so
 without this index every sidebar read scans each channel's full history in
@@ -63,13 +63,13 @@ Expected flags are all `true`, with this definition:
 CREATE INDEX idx_events_community_channel_received ON ONLY public.events USING btree (community_id, channel_id, received_at DESC, id, created_at)
 ```
 
-Then deploy normally. Migration 0051 skips `CREATE INDEX`, validates the
+Then deploy normally. Migration 0052 skips `CREATE INDEX`, validates the
 catalog shape, and records the migration.
 
 ## Recovery
 
 A failed concurrent build leaves an invalid partition index, and the parent
-stays invalid; migration 0051 rejects both. Drop only the failed partition
+stays invalid; migration 0052 rejects both. Drop only the failed partition
 index outside a transaction, then repeat that partition's build and attach:
 
 ```sql

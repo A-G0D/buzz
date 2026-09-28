@@ -638,6 +638,26 @@ async fn migration_schema_database_guard_covers_legacy_writer_and_nip09_deletion
     assert_eq!(watermark.1, c.id.as_bytes().as_slice());
 }
 
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn migration_schema_operator_listener_outbox_is_not_tenant_scoped() {
+    let db = setup_db().await;
+    let community = CommunityId::from_uuid(make_community(&db.pool).await);
+    let inventory = db
+        .deletion_store()
+        .inventory_schema(community)
+        .await
+        .expect("migrated deletion catalog should validate");
+
+    assert!(
+        !inventory
+            .scoped_tables
+            .iter()
+            .any(|table| table == "operator_listener_outbox"),
+        "operator-listener outbox is deployment-global, not tenant-scoped"
+    );
+}
+
 // ---- Read-replica routing ------------------------------------------------
 //
 // These tests pin the routing contract of `Db::read()` and the two routed
@@ -3302,7 +3322,7 @@ async fn migration_schema_channel_received_prebuild_validation() {
     const INDEX: &str = "idx_events_community_channel_received";
     const COLUMNS: &str = "(community_id, channel_id, received_at DESC, id, created_at)";
     let admin = PgPool::connect(&admin_url().await).await.unwrap();
-    let (pool, name) = create_scratch_db_through(&admin, "received_prebuild", Some(50)).await;
+    let (pool, name) = create_scratch_db_through(&admin, "received_prebuild", Some(51)).await;
     let partitions: Vec<String> = sqlx::query_scalar(
         "SELECT c.relname::text FROM pg_inherits i JOIN pg_class c ON c.oid=i.inhrelid \
          WHERE i.inhparent='events'::regclass ORDER BY 1",
@@ -3327,7 +3347,7 @@ async fn migration_schema_channel_received_prebuild_validation() {
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(version, 50);
+        assert_eq!(version, 51);
         sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP INDEX {INDEX}")))
             .execute(&pool)
             .await

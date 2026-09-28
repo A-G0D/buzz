@@ -133,7 +133,7 @@ unread remains device-local. There is no automatic dual-authority rollback.
   shared eight-second intent-processing deadline after admission. Limits are
   containment, not a production capacity claim.
 
-Apply migrations 0050 and 0051 (or the equivalent desired schema). Brownfield
+Apply migrations 0051 and 0052 (or the equivalent desired schema). Brownfield
 operators must prebuild the receipt index using
 [the concurrent deployment procedure](events-channel-received-deployment.md).
 Do not run an unbounded blocking index build on a large events table. No new
