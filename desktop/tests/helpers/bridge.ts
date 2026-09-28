@@ -174,6 +174,8 @@ type MockBridgeOptions = {
   } | null;
   /** Delay enterprise adapter login completion so cancellation/retry UI can be tested. */
   enterpriseLoginDelayMs?: number;
+  /** Sequenced enterprise login failures. String = throw; null = succeed. */
+  enterpriseLoginErrors?: (string | null)[];
   /** Builderlab account returned by hosted-community onboarding. Null/omitted = signed out. */
   builderlabAuth?: {
     email?: string;

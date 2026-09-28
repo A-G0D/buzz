@@ -239,6 +239,8 @@ type E2eConfig = {
     } | null;
     /** Delay enterprise adapter login completion so cancellation/retry UI can be tested. */
     enterpriseLoginDelayMs?: number;
+    /** Sequenced enterprise login failures. String = throw; null = succeed. */
+    enterpriseLoginErrors?: (string | null)[];
     /** Builderlab account returned by hosted-community onboarding. Null/omitted = signed out. */
     builderlabAuth?: {
       email?: string;
@@ -12563,6 +12565,12 @@ export function maybeInstallE2eTauriMocks() {
         const delayMs = activeConfig?.mock?.enterpriseLoginDelayMs ?? 0;
         if (delayMs > 0)
           await new Promise((resolve) => window.setTimeout(resolve, delayMs));
+        const nextLoginError =
+          activeConfig?.mock?.enterpriseLoginErrors?.shift();
+        if (activeConfig?.mock?.enterpriseLoginErrors) {
+          window.__BUZZ_E2E__ = activeConfig;
+        }
+        if (nextLoginError) throw new Error(nextLoginError);
         const nextAuth = activeConfig?.mock?.enterpriseAuth ?? {
           email: "employee@example.com",
           expiresAt: "2099-01-01T00:00:00Z",

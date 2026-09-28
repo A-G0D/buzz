@@ -1749,6 +1749,136 @@ test("authoritative corporate profile save failure stays non-editable and retrie
     ]);
 });
 
+test("joining enterprise login retry reruns init for the active community", async ({
+  page,
+}) => {
+  const relayUrl = "wss://enterprise-login-retry.example";
+  const transactionId = "txn-enterprise-login-retry";
+  const timestamp = new Date().toISOString();
+  await seedActiveIdentity(page, BLANK_TYLER_IDENTITY);
+  await page.addInitScript(
+    ({
+      pubkey,
+      storageKey,
+      transactionStorageKey,
+      relayUrl,
+      transactionId,
+      timestamp,
+    }) => {
+      window.localStorage.setItem(
+        `buzz-machine-onboarding-complete.v2:${pubkey}`,
+        "true",
+      );
+      window.localStorage.setItem(
+        storageKey,
+        JSON.stringify([
+          {
+            id: "e2e-enterprise-community",
+            name: "Enterprise",
+            relayUrl,
+            addedAt: timestamp,
+            pubkey,
+          },
+        ]),
+      );
+      window.localStorage.setItem(
+        "buzz-active-community-id",
+        "e2e-enterprise-community",
+      );
+      window.localStorage.setItem(
+        transactionStorageKey,
+        JSON.stringify({
+          id: transactionId,
+          source: "first-community",
+          stage: "connecting",
+          relayUrl,
+          communityName: "Enterprise",
+          communityId: "e2e-enterprise-community",
+          addedCommunity: true,
+          createdAt: timestamp,
+          updatedAt: timestamp,
+        }),
+      );
+    },
+    {
+      pubkey: BLANK_TYLER_IDENTITY.pubkey,
+      storageKey: "buzz-communities",
+      transactionStorageKey: COMMUNITY_ONBOARDING_TRANSACTION_STORAGE_KEY,
+      relayUrl,
+      transactionId,
+      timestamp,
+    },
+  );
+  await installMockBridge(
+    page,
+    {
+      enterpriseLoginGate: { status: "required" },
+      enterpriseAuth: null,
+      enterpriseLoginErrors: ["Browser login was rejected", null],
+      profileHasEvent: false,
+    },
+    {
+      relayWsUrl: relayUrl,
+      skipOnboardingSeed: true,
+      skipCommunitySeed: true,
+    },
+  );
+  await page.goto("/");
+
+  await expect(page.getByTestId("enterprise-browser-login-gate")).toBeVisible();
+  await page.getByTestId("enterprise-browser-login-continue").click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (window.__BUZZ_E2E_COMMANDS__ ?? []).filter(
+            (command) => command === "start_enterprise_auth_login",
+          ).length,
+      ),
+    )
+    .toBe(1);
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        JSON.stringify(window.__BUZZ_E2E__?.mock?.enterpriseLoginErrors),
+      ),
+    )
+    .toBe("[null]");
+  await expect(page.getByText("Browser login was rejected")).toBeVisible();
+
+  await page.getByRole("button", { name: "Retry" }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (window.__BUZZ_E2E_COMMANDS__ ?? []).filter(
+            (command) => command === "enterprise_login_gate",
+          ).length,
+      ),
+    )
+    .toBe(2);
+  await expect(page.getByTestId("enterprise-browser-login-gate")).toBeVisible();
+  await expect(page.getByTestId("enterprise-browser-login-error")).toHaveCount(
+    0,
+  );
+  await page.getByTestId("enterprise-browser-login-continue").click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (window.__BUZZ_E2E_COMMANDS__ ?? []).filter(
+            (command) => command === "start_enterprise_auth_login",
+          ).length,
+      ),
+    )
+    .toBe(2);
+  await expect
+    .poll(() =>
+      page.evaluate(() => window.__BUZZ_E2E__?.mock?.enterpriseAuth?.email),
+    )
+    .toBe("employee@example.com");
+});
+
 test("first-community owner can replace a mismatched account identity", async ({
   page,
 }) => {

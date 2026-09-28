@@ -169,9 +169,11 @@ function LoadingDots({ label }: { label: string }) {
 export function CommunityOnboardingFlow({
   onCancel,
   onConnect,
+  onRetry,
 }: {
   onCancel: () => void;
   onConnect: () => void;
+  onRetry?: () => void;
 }) {
   const { transaction, update, clear } = useCommunityOnboarding();
   const queryClient = useQueryClient();
@@ -271,7 +273,7 @@ export function CommunityOnboardingFlow({
     };
   }, [clear, isEnteringStage]);
 
-  const retry = () =>
+  const retry = () => {
     update({
       stage: nextRetryStage(
         transaction?.stage,
@@ -279,6 +281,8 @@ export function CommunityOnboardingFlow({
       ),
       error: undefined,
     });
+    onRetry?.();
+  };
   const relayUrl = transaction?.relayUrl;
   const finish = React.useCallback(async () => {
     if (!relayUrl) return;
