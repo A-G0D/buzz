@@ -36,7 +36,8 @@ upstream ceremony. No owner-signed attestation is required or checked, and
 owners have no self-service cancellation. Recovery is a privileged abort,
 which stays open across the reversible `submitted`, `inventoried`, `approved`,
 and `fenced` stages — releasing the request fence while leaving the community
-archived — and closes from `drained` onward, once tenant state is destroyed.
+archived — and closes from `drained` onward, when tenant-state destruction may
+have begun.
 
 Manual operator handoff converges on an admitted owner request only when
 `buzz-admin deletions submit --requested-by` repeats the owner pubkey recorded

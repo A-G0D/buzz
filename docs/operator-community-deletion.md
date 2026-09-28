@@ -52,17 +52,19 @@ non-secret S3 settings. It does not receive `BUZZ_RELAY_PRIVATE_KEY`,
 `BUZZ_GIT_HOOK_HMAC_SECRET`, `RELAY_URL`, or the full Secret through `envFrom`.
 The pod also disables service-account token automounting and Kubernetes service
 link environment injection because the executor does not call the Kubernetes
-API or discover cluster Services.
+API or discover cluster Services. This disables the ordinary Kubernetes API
+token mount, not credentials injected by a platform workload-identity
+mechanism.
 
 Leaving `operatorJobs.deletionDrain.serviceAccountName` empty falls back to the
-relay's own service account. `automountServiceAccountToken: false` only
-suppresses the projected token inside the pod; it does not detach the identity.
-Cloud IAM bindings attached to that service account — IRSA on EKS, Workload
-Identity on GKE — are resolved by the node/metadata path and still apply, so the
-drain pod inherits the relay's cloud permissions. Create a dedicated service
-account with only the object-store permissions listed below and name it
-explicitly if you want the executor's IAM blast radius to be smaller than the
-relay's.
+relay's own service account, including cloud IAM attached through the platform's
+workload-identity mechanism. For example, the EKS IRSA admission webhook can
+inject its projected web-identity token and AWS environment variables despite
+`automountServiceAccountToken: false`; other platforms provide their own
+identity mechanism. The drain pod therefore inherits the relay's cloud role by
+default. Create a dedicated service account with only the object-store
+permissions listed below and name it explicitly if you want the executor's IAM
+blast radius to be smaller than the relay's.
 
 The S3 principal needs the relay's normal object permissions plus bucket-level
 `s3:ListBucketVersions` and object-level `s3:DeleteObjectVersion` for every
@@ -87,8 +89,10 @@ reports their objects with the `null` version id.
      -l app.kubernetes.io/component=deletion-drain,app.kubernetes.io/instance=<release>
    ```
 
-   The name is `<fullname>-deletion-drain`. `buzz.fullname` collapses to the
-   release name when the release name already contains the chart name, so
+   The name is `<bounded-fullname>-deletion-drain`. The chart truncates only the
+   fullname portion when needed so the suffix remains stable within Kubernetes'
+   52-character CronJob name limit. `buzz.fullname` collapses to the release
+   name when the release name already contains the chart name, so
    `helm install buzz ...` renders `buzz-deletion-drain`, not
    `buzz-buzz-deletion-drain`.
 5. Start one staffed manual run with
