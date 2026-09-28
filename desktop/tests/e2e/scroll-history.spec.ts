@@ -2172,6 +2172,8 @@ test("thread summary badge survives a retained older-history prepend", async ({
 
   await page.getByTestId("channel-deep-history").click();
   await expect(page.getByTestId("chat-title")).toHaveText("deep-history");
+  // Page only after live admission and its head refresh. That refresh
+  // replaces the window, so an earlier prepend can be discarded.
   await waitForMockChannelHeadReady(
     page,
     "deep-history",
