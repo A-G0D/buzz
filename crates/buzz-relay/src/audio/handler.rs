@@ -740,6 +740,8 @@ pub(crate) async fn handle_active_audio_connection(
             // The resolve may CAS-acquire the huddle lease in Redis, a
             // persistent write, so it runs under an effect permit like every
             // other pre-commit write. [nip_fi_gate contract]
+            #[cfg(test)]
+            crate::nip_fi_test_hooks::before_lease_permit(tenant.community()).await;
             let resolved = {
                 let _lease_permit = match audio_gate.acquire_effect().await {
                     Ok(permit) => permit,
@@ -9545,6 +9547,168 @@ mod tests {
 
             server.abort();
             let _ = server.await;
+        }
+
+        // ── Lease-permit ordering witness ─────────────────────────────────────
+        //
+        // Cancellation that lands just before the lease permit must stop the
+        // join before `resolve_join_owner_ready` touches the directory, so no
+        // ownership lookup or lease CAS runs without a permit.
+        //
+        // Mutation oracle: move `_lease_permit` after the resolver call → the
+        // directory is consulted after cancellation → call count is non-zero → RED.
+        #[tokio::test]
+        #[ignore = "requires Postgres — runs in postgres-ci nextest lane"]
+        async fn cancel_before_lease_permit_never_consults_directory() {
+            use crate::audio::join::{
+                AcquireOutcome, HuddleDirectory, HuddleLease, HuddleOwnerRegistry,
+                HuddleReleaseOutcome, HuddleRenewOutcome, Ownership,
+            };
+            use buzz_core::CommunityId;
+            use buzz_relay_mesh::wire::FencedHeader;
+            use buzz_relay_mesh::{MeshError, RuntimeId};
+            use chrono::{Duration, Utc};
+            use futures_util::StreamExt as _;
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            use std::sync::Arc;
+            use uuid::Uuid;
+
+            struct CountingDirectory(Arc<AtomicUsize>);
+            #[async_trait::async_trait]
+            impl HuddleDirectory for CountingDirectory {
+                async fn owner_of(
+                    &self,
+                    _c: CommunityId,
+                    _s: Uuid,
+                ) -> Result<Option<Ownership>, MeshError> {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                    Ok(None)
+                }
+                async fn acquire(
+                    &self,
+                    _c: CommunityId,
+                    _s: Uuid,
+                    _o: RuntimeId,
+                ) -> Result<AcquireOutcome, MeshError> {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                    Err(MeshError::Transport("not under test".into()))
+                }
+                async fn renew(&self, _l: &HuddleLease) -> Result<HuddleRenewOutcome, MeshError> {
+                    unreachable!()
+                }
+                async fn release(
+                    &self,
+                    _l: &HuddleLease,
+                ) -> Result<HuddleReleaseOutcome, MeshError> {
+                    Ok(HuddleReleaseOutcome::Released)
+                }
+                async fn validate(
+                    &self,
+                    _c: CommunityId,
+                    _f: &FencedHeader,
+                ) -> Result<(), MeshError> {
+                    Ok(())
+                }
+            }
+
+            let state = audio_test_state_real_db()
+                .await
+                .expect("PostgreSQL must be available");
+            let pool = state.db.pool().clone();
+            let (tenant, channel_id, key) = seed_audio_fixture(&pool).await;
+            let community = tenant.community();
+            let relay_url = format!("ws://{}", tenant.host());
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mesh =
+                crate::mesh_boot::MeshHandle::for_test_only(Arc::new(HuddleOwnerRegistry::new()))
+                    .await
+                    .with_test_directory(Arc::new(CountingDirectory(Arc::clone(&calls))));
+            state.mesh.set(mesh).map_err(|_| ()).expect("fresh mesh");
+
+            let assertion = buzz_auth::VerifiedAssertion::for_test(
+                Some(key.public_key()),
+                vec![Utc::now() + Duration::hours(1)],
+            );
+            let conn_cancel = tokio_util::sync::CancellationToken::new();
+            let (arrived_rx, release) =
+                crate::nip_fi_test_hooks::audio_lease_permit_hook::arm(community);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let app = axum::Router::new().route(
+                "/",
+                axum::routing::get({
+                    let (state, tenant, cancel) =
+                        (Arc::clone(&state), tenant.clone(), conn_cancel.clone());
+                    move |ws: axum::extract::ws::WebSocketUpgrade| {
+                        let (state, tenant, assertion) =
+                            (Arc::clone(&state), tenant.clone(), assertion.clone());
+                        let control = crate::state::CommunityConnectionControl::new(cancel.clone());
+                        async move {
+                            ws.on_upgrade(move |socket| async move {
+                                handle_active_audio_connection(
+                                    socket,
+                                    state,
+                                    tenant,
+                                    channel_id,
+                                    control,
+                                    Some(assertion),
+                                    Utc::now(),
+                                    None,
+                                )
+                                .await
+                            })
+                        }
+                    }
+                }),
+            );
+            let server = tokio::spawn(async move { axum::serve(listener, app).await });
+            let (mut client, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/"))
+                .await
+                .expect("connect");
+            let challenge = match client.next().await {
+                Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t))) => {
+                    serde_json::from_str::<serde_json::Value>(&t).expect("json")["challenge"]
+                        .as_str()
+                        .expect("challenge")
+                        .to_string()
+                }
+                other => panic!("expected challenge; got {other:?}"),
+            };
+            let auth_event = nostr::EventBuilder::new(nostr::Kind::Authentication, "")
+                .tag(nostr::Tag::parse(["relay", &relay_url]).unwrap())
+                .tag(nostr::Tag::parse(["challenge", &challenge]).unwrap())
+                .sign_with_keys(&key)
+                .unwrap();
+            let auth_msg = serde_json::json!({
+                "type": "auth",
+                "event": auth_event,
+                "parent_channel_id": null,
+                "protocol_version": 1,
+            })
+            .to_string();
+            client
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    auth_msg.into(),
+                ))
+                .await
+                .expect("send auth");
+
+            tokio::time::timeout(std::time::Duration::from_secs(5), arrived_rx)
+                .await
+                .expect("handler must reach the lease permit")
+                .expect("hook channel");
+            conn_cancel.cancel();
+            release.notify_one();
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(3), client.next()).await;
+
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                0,
+                "resolver must not consult the directory once the permit is refused"
+            );
+            server.abort();
         }
 
         // ── F4b relay-membership denial wire frame ────────────────────────────

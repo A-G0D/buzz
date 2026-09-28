@@ -194,6 +194,10 @@ make_hook!(audio_membership_lock_hook, before_membership_lock);
 make_hook!(audio_participant_commit_hook, before_participant_commit);
 make_hook!(audio_participant_fanout_hook, after_participant_fanout);
 make_hook!(audio_add_peer_hook, after_add_peer);
+// `before_lease_permit`: fires in `handle_active_audio_connection` immediately
+// before the effect permit that covers join-owner resolution. Cancelling here
+// proves the resolver (and its lease CAS) never runs without a permit.
+make_hook!(audio_lease_permit_hook, before_lease_permit);
 // `before_archive_recheck`: fires in `commit_participant_join` immediately
 // after the `SELECT archived_at ... FOR UPDATE` row lock is acquired and the
 // snapshot value is read, but before the archived check / any write. At this
