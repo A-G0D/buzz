@@ -490,6 +490,8 @@ mod postgres_tests {
             "relay_admin_outbox",
             "relay_operator_audit",
             "storage_accounting_snapshots",
+            "operator_listener_pubkeys",
+            "operator_listener_outbox",
         ] {
             if normalized[insert_pos..].contains(&format!("'{value}'")) {
                 globals.insert(value.to_owned());
@@ -703,14 +705,14 @@ mod postgres_tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 50);
+        assert_eq!(migrations.len(), 51);
         assert_eq!(migrations[48].version, 49);
-        assert_eq!(migrations[49].version, 50);
+        assert_eq!(migrations[50].version, 51);
         assert!(migrations[48]
             .sql
             .as_str()
             .contains("idx_thread_metadata_window"));
-        assert!(migrations[49]
+        assert!(migrations[50]
             .sql
             .as_str()
             .contains("community_deletion_owner_provenance"));
@@ -1298,10 +1300,63 @@ mod postgres_tests {
             .sql
             .as_str()
             .contains("CREATE TABLE storage_accounting_snapshots"));
-        // schema.sql exclusion list must match the restored (pre-0041) body.
+        assert_eq!(migrations[47].version, 48);
+        assert!(migrations[47]
+            .sql
+            .as_str()
+            .contains("ADD COLUMN hash_version SMALLINT"));
+        assert_eq!(migrations[49].version, 50);
+        assert!(migrations[49]
+            .sql
+            .as_str()
+            .contains("CREATE TABLE operator_listener_pubkeys"));
+        assert!(migrations[49]
+            .sql
+            .as_str()
+            .contains("CREATE TABLE operator_listener_outbox"));
+        assert!(migrations[49]
+            .sql
+            .as_str()
+            .contains("CREATE OR REPLACE FUNCTION community_write_fence_excluded_table"));
+        assert!(migrations[49]
+            .sql
+            .as_str()
+            .contains("'rate_limit_violations', 'operator_listener_outbox'"));
+        for index in [
+            "operator_listener_pubkeys_target",
+            "operator_listener_pubkeys_created_at",
+            "operator_listener_outbox_due",
+            "operator_listener_outbox_recovery",
+            "operator_listener_outbox_created_at",
+        ] {
+            assert!(
+                migrations[49].sql.as_str().contains(index),
+                "migration 0050 must declare {index}"
+            );
+            assert!(
+                desired_schema.contains(index),
+                "schema.sql must declare {index}"
+            );
+        }
+        for index_shape in [
+            "ON operator_listener_outbox (next_attempt_at, created_at, id)",
+            "ON operator_listener_outbox (lease_until, created_at, id)",
+        ] {
+            assert!(
+                migrations[49].sql.as_str().contains(index_shape),
+                "migration 0050 must declare {index_shape}"
+            );
+            assert!(
+                desired_schema.contains(index_shape),
+                "schema.sql must declare {index_shape}"
+            );
+        }
+        // schema.sql keeps the restored (pre-0041) deletion exclusions and also
+        // leaves the deployment-global listener outbox outside tenant fencing.
         assert!(
-            desired_schema.contains("'rate_limit_violations'\n    ]::TEXT[])"),
-            "schema.sql exclusion list must match the pre-0041 body after ledger removal"
+            desired_schema
+                .contains("'rate_limit_violations', 'operator_listener_outbox'\n    ]::TEXT[])"),
+            "schema.sql must exclude the deployment-global listener outbox from tenant fencing"
         );
     }
 
@@ -1770,10 +1825,10 @@ mod postgres_tests {
             .expect("embedded migration 0029")
             .sql
             .as_ref();
-        let migration_0050: &str = MIGRATOR
+        let migration_0051: &str = MIGRATOR
             .iter()
-            .find(|migration| migration.version == 50)
-            .expect("embedded migration 0050")
+            .find(|migration| migration.version == 51)
+            .expect("embedded migration 0051")
             .sql
             .as_ref();
         let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1784,7 +1839,7 @@ mod postgres_tests {
             .expect("read schema/schema.sql");
 
         let migration = surface(migration_0029);
-        let owner_admission_migration = surface(migration_0050);
+        let owner_admission_migration = surface(migration_0051);
         let schema = surface(&schema_sql);
 
         assert_eq!(
@@ -1830,7 +1885,7 @@ mod postgres_tests {
             owner_admission_migration
                 .functions
                 .get("prevent_community_deletion_request_retargeting")
-                .expect("0050 deletion retargeting guard"),
+                .expect("0051 deletion retargeting guard"),
             "schema.sql must carry the latest immutable owner-provenance guard"
         );
         let request_table = schema
