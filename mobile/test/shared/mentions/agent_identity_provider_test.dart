@@ -4,6 +4,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:buzz/features/channels/agent_activity/working_bots_provider.dart';
 import 'package:buzz/features/channels/channel_management_provider.dart';
+import 'package:buzz/features/channels/channel_typing_provider.dart';
 import 'package:buzz/shared/mentions/agent_identity_provider.dart';
 import 'package:buzz/shared/relay/relay.dart';
 
@@ -212,6 +213,32 @@ void main() {
     },
   );
 
+  test('keeps working state for a promoted verified agent', () async {
+    final relaySession = _MembershipRelaySessionNotifier([
+      _membershipEvent(role: 'admin'),
+    ]);
+    final container = ProviderContainer(
+      overrides: [
+        relaySessionProvider.overrideWith(() => relaySession),
+        knownAgentPubkeysProvider.overrideWithValue(const {_agentPubkey}),
+        channelTypingProvider(_channelId).overrideWith(
+          () => _StaticTypingNotifier([
+            const TypingEntry(pubkey: _agentPubkey, expiresAtMs: 9999999999999),
+          ]),
+        ),
+      ],
+    );
+    addTearDown(container.dispose);
+
+    expect(
+      await container.read(channelMembersProvider(_channelId).future),
+      hasLength(1),
+    );
+    expect(container.read(workingBotPubkeysProvider(_channelId)), {
+      _agentPubkey,
+    });
+  });
+
   test('blank profile labels defer to the directory label', () {
     const pubkey = 'deadbeef0123456789';
 
@@ -248,6 +275,15 @@ NostrEvent _membershipEvent({required String role}) => NostrEvent(
 Future<void> _pumpEventQueue() async {
   await Future<void>.delayed(Duration.zero);
   await Future<void>.delayed(Duration.zero);
+}
+
+class _StaticTypingNotifier extends ChannelTypingNotifier {
+  final List<TypingEntry> entries;
+
+  _StaticTypingNotifier(this.entries) : super(_channelId);
+
+  @override
+  List<TypingEntry> build() => entries;
 }
 
 class _MembershipRelaySessionNotifier extends RelaySessionNotifier {

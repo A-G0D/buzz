@@ -110,6 +110,17 @@ class ChannelDetailsPage extends HookConsumerWidget {
         '$memberCount ${memberCount == 1 ? 'member' : 'members'}';
     final previewMembers = members.take(_channelMemberPreviewLimit).toList();
     final userCache = ref.watch(userCacheProvider);
+    final agentPubkeys = agentPubkeysWithChannelBots(
+      knownAgentPubkeys: agentPubkeysWithProfileOwners(
+        knownAgentPubkeys: ref.watch(knownAgentPubkeysProvider),
+        profileOwnedAgentPubkeys: userCache.entries
+            .where((entry) => entry.value.isAgent)
+            .map((entry) => entry.key),
+      ),
+      channelBotPubkeys: members
+          .where((member) => member.isBot)
+          .map((member) => member.pubkey),
+    );
     final currentSectionId = sectionState.isReady
         ? sectionState.store.assignments[resolvedChannel.id]
         : sectionId;
@@ -412,6 +423,7 @@ class ChannelDetailsPage extends HookConsumerWidget {
                         userCache[member.pubkey.toLowerCase()]?.displayName,
                     avatarUrl:
                         userCache[member.pubkey.toLowerCase()]?.avatarUrl,
+                    isAgent: agentPubkeys.contains(member.pubkey.toLowerCase()),
                   ),
                 AppListRowRaw(
                   key: const ValueKey('channel-details-members-row'),
@@ -644,6 +656,7 @@ class _ChannelMemberPreviewRow extends StatelessWidget {
     required this.onMemberTap,
     required this.displayName,
     required this.avatarUrl,
+    required this.isAgent,
   });
 
   final ChannelMember member;
@@ -651,6 +664,7 @@ class _ChannelMemberPreviewRow extends StatelessWidget {
   final void Function(BuildContext context, String pubkey) onMemberTap;
   final String? displayName;
   final String? avatarUrl;
+  final bool isAgent;
 
   @override
   Widget build(BuildContext context) {
@@ -679,7 +693,7 @@ class _ChannelMemberPreviewRow extends StatelessWidget {
         radius: 20,
         backgroundColor: context.colors.primaryContainer,
         fallback: Text(initial),
-        isAgent: member.isBot,
+        isAgent: isAgent,
       ),
       title: Text.rich(
         TextSpan(

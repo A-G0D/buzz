@@ -2374,6 +2374,41 @@ void main() {
       expect(roleChanges, [(_channelId, 'agent', 'admin')]);
     });
 
+    testWidgets('uses verified agent identity in member previews', (
+      tester,
+    ) async {
+      await tester.pumpWidget(
+        _buildTestable(
+          messages: const [],
+          members: [
+            ChannelMember(
+              pubkey: 'self',
+              role: 'owner',
+              joinedAt: DateTime(2025),
+            ),
+            ChannelMember(
+              pubkey: 'agent',
+              role: 'admin',
+              joinedAt: DateTime(2025),
+            ),
+          ],
+          knownAgentPubkeys: const {'agent'},
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      await tester.tap(
+        find.byKey(const ValueKey('channel-header-settings-trigger')),
+      );
+      await tester.pumpAndSettle();
+
+      final row = find.byKey(const ValueKey('channel-details-member-agent'));
+      final avatar = tester.widget<AvatarImage>(
+        find.descendant(of: row, matching: find.byType(AvatarImage)),
+      );
+      expect(avatar.isAgent, isTrue);
+    });
+
     testWidgets('action tiles expose button and enabled semantics', (
       tester,
     ) async {
