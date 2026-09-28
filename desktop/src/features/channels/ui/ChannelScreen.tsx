@@ -330,14 +330,12 @@ export function ChannelScreen({
       ...new Set([
         ...messageEventProfilePubkeys,
         ...activeDmParticipantPubkeys,
-        ...(channelMembers ?? []).map((member) => member.pubkey),
         ...knownAgentPubkeys,
         ...typingEntries.map((entry) => entry.pubkey),
       ]),
     ],
     [
       activeDmParticipantPubkeys,
-      channelMembers,
       knownAgentPubkeys,
       messageEventProfilePubkeys,
       typingEntries,
