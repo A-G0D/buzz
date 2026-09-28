@@ -2304,6 +2304,67 @@ test("members sidebar exposes view-activity for a viewer-owned relay agent", asy
   ).toBeVisible();
 });
 
+test("channel managers promote an agent to explicit admin", async ({
+  page,
+}) => {
+  await installMockBridge(page, {
+    relayAgents: [
+      {
+        pubkey: OWNED_RELAY_AGENT_PUBKEY,
+        name: "nadia",
+        agentType: "goose",
+        capabilities: ["search", "summaries"],
+        channelNames: ["agents"],
+        respondTo: "anyone",
+      },
+    ],
+  });
+  await page.goto("/");
+
+  await openMembersSidebar(page, "agents");
+
+  const agentRow = page.getByTestId(
+    `sidebar-member-${OWNED_RELAY_AGENT_PUBKEY}`,
+  );
+  await expect(agentRow).toContainText("agent · member");
+
+  await openMemberMenu(page, OWNED_RELAY_AGENT_PUBKEY);
+  await page
+    .getByTestId(`sidebar-change-role-${OWNED_RELAY_AGENT_PUBKEY}`)
+    .click();
+  await page
+    .getByTestId(`sidebar-role-admin-${OWNED_RELAY_AGENT_PUBKEY}`)
+    .click();
+
+  await expect(agentRow).toContainText("agent · admin");
+  await expect(agentRow).toBeVisible();
+  await expect(
+    page.getByTestId(`sidebar-member-open-profile-${OWNED_RELAY_AGENT_PUBKEY}`),
+  ).toBeVisible();
+
+  const roleChanges = await page.evaluate(() =>
+    (
+      (
+        window as Window & {
+          __BUZZ_E2E_COMMAND_LOG__?: Array<{
+            command: string;
+            payload: unknown;
+          }>;
+        }
+      ).__BUZZ_E2E_COMMAND_LOG__ ?? []
+    )
+      .filter((entry) => entry.command === "change_channel_member_role")
+      .map((entry) => entry.payload),
+  );
+  expect(roleChanges).toEqual([
+    {
+      channelId: AGENTS_CHANNEL_ID,
+      pubkey: OWNED_RELAY_AGENT_PUBKEY,
+      role: "admin",
+    },
+  ]);
+});
+
 test("profile renders live activity for a viewer-owned relay agent", async ({
   page,
 }) => {

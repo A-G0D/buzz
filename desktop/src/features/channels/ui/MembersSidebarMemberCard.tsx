@@ -97,7 +97,7 @@ const MEMBER_ROW_INSET_DIVIDER_CLASS =
 
 function formatRoleLabel(member: ChannelMember, memberIsBot: boolean) {
   if (memberIsBot) {
-    return "agent";
+    return member.role === "bot" ? "agent" : `agent · ${member.role}`;
   }
 
   if (member.role === "owner" || member.role === "admin") {
@@ -157,9 +157,12 @@ export function MembersSidebarMemberCard({
   // owner (whom no moderator can restrict).
   const canModerateMember =
     canModerate && !memberIsBot && member.role !== "owner";
-  const hasActions = memberIsBot
-    ? Boolean(managedAgent) || canRemoveMember || canViewActivity
-    : canRemoveMember || canChangeRole || canModerateMember;
+  const hasActions =
+    Boolean(managedAgent) ||
+    canRemoveMember ||
+    canViewActivity ||
+    canChangeRole ||
+    canModerateMember;
 
   const memberIdentity = (
     <div className="pointer-events-none relative z-10 flex min-w-0 flex-1 items-center gap-3">
@@ -346,8 +349,7 @@ function MemberActionsMenu({
   onViewActivity?: (pubkey: string) => void;
   pairAction?: ManagedAgentPairAction;
 }) {
-  const showChangeRole =
-    canChangeRole && !memberIsBot && member.role !== "owner";
+  const showChangeRole = canChangeRole && member.role !== "owner";
   const isBanned = moderationState?.banned ?? false;
   const isTimedOut = moderationState?.timedOut ?? false;
 

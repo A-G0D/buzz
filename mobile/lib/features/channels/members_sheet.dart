@@ -3,6 +3,7 @@ import 'package:flutter_hooks/flutter_hooks.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:lucide_icons_flutter/lucide_icons.dart';
 
+import '../../shared/mentions/agent_identity_provider.dart';
 import '../../shared/theme/theme.dart';
 import '../../shared/widgets/avatar_image.dart';
 import '../../shared/widgets/buzz_loading_indicator.dart';
@@ -30,9 +31,22 @@ class MembersSheet extends HookConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final membersAsync = ref.watch(channelMembersProvider(channel.id));
     final allMembers = membersAsync.asData?.value ?? const <ChannelMember>[];
-    final people = allMembers.where((member) => !member.isBot).toList();
-    final bots = allMembers.where((member) => member.isBot).toList();
     final userCache = ref.watch(userCacheProvider);
+    final agentPubkeys = agentPubkeysWithChannelBots(
+      knownAgentPubkeys: agentPubkeysWithProfileOwners(
+        knownAgentPubkeys: ref.watch(knownAgentPubkeysProvider),
+        profileOwnedAgentPubkeys: userCache.entries
+            .where((entry) => entry.value.isAgent)
+            .map((entry) => entry.key),
+      ),
+      channelBotPubkeys: allMembers
+          .where((member) => member.isBot)
+          .map((member) => member.pubkey),
+    );
+    bool isAgent(ChannelMember member) =>
+        agentPubkeys.contains(member.pubkey.toLowerCase());
+    final people = allMembers.where((member) => !isAgent(member)).toList();
+    final agents = allMembers.where(isAgent).toList();
     final typingBotPubkeys = ref.watch(workingBotPubkeysProvider(channel.id));
     final statusCache = ref.watch(userStatusCacheProvider);
     final bottomClearance = Grid.md + MediaQuery.viewPaddingOf(context).bottom;
@@ -70,17 +84,17 @@ class MembersSheet extends HookConsumerWidget {
         ref
             .read(userCacheProvider.notifier)
             .preload(allMembers.map((m) => m.pubkey).toList());
-        // Track user statuses for people (not bots).
+        // Track user statuses for people (not agents).
         final peoplePubkeys = allMembers
-            .where((m) => !m.isBot)
-            .map((m) => m.pubkey)
+            .where((member) => !isAgent(member))
+            .map((member) => member.pubkey)
             .toList();
         if (peoplePubkeys.isNotEmpty) {
           ref.read(userStatusCacheProvider.notifier).track(peoplePubkeys);
         }
       }
       return null;
-    }, [allMembers.length]);
+    }, [allMembers.length, Object.hashAll(agentPubkeys)]);
 
     return Padding(
       key: const ValueKey('members-sheet-content-padding'),
@@ -99,6 +113,7 @@ class MembersSheet extends HookConsumerWidget {
                 for (final member in people)
                   _MemberTile(
                     member: member,
+                    isAgent: false,
                     currentPubkey: currentPubkey,
                     profile: userCache[member.pubkey.toLowerCase()],
                     canManage: canManage,
@@ -109,28 +124,31 @@ class MembersSheet extends HookConsumerWidget {
                     userStatus: statusCache[member.pubkey.toLowerCase()],
                   ),
               ],
-              if (bots.isNotEmpty) ...[
+              if (agents.isNotEmpty) ...[
                 const SizedBox(height: Grid.xxs),
-                _SectionLabel(label: 'Agents · ${bots.length}'),
-                for (final bot in bots)
+                _SectionLabel(label: 'Agents · ${agents.length}'),
+                for (final agent in agents)
                   _MemberTile(
-                    member: bot,
+                    member: agent,
+                    isAgent: true,
                     currentPubkey: currentPubkey,
-                    profile: userCache[bot.pubkey.toLowerCase()],
+                    profile: userCache[agent.pubkey.toLowerCase()],
                     canManage: canManage,
-                    isSelf: false,
+                    isSelf:
+                        agent.pubkey.toLowerCase() ==
+                        currentPubkey?.toLowerCase(),
                     channelId: channel.id,
                     isWorking: typingBotPubkeys.contains(
-                      bot.pubkey.toLowerCase(),
+                      agent.pubkey.toLowerCase(),
                     ),
-                    onViewActivity: () => openActivity(bot),
+                    onViewActivity: () => openActivity(agent),
                     onActivityTap:
-                        typingBotPubkeys.contains(bot.pubkey.toLowerCase())
-                        ? () => openActivity(bot)
+                        typingBotPubkeys.contains(agent.pubkey.toLowerCase())
+                        ? () => openActivity(agent)
                         : null,
                   ),
               ],
-              if (people.isEmpty && bots.isEmpty)
+              if (people.isEmpty && agents.isEmpty)
                 Center(
                   child: Text(
                     'No members found.',
@@ -191,6 +209,7 @@ String _roleLabel(String role) {
 
 class _MemberTile extends ConsumerWidget {
   final ChannelMember member;
+  final bool isAgent;
   final String? currentPubkey;
   final UserProfile? profile;
   final bool canManage;
@@ -203,6 +222,7 @@ class _MemberTile extends ConsumerWidget {
 
   const _MemberTile({
     required this.member,
+    required this.isAgent,
     required this.currentPubkey,
     required this.profile,
     required this.canManage,
@@ -235,7 +255,7 @@ class _MemberTile extends ConsumerWidget {
       leading: _MemberAvatar(
         avatarUrl: profile?.avatarUrl,
         initial: initial,
-        isAgent: member.isBot || profile?.isAgent == true,
+        isAgent: isAgent,
       ),
       title: Text(label),
       subtitle: isWorking
@@ -297,7 +317,7 @@ class _MemberTile extends ConsumerWidget {
         : (profile?.displayName?.trim().isNotEmpty == true
               ? profile!.displayName!.trim()
               : member.labelFor(currentPubkey));
-    final canChangeRole = showManagementActions && !member.isBot;
+    final canChangeRole = showManagementActions;
     showBuzzModalBottomSheet<void>(
       context: context,
       title: label,

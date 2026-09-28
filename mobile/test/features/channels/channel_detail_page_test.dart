@@ -2315,6 +2315,65 @@ void main() {
       expect(find.text('Remove from channel'), findsOneWidget);
     });
 
+    testWidgets('promotes a verified agent to explicit channel admin', (
+      tester,
+    ) async {
+      final roleChanges = <(String, String, String)>[];
+      await tester.pumpWidget(
+        _buildTestable(
+          messages: const [],
+          members: [
+            ChannelMember(
+              pubkey: 'self',
+              role: 'owner',
+              joinedAt: DateTime(2025),
+            ),
+            ChannelMember(
+              pubkey: 'agent',
+              role: 'member',
+              joinedAt: DateTime(2025),
+            ),
+          ],
+          users: const {
+            'agent': UserProfile(
+              pubkey: 'agent',
+              displayName: 'Pollen',
+              ownerPubkey: 'owner',
+            ),
+          },
+          knownAgentPubkeys: const {'agent'},
+          createChannelActions: (ref) => _FakeChannelActions(
+            ref,
+            onChangeMemberRole: (channelId, pubkey, role) async {
+              roleChanges.add((channelId, pubkey, role));
+            },
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      await tester.tap(
+        find.byKey(const ValueKey('channel-header-settings-trigger')),
+      );
+      await tester.pumpAndSettle();
+      await tester.ensureVisible(
+        find.byKey(const ValueKey('channel-details-members-row')),
+      );
+      await tester.tap(
+        find.byKey(const ValueKey('channel-details-members-row')),
+      );
+      await tester.pumpAndSettle();
+
+      expect(find.text('Agents · 1'), findsOneWidget);
+      expect(find.text('People · 1'), findsOneWidget);
+      await tester.tap(find.byIcon(LucideIcons.ellipsis));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Admin'));
+      await tester.pumpAndSettle();
+
+      expect(roleChanges, [(_channelId, 'agent', 'admin')]);
+    });
+
     testWidgets('action tiles expose button and enabled semantics', (
       tester,
     ) async {
@@ -15146,6 +15205,8 @@ class _FakeChannelActions extends ChannelActions {
   final Future<void> Function(String channelId)? onArchiveChannel;
   final Future<void> Function(String channelId, List<String> pubkeys)?
   onAddMembers;
+  final Future<void> Function(String channelId, String pubkey, String role)?
+  onChangeMemberRole;
   final Future<void> Function(
     String channelId,
     String? name,
@@ -15159,6 +15220,7 @@ class _FakeChannelActions extends ChannelActions {
     this.onLeaveChannel,
     this.onArchiveChannel,
     this.onAddMembers,
+    this.onChangeMemberRole,
     this.onUpdateChannel,
   }) : super(
          ref: ref,
@@ -15182,6 +15244,15 @@ class _FakeChannelActions extends ChannelActions {
     String role = 'member',
   }) async {
     await onAddMembers?.call(channelId, pubkeys);
+  }
+
+  @override
+  Future<void> changeMemberRole({
+    required String channelId,
+    required String pubkey,
+    required String role,
+  }) async {
+    await onChangeMemberRole?.call(channelId, pubkey, role);
   }
 
   @override
