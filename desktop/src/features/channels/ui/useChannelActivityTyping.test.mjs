@@ -8,6 +8,7 @@ import {
   resetAgentWorkingSignal,
 } from "../../agents/agentWorkingSignal.ts";
 import { resetActiveAgentTurnsStore } from "../../agents/activeAgentTurnsStore.ts";
+import { buildChannelAgentSessionCandidates } from "./useChannelAgentSessions.ts";
 import {
   channelScopedBotTypingPubkeyKey,
   mergeMemberAgentFlagsIntoProfiles,
@@ -74,6 +75,27 @@ describe("thread-only bot typing regression", () => {
     const state = getAgentWorkingState(AGENT, "chan-1");
     assert.equal(state.working, true);
     assert.equal(state.source, "typing");
+  });
+});
+
+describe("promoted agent typing", () => {
+  it("keeps an explicitly promoted agent in activity classification", () => {
+    const [candidate] = buildChannelAgentSessionCandidates({
+      channelMembers: [
+        {
+          pubkey: AGENT,
+          role: "admin",
+          isAgent: true,
+          displayName: "Deploy Agent",
+        },
+      ],
+      managedAgents: [],
+      relayAgents: [],
+    });
+
+    assert.equal(candidate?.pubkey, AGENT);
+    assert.equal(candidate?.name, "Deploy Agent");
+    assert.equal(candidate?.agentSource, "member-bot");
   });
 });
 

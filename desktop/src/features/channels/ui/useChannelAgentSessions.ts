@@ -94,7 +94,8 @@ export function buildChannelAgentSessionCandidates({
 
   for (const member of channelMembers ?? []) {
     const key = normalizePubkey(member.pubkey);
-    if (member.role !== "bot" || byPubkey.has(key)) {
+    const hasMemberAgentIdentity = member.role === "bot" || member.isAgent;
+    if (!hasMemberAgentIdentity || byPubkey.has(key)) {
       continue;
     }
 
