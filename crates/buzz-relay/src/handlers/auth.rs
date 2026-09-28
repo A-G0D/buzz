@@ -409,6 +409,36 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
 
             // Stash NIP-OA owner on the auth context only after the shared
             // backfill confirms the first-write-wins relationship.
+            // B2: acquire a session effect permit after the last policy read
+            // and before the first persistent write — NIP-OA materialization
+            // (users + agent-owner rows) — and hold it through the auth commit.
+            //
+            // Gate ordering: acquire_effect() obtains the fair read lock, then
+            // checks cancel and deadline. A permit is returned only when the
+            // session is still active — expiry cannot transition to Expired
+            // while any permit is held (the permit IS the read lock). This
+            // replaces the old "acquire write_lock → check cancel" fence with
+            // a stronger bound: no AUTH commit can start after the gate's
+            // deadline passes or after the expiry task's cancel.cancel() fires,
+            // and any AUTH commit that starts under a permit will complete before
+            // the gate's quiescence barrier allows teardown to proceed.
+            //
+            // Off-mode: the gate has no deadline, but an externally cancelled
+            // AUTH still stops here, before materialization.
+            // [FI-TRACE-LEASE-BOUND, B2 seam: AUTH commit]
+            //
+            // Test hook: fires immediately before acquire_effect so a test can
+            // arm expiry after the policy reads and before the permit and
+            // materialization. This is the exact async gap W1 (auth barrier witness)
+            // exercises. No-op in production (cfg(test) only, Mutex<None> unless
+            // armed). [nip_fi_test_hooks::auth_commit_hook]
+            #[cfg(test)]
+            crate::nip_fi_test_hooks::before_auth_commit(conn.tenant.community()).await;
+            let _auth_permit = match conn.nip_fi_gate.acquire_effect().await {
+                Ok(permit) => permit,
+                Err(crate::nip_fi_gate::SessionExpired) => return,
+            };
+
             if let Some(owner) = nip_oa_owner {
                 if crate::api::relay_members::materialize_nip_oa_owner(
                     &state,
@@ -430,32 +460,6 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
             }
 
             info!(conn_id = %conn_id, pubkey = %pubkey.to_hex(), "NIP-42 auth successful");
-            // B2: acquire a session effect permit before committing auth state.
-            //
-            // Gate ordering: acquire_effect() obtains the fair read lock, then
-            // checks cancel and deadline. A permit is returned only when the
-            // session is still active — expiry cannot transition to Expired
-            // while any permit is held (the permit IS the read lock). This
-            // replaces the old "acquire write_lock → check cancel" fence with
-            // a stronger bound: no AUTH commit can start after the gate's
-            // deadline passes or after the expiry task's cancel.cancel() fires,
-            // and any AUTH commit that starts under a permit will complete before
-            // the gate's quiescence barrier allows teardown to proceed.
-            //
-            // Off-mode (no gate): no permit is needed; proceed unconditionally.
-            // [FI-TRACE-LEASE-BOUND, B2 seam: AUTH commit]
-            //
-            // Test hook: fires immediately before acquire_effect so a test can
-            // arm expiry between the NIP-42 verification success and the permit
-            // acquisition. This is the exact async gap W1 (auth barrier witness)
-            // exercises. No-op in production (cfg(test) only, Mutex<None> unless
-            // armed). [nip_fi_test_hooks::auth_commit_hook]
-            #[cfg(test)]
-            crate::nip_fi_test_hooks::before_auth_commit(conn.tenant.community()).await;
-            let _auth_permit = match conn.nip_fi_gate.acquire_effect().await {
-                Ok(permit) => permit,
-                Err(crate::nip_fi_gate::SessionExpired) => return,
-            };
             if !conn.authenticate(auth_ctx) {
                 return;
             }
@@ -1232,6 +1236,121 @@ mod tests {
                     );
                 }
             }
+        }
+
+        /// Permit-before-write witness: expiry armed after the policy reads
+        /// and before NIP-OA materialization leaves no `users` / agent-owner
+        /// row and no committed auth.
+        ///
+        /// Mutation oracle: move `acquire_effect()` back after
+        /// `materialize_nip_oa_owner` → the agent and owner rows are written
+        /// before the permit is refused → the row-count assertion goes RED.
+        #[tokio::test]
+        #[ignore = "requires Postgres — runs in postgres-ci nextest lane"]
+        async fn expiry_before_nip_oa_materialize_writes_no_rows_and_commits_no_auth() {
+            use buzz_auth::VerifiedAssertion;
+            use chrono::{Duration, Utc};
+            use std::collections::HashMap;
+            use std::sync::Arc;
+            use tokio::sync::mpsc;
+            use tokio_util::sync::CancellationToken;
+            use uuid::Uuid;
+
+            let pool = sqlx::PgPool::connect(&crate::test_support::database_url())
+                .await
+                .expect("PostgreSQL must be available");
+            let community_id = Uuid::new_v4();
+            sqlx::query("INSERT INTO communities (id, host) VALUES ($1, $2)")
+                .bind(community_id)
+                .bind(format!("materialize-{}.example", community_id.simple()))
+                .execute(&pool)
+                .await
+                .expect("insert community");
+            let community = buzz_core::tenant::CommunityId::from_uuid(community_id);
+
+            let agent = Keys::generate();
+            let owner = Keys::generate();
+            let auth_tag = buzz_sdk::nip_oa::compute_auth_tag(&owner, &agent.public_key(), "")
+                .expect("sign NIP-OA credential");
+            let auth_tag: Vec<String> = serde_json::from_str(&auth_tag).expect("tag JSON");
+
+            let deadline = Utc::now() + Duration::hours(1);
+            let assertion = VerifiedAssertion::for_test(Some(agent.public_key()), vec![deadline]);
+            let challenge = "materialize-barrier-challenge".to_string();
+            let (send_tx, mut send_rx) = mpsc::channel::<WsMessage>(8);
+            let (ctrl_tx, _ctrl_rx) = mpsc::channel::<WsMessage>(8);
+            let (terminal_ctrl_tx, _terminal_ctrl_rx) = mpsc::channel::<WsMessage>(1);
+            let cancel = CancellationToken::new();
+            let conn = Arc::new(crate::connection::ConnectionState {
+                conn_id: Uuid::new_v4(),
+                tenant: buzz_core::tenant::TenantContext::resolved(
+                    community,
+                    "test.local".to_string(),
+                ),
+                remote_addr: "127.0.0.1:1234".parse().unwrap(),
+                auth_state: std::sync::Mutex::new(AuthState::Pending {
+                    challenge: challenge.clone(),
+                    started_at: Instant::now(),
+                }),
+                subscriptions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+                send_tx,
+                ctrl_tx,
+                terminal_ctrl_tx,
+                cancel: cancel.clone(),
+                backpressure_count: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+                grace_limit: 3,
+                nip_fi_assertion: Some(assertion),
+                session_deadline: Some(deadline),
+                nip_fi_gate: crate::nip_fi_gate::SessionAdmissionGate::new(
+                    deadline,
+                    cancel.clone(),
+                ),
+            });
+
+            let state = auth_test_state_real_db_expect().await;
+            let auth_event = EventBuilder::new(Kind::Authentication, "")
+                .tag(Tag::parse(["relay", "ws://test.local"]).unwrap())
+                .tag(Tag::parse(["challenge", &challenge]).unwrap())
+                .tag(Tag::parse(auth_tag).unwrap())
+                .sign_with_keys(&agent)
+                .unwrap();
+
+            let (arrived_rx, release) = crate::nip_fi_test_hooks::auth_commit_hook::arm(community);
+            let handle = tokio::spawn(handle_auth(auth_event, Arc::clone(&conn), state));
+            tokio::time::timeout(std::time::Duration::from_secs(5), arrived_rx)
+                .await
+                .expect("handler must reach the pre-materialize hook within 5s")
+                .expect("arrived channel closed");
+            cancel.cancel();
+            release.notify_one();
+            tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+                .await
+                .expect("handle_auth must return within 5s")
+                .expect("handle_auth must not panic");
+
+            let rows: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM users WHERE community_id = $1 AND pubkey = ANY($2)",
+            )
+            .bind(community_id)
+            .bind(vec![
+                agent.public_key().to_bytes().to_vec(),
+                owner.public_key().to_bytes().to_vec(),
+            ])
+            .fetch_one(&pool)
+            .await
+            .expect("count users");
+            assert_eq!(
+                rows, 0,
+                "no users / agent-owner row may be written after expiry"
+            );
+            assert!(
+                !matches!(conn.auth_state_snapshot(), AuthState::Authenticated(_)),
+                "auth must not be committed after expiry"
+            );
+            assert!(
+                send_rx.try_recv().is_err(),
+                "no OK may be sent after expiry"
+            );
         }
 
         /// Fix 4a witness: root allowlist denial with FI assertion emits

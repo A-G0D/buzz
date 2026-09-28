@@ -718,15 +718,35 @@ pub(crate) async fn handle_active_audio_connection(
                 .await;
                 return;
             }
-            match crate::audio::join::resolve_join_owner_ready(
-                mesh.effective_directory(),
-                tenant.community(),
-                channel_id,
-                mesh.local_runtime_id,
-                &mesh.owners,
-            )
-            .await
-            {
+            // The resolve may CAS-acquire the huddle lease in Redis, a
+            // persistent write, so it runs under an effect permit like every
+            // other pre-commit write. [nip_fi_gate contract]
+            let resolved = {
+                let _lease_permit = match audio_gate.acquire_effect().await {
+                    Ok(permit) => permit,
+                    Err(crate::nip_fi_gate::SessionExpired) => {
+                        cancel.cancel();
+                        if let Some(t) = _nip_fi_admission_expiry.take() {
+                            let _ = t.await;
+                        }
+                        crate::connection::send_exit_frames_bounded(
+                            &mut ws_send,
+                            std::iter::from_fn(|| terminal_ctrl_rx.try_recv().ok()),
+                        )
+                        .await;
+                        return;
+                    }
+                };
+                crate::audio::join::resolve_join_owner_ready(
+                    mesh.effective_directory(),
+                    tenant.community(),
+                    channel_id,
+                    mesh.local_runtime_id,
+                    &mesh.owners,
+                )
+                .await
+            };
+            match resolved {
                 Ok(resolved) => {
                     if let Some(lease) = resolved.acquired {
                         let directory: std::sync::Arc<dyn crate::audio::join::HuddleDirectory> =

@@ -22,7 +22,7 @@
 //!
 //! | Witness | Hook location (production file:line) | One-line mutation | Failing assertion |
 //! |---------|--------------------------------------|-------------------|-------------------|
-//! | **W1** (auth barrier) | `handlers/auth.rs:319` — immediately before `acquire_effect()` in AUTH commit path | Delete `before_auth_commit(...)` call | `arrived_rx` times out → test panics |
+//! | **W1** (auth barrier) | `handlers/auth.rs` — immediately before `acquire_effect()`, ahead of NIP-OA materialization and the AUTH commit | Delete `before_auth_commit(...)` call | `arrived_rx` times out → test panics |
 //! | **W1** (auth barrier) | same | Remove `acquire_effect()` from auth.rs | `auth_state is NOT Authenticated` → assertion panics |
 //! | **W1** (auth barrier) | same | Change gate to `off_mode` | same as above |
 //! | **W2** (event barrier) | `handlers/event.rs:784` — immediately before `acquire_effect()` in event ingest path | Delete `before_event_ingest(...)` call | `arrived_rx` times out → test panics |
