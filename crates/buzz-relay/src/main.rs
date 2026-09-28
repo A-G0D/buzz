@@ -1348,12 +1348,15 @@ fn jwks_next_retry_after_failed_refresh(
 
 /// Supervisor for [`nip_fi_jwks_refresh_loop`]: restarts the loop with
 /// exponential backoff (1 s → 60 s) if it panics, so a single bad refresh
-/// cannot permanently disable JWKS recovery. Each restart re-seeds the loop
-/// from `issuers`. Clean cancellation terminates both the loop and this
-/// supervisor.
+/// cannot permanently disable JWKS recovery. The first run is seeded from
+/// the startup warm results; every restart seeds all issuers cold, because
+/// the warm state captured at startup may be stale and a cold issuer's 5 s
+/// fast retry is the safe choice (a still-warm issuer costs one extra fetch
+/// before returning to its interval). Clean cancellation terminates both the
+/// loop and this supervisor.
 async fn run_jwks_refresh_supervisor<F, Fut>(
     // `(issuer_id, interval_seconds, warmed_at_startup)`, one per issuer.
-    issuers: Vec<(String, u64, bool)>,
+    mut issuers: Vec<(String, u64, bool)>,
     fetch: F,
     cancel: CancellationToken,
 ) where
@@ -1381,6 +1384,9 @@ async fn run_jwks_refresh_supervisor<F, Fut>(
                     _ = tokio::time::sleep(std::time::Duration::from_secs(restart_backoff_secs)) => {}
                 }
                 restart_backoff_secs = (restart_backoff_secs * 2).min(60);
+                for (_, _, warmed) in &mut issuers {
+                    *warmed = false;
+                }
             }
         }
     }
@@ -2717,6 +2723,9 @@ mod tests {
     //    attempts is 300 s → `elapsed_secs <= 10` fails.
     // 3. Stub the fetch to always fail: the cache never warms → `key_set`
     //    stays `None`.
+    // 4. Restart from the startup tuples (drop the cold re-seed): the first
+    //    post-restart fetch waits the warm 300 s interval → `restart_gap_secs`
+    //    assertion fails.
     #[tokio::test(start_paused = true)]
     async fn f1_supervisor_loop_drives_recovery_and_restores_admission() {
         use buzz_auth::{
@@ -2751,6 +2760,8 @@ mod tests {
         // That first refresh panics (a worker bug), which only the supervisor
         // survives.
         let panicked = Arc::new(AtomicBool::new(false));
+        let panicked_at = Arc::new(std::sync::Mutex::new(None::<tokio::time::Instant>));
+        let panicked_at_fetch = Arc::clone(&panicked_at);
         let cancel = CancellationToken::new();
         let fetch_source = Arc::clone(&source);
         let supervisor_task = tokio::spawn(run_jwks_refresh_supervisor(
@@ -2759,8 +2770,10 @@ mod tests {
                 let src = Arc::clone(&fetch_source);
                 let iss = issuer.to_owned();
                 let panicked = Arc::clone(&panicked);
+                let panicked_at = Arc::clone(&panicked_at_fetch);
                 async move {
                     if !panicked.swap(true, Ordering::SeqCst) {
+                        *panicked_at.lock().unwrap() = Some(tokio::time::Instant::now());
                         panic!("F1: injected refresh-worker panic");
                     }
                     src.get_snapshot(&iss).await.is_some()
@@ -2777,6 +2790,15 @@ mod tests {
                  without the supervisor's restart never refreshes again",
             );
         let clock_after_attempt1 = tokio::time::Instant::now();
+        // The issuer was warm at startup but has no snapshot when the worker
+        // panics, so the restart must use the cold cadence: restart backoff
+        // (1 s) + 5 s, not the startup-warm 300 s interval.
+        let restart_gap_secs =
+            (clock_after_attempt1 - panicked_at.lock().unwrap().expect("panic recorded")).as_secs();
+        assert!(
+            restart_gap_secs <= 1 + 5,
+            "F1: first post-restart fetch must follow the cold cadence; gap={restart_gap_secs}s"
+        );
         assert!(
             IssuerKeySource::key_set(source.as_ref(), ISSUER).is_none(),
             "F1: key_set must still be None after the failed tick"
