@@ -11308,6 +11308,57 @@ mod postgres_tests {
         assert_no_effects(&pool, community, &applied, "malformed host").await;
     }
 
+    /// A permanent direct ban over an active or expired timed ban clears the
+    /// old expiry, is in effect for admission, and leaves the timeout alone.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn direct_ban_clears_prior_ban_expiry() {
+        for prior in ["1 day", "-1 day"] {
+            let (pool, community, host, state) = direct_fixture().await;
+            let target = [0x7cu8; 32];
+            seed_restriction(&pool, community, &target).await;
+            sqlx::query(
+                "UPDATE community_bans SET ban_expires_at = now() + $2::interval \
+                 WHERE community_id = $1",
+            )
+            .bind(community.as_uuid())
+            .bind(prior)
+            .execute(&pool)
+            .await
+            .unwrap();
+            let mute: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
+                "SELECT muted_until FROM community_bans WHERE community_id = $1",
+            )
+            .bind(community.as_uuid())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+            let path = format!("/members/{}/ban?communityHost={host}", hex::encode(target));
+            let body = serde_json::json!({ "requestId": Uuid::new_v4() });
+            let (status, resp) = direct_post(&state, &path, body).await;
+            assert_eq!(status, StatusCode::OK, "{prior}: {resp}");
+
+            let (expiry, after): (
+                Option<chrono::DateTime<chrono::Utc>>,
+                Option<chrono::DateTime<chrono::Utc>>,
+            ) = sqlx::query_as(
+                "SELECT ban_expires_at, muted_until FROM community_bans WHERE community_id = $1",
+            )
+            .bind(community.as_uuid())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!((expiry, after), (None, mute), "{prior}");
+            let restriction = state
+                .db
+                .moderation_restriction_state(community, &target)
+                .await
+                .unwrap();
+            assert!(restriction.banned, "{prior}: ban must be in effect");
+        }
+    }
+
     /// D2: config staff (the actor itself) and DB staff are refused for ban and
     /// timeout with no rows written; owner-fallback staff likewise.
     #[tokio::test]

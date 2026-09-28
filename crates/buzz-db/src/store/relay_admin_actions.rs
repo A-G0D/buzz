@@ -496,7 +496,8 @@ pub async fn execute_ban_with_marker(
         INSERT INTO community_bans (community_id, pubkey, banned, actor_pubkey, ban_reason)
         VALUES ($1, $2, TRUE, $3, $4)
         ON CONFLICT (community_id, pubkey)
-        DO UPDATE SET banned = TRUE, actor_pubkey = EXCLUDED.actor_pubkey,
+        DO UPDATE SET banned = TRUE, ban_expires_at = NULL,
+                      actor_pubkey = EXCLUDED.actor_pubkey,
                       ban_reason = EXCLUDED.ban_reason, updated_at = now()
         "#,
     )
