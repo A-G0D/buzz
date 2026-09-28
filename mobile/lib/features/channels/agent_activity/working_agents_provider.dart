@@ -10,7 +10,7 @@ import '../channel_typing_provider.dart';
 ///
 /// Used by both the members button badge and the members sheet to avoid
 /// duplicating the agent-typing cross-reference logic.
-final workingBotPubkeysProvider = Provider.autoDispose
+final workingAgentPubkeysProvider = Provider.autoDispose
     .family<Set<String>, String>((ref, channelId) {
       final typingEntries = ref.watch(channelTypingProvider(channelId));
       final membersAsync = ref.watch(channelMembersProvider(channelId));

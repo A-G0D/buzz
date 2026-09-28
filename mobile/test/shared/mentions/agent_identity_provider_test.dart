@@ -2,7 +2,7 @@ import 'dart:async';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
-import 'package:buzz/features/channels/agent_activity/working_bots_provider.dart';
+import 'package:buzz/features/channels/agent_activity/working_agents_provider.dart';
 import 'package:buzz/features/channels/channel_management_provider.dart';
 import 'package:buzz/features/channels/channel_typing_provider.dart';
 import 'package:buzz/shared/mentions/agent_identity_provider.dart';
@@ -200,7 +200,7 @@ void main() {
       );
       addTearDown(container.dispose);
       final keepAlive = container.listen(
-        workingBotPubkeysProvider(_channelId),
+        workingAgentPubkeysProvider(_channelId),
         (_, _) {},
         fireImmediately: true,
       );
@@ -234,7 +234,7 @@ void main() {
       await container.read(channelMembersProvider(_channelId).future),
       hasLength(1),
     );
-    expect(container.read(workingBotPubkeysProvider(_channelId)), {
+    expect(container.read(workingAgentPubkeysProvider(_channelId)), {
       _agentPubkey,
     });
   });
@@ -270,7 +270,7 @@ void main() {
         await container.read(channelMembersProvider(_channelId).future),
         hasLength(1),
       );
-      expect(container.read(workingBotPubkeysProvider(_channelId)), isEmpty);
+      expect(container.read(workingAgentPubkeysProvider(_channelId)), isEmpty);
     },
   );
 

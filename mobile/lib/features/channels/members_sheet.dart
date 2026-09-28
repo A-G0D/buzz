@@ -13,7 +13,7 @@ import '../../shared/profile/user_profile.dart';
 import '../profile/user_status.dart';
 import '../profile/user_status_cache_provider.dart';
 import 'agent_activity/agent_activity_sheet.dart';
-import 'agent_activity/working_bots_provider.dart';
+import 'agent_activity/working_agents_provider.dart';
 import 'channel.dart';
 import 'channel_management_provider.dart';
 
@@ -47,7 +47,9 @@ class MembersSheet extends HookConsumerWidget {
         agentPubkeys.contains(member.pubkey.toLowerCase());
     final people = allMembers.where((member) => !isAgent(member)).toList();
     final agents = allMembers.where(isAgent).toList();
-    final typingBotPubkeys = ref.watch(workingBotPubkeysProvider(channel.id));
+    final workingAgentPubkeys = ref.watch(
+      workingAgentPubkeysProvider(channel.id),
+    );
     final statusCache = ref.watch(userStatusCacheProvider);
     final bottomClearance = Grid.md + MediaQuery.viewPaddingOf(context).bottom;
 
@@ -138,12 +140,12 @@ class MembersSheet extends HookConsumerWidget {
                         agent.pubkey.toLowerCase() ==
                         currentPubkey?.toLowerCase(),
                     channelId: channel.id,
-                    isWorking: typingBotPubkeys.contains(
+                    isWorking: workingAgentPubkeys.contains(
                       agent.pubkey.toLowerCase(),
                     ),
                     onViewActivity: () => openActivity(agent),
                     onActivityTap:
-                        typingBotPubkeys.contains(agent.pubkey.toLowerCase())
+                        workingAgentPubkeys.contains(agent.pubkey.toLowerCase())
                         ? () => openActivity(agent)
                         : null,
                   ),

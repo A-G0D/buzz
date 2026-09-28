@@ -151,8 +151,8 @@ class _MembersButton extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final hasWorkingBot = ref
-        .watch(workingBotPubkeysProvider(channelId))
+    final hasWorkingAgent = ref
+        .watch(workingAgentPubkeysProvider(channelId))
         .isNotEmpty;
 
     return IconButton(
@@ -172,7 +172,7 @@ class _MembersButton extends ConsumerWidget {
         clipBehavior: Clip.none,
         children: [
           const Icon(LucideIcons.users, size: 22),
-          if (hasWorkingBot)
+          if (hasWorkingAgent)
             Positioned(
               top: -2,
               right: -2,
