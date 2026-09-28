@@ -330,12 +330,14 @@ export function ChannelScreen({
       ...new Set([
         ...messageEventProfilePubkeys,
         ...activeDmParticipantPubkeys,
+        ...(channelMembers ?? []).map((member) => member.pubkey),
         ...knownAgentPubkeys,
         ...typingEntries.map((entry) => entry.pubkey),
       ]),
     ],
     [
       activeDmParticipantPubkeys,
+      channelMembers,
       knownAgentPubkeys,
       messageEventProfilePubkeys,
       typingEntries,
@@ -594,7 +596,9 @@ export function ChannelScreen({
     agentsLoaded:
       !channelMembersQuery.isLoading &&
       !managedAgentsQuery.isLoading &&
-      !relayAgentsQuery.isLoading,
+      !relayAgentsQuery.isLoading &&
+      !messageProfilesQuery.isLoading &&
+      !messageProfilesQuery.isPlaceholderData,
     channelMembers,
     handleOpenThread,
     managedAgents: agentSessionCandidates,
