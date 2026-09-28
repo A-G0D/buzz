@@ -14,14 +14,25 @@ use axum::{
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use std::path::Path;
-use std::{sync::Arc, time::Duration};
+use std::{
+    io::Read,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 
-/// Launcher-supplied JSON capability for a fixed loopback credential broker.
+/// Nonsecret startup marker. Set to `stdin-v1` and send a four-byte big-endian
+/// length followed by the JSON [`BrokerConfig`] before ACP input. Never put the
+/// capability in the environment or arguments.
+///
+/// The trusted launcher must isolate the agent from tool process inspection.
+/// On macOS this requires inherited kernel denials for other-process `process-info*` and
+/// `mach-priv-task-port` and `kern.procargs*` sysctl reads, including processes
+/// in the same sandbox. The startup channel does not replace OS isolation.
 pub const BROKER_ENV: &str = "BUZZ_SANDBOX_AUTH_BROKER";
 /// Path to the immutable certificate snapshot supplied by the launcher.
 pub const ROOTS_ENV: &str = "BUZZ_SANDBOX_TLS_ROOTS";
 
-/// Connection capability passed only to the protected agent, never its tools.
+/// Connection capability delivered privately before any tools are started.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct BrokerConfig {
     /// Loopback TCP port selected by the trusted launcher.
@@ -45,6 +56,55 @@ struct BrokerState {
     source: Arc<dyn TokenSource>,
 }
 
+static BROKER: OnceLock<BrokerConfig> = OnceLock::new();
+const MAX_BOOTSTRAP_BYTES: usize = 16 * 1024;
+
+pub(crate) fn initialize() -> Result<(), AgentError> {
+    let Some(marker) = std::env::var_os(BROKER_ENV) else {
+        return Ok(());
+    };
+    if marker != "stdin-v1" {
+        return Err(AgentError::Llm(
+            "broker capability must be delivered through stdin-v1".into(),
+        ));
+    }
+    // Unlike clearing environ, this denies same-UID reads of the initial
+    // environment, memory, and descriptors through procfs/ptrace on Linux.
+    #[cfg(target_os = "linux")]
+    nix::sys::prctl::set_dumpable(false)
+        .map_err(|_| AgentError::Llm("cannot protect broker process from inspection".into()))?;
+    if !cfg!(any(target_os = "linux", target_os = "macos")) {
+        return Err(AgentError::Llm(
+            "credential broker unsupported on this platform".into(),
+        ));
+    }
+    let broker = read_bootstrap(&mut std::io::stdin().lock())?;
+    BROKER
+        .set(broker)
+        .map_err(|_| AgentError::Llm("broker already initialized".into()))
+}
+
+fn read_bootstrap(reader: &mut impl Read) -> Result<BrokerConfig, AgentError> {
+    let invalid = |_| AgentError::Llm("invalid broker startup frame".into());
+    let mut header = [0; 4];
+    reader.read_exact(&mut header).map_err(invalid)?;
+    let size = u32::from_be_bytes(header) as usize;
+    if size == 0 || size > MAX_BOOTSTRAP_BYTES {
+        return Err(AgentError::Llm("invalid broker startup frame size".into()));
+    }
+    let mut bytes = vec![0; size];
+    reader.read_exact(&mut bytes).map_err(invalid)?;
+    serde_json::from_slice(&bytes)
+        .map_err(|_| AgentError::Llm("invalid broker startup configuration".into()))
+}
+
+pub(crate) fn configured() -> Result<bool, AgentError> {
+    if BROKER.get().is_none() && std::env::var_os(BROKER_ENV).is_some() {
+        return Err(AgentError::Llm("broker startup was not initialized".into()));
+    }
+    Ok(BROKER.get().is_some())
+}
+
 /// Native trust is captured before confinement. Verification remains enabled,
 /// using rustls locally instead of macOS trustd (which can bypass network policy).
 pub fn http_builder() -> Result<reqwest::ClientBuilder, AgentError> {
@@ -60,7 +120,10 @@ fn builder_with_roots(
 }
 
 pub(crate) fn token_source(cfg: &Config) -> Result<Option<Arc<dyn TokenSource>>, AgentError> {
-    let Some(raw) = std::env::var_os(BROKER_ENV) else {
+    let Some(broker) = BROKER.get() else {
+        if std::env::var_os(BROKER_ENV).is_some() {
+            return Err(AgentError::Llm("broker startup was not initialized".into()));
+        }
         return Ok(None);
     };
     if !matches!(cfg.provider, Provider::Databricks | Provider::DatabricksV2)
@@ -68,8 +131,6 @@ pub(crate) fn token_source(cfg: &Config) -> Result<Option<Arc<dyn TokenSource>>,
     {
         return Ok(None);
     }
-    let broker: BrokerConfig = serde_json::from_str(&raw.to_string_lossy())
-        .map_err(|_| AgentError::Llm("invalid sandbox auth broker".into()))?;
     if broker.host != cfg.base_url || broker.port == 0 || broker.secret.len() < 32 {
         return Err(AgentError::Llm(
             "sandbox auth broker provider mismatch".into(),
@@ -80,7 +141,10 @@ pub(crate) fn token_source(cfg: &Config) -> Result<Option<Arc<dyn TokenSource>>,
         .timeout(Duration::from_secs(60))
         .build()
         .map_err(|_| AgentError::Llm("sandbox auth client unavailable".into()))?;
-    Ok(Some(Arc::new(BrokerClient { broker, client })))
+    Ok(Some(Arc::new(BrokerClient {
+        broker: broker.clone(),
+        client,
+    })))
 }
 struct BrokerClient {
     broker: BrokerConfig,
@@ -176,6 +240,39 @@ async fn token(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn bootstrap_preserves_following_acp_input() {
+        let config = BrokerConfig {
+            port: 1234,
+            secret: "synthetic-capability".into(),
+            host: "https://model.example".into(),
+        };
+        let bytes = serde_json::to_vec(&config).unwrap();
+        let mut frame = (bytes.len() as u32).to_be_bytes().to_vec();
+        frame.extend(bytes);
+        frame.extend(b"{\"jsonrpc\":\"2.0\"}\n");
+        let mut reader = std::io::Cursor::new(frame);
+        assert_eq!(read_bootstrap(&mut reader).unwrap().secret, config.secret);
+        let mut acp = String::new();
+        reader.read_to_string(&mut acp).unwrap();
+        assert_eq!(acp, "{\"jsonrpc\":\"2.0\"}\n");
+    }
+
+    #[test]
+    fn bootstrap_rejects_invalid_frames_without_echoing_their_contents() {
+        for frame in [
+            vec![],
+            vec![0, 0],
+            0u32.to_be_bytes().to_vec(),
+            ((MAX_BOOTSTRAP_BYTES + 1) as u32).to_be_bytes().to_vec(),
+            [8u32.to_be_bytes().as_slice(), b"private"].concat(),
+            [7u32.to_be_bytes().as_slice(), b"private"].concat(),
+        ] {
+            let error = read_bootstrap(&mut frame.as_slice()).err().unwrap();
+            assert!(!error.to_string().contains("private"));
+        }
+    }
+
     #[tokio::test]
     async fn broker_rejects_unauthorized_callers_and_serves_fixed_source() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
