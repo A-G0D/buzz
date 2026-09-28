@@ -2160,6 +2160,44 @@ async fn author_type_label(
     }
 }
 
+/// Reject writes from a pubkey that is banned or currently timed out in the
+/// community. Fails closed when the restriction lookup errors.
+async fn enforce_write_restrictions(
+    state: &Arc<AppState>,
+    tenant: &TenantContext,
+    pubkey: &nostr::PublicKey,
+) -> Result<(), IngestError> {
+    match state
+        .db
+        .moderation_restriction_state(tenant.community(), pubkey.as_bytes())
+        .await
+    {
+        Ok(r) => {
+            if r.banned {
+                return Err(IngestError::AuthFailed(
+                    "blocked: you are banned from this community".to_string(),
+                ));
+            }
+            if let Some(until) = r.muted_until {
+                if until > chrono::Utc::now() {
+                    return Err(IngestError::AuthFailed(format!(
+                        "restricted: you are timed out until {}",
+                        until.timestamp()
+                    )));
+                }
+            }
+        }
+        Err(e) => {
+            // Fail closed: a DB error must not let a banned/timed-out actor
+            // write.
+            return Err(IngestError::Internal(format!(
+                "error: internal error checking restriction state: {e}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Ingest a signed Nostr event through the full validation pipeline.
 ///
 /// Shared by WebSocket and HTTP transports. The caller constructs [`IngestAuth`]
@@ -2384,27 +2422,11 @@ async fn ingest_event_inner(
     }
 
     if kind_u32 == KIND_AGENT_OBSERVER_FRAME {
-        // Observer frames return before the write-path ban gate below, and
-        // NIP-98 auth never consults bans. Re-check the authoring pubkey here so
-        // a banned owner cannot keep sending control frames over HTTP.
-        match state
-            .db
-            .moderation_restriction_state(tenant.community(), auth.pubkey().as_bytes())
-            .await
-        {
-            Ok(r) if r.banned => {
-                return Err(IngestError::AuthFailed(
-                    "blocked: you are banned from this community".to_string(),
-                ));
-            }
-            Ok(_) => {}
-            Err(e) => {
-                // Fail closed: a DB error must not let a banned actor through.
-                return Err(IngestError::Internal(format!(
-                    "error: internal error checking restriction state: {e}"
-                )));
-            }
-        }
+        // Observer frames return before the write-path restriction gate below,
+        // and NIP-98 auth never consults bans. Apply the same ban/timeout gate
+        // here so a restricted owner cannot keep sending control frames over
+        // HTTP.
+        enforce_write_restrictions(state, tenant, auth.pubkey()).await?;
         super::event::ingest_agent_observer_event(state, tenant, &event, None).await?;
         emit(
             tracer,
@@ -2505,34 +2527,7 @@ async fn ingest_event_inner(
     // the restriction-state cache (see should-fix), which can fold in owner
     // resolution without a per-write DB round-trip.
     if !buzz_core::kind::is_moderation_command_kind(kind_u32) && !is_relay_admin_kind(kind_u32) {
-        match state
-            .db
-            .moderation_restriction_state(tenant.community(), auth.pubkey().as_bytes())
-            .await
-        {
-            Ok(r) => {
-                if r.banned {
-                    return Err(IngestError::AuthFailed(
-                        "blocked: you are banned from this community".to_string(),
-                    ));
-                }
-                if let Some(until) = r.muted_until {
-                    if until > chrono::Utc::now() {
-                        return Err(IngestError::AuthFailed(format!(
-                            "restricted: you are timed out until {}",
-                            until.timestamp()
-                        )));
-                    }
-                }
-            }
-            Err(e) => {
-                // Fail closed: a DB error must not let a banned/timed-out actor
-                // write.
-                return Err(IngestError::Internal(format!(
-                    "error: internal error checking restriction state: {e}"
-                )));
-            }
-        }
+        enforce_write_restrictions(state, tenant, auth.pubkey()).await?;
     }
 
     let mut channel_id = if kind_u32 == KIND_REACTION {
@@ -3684,32 +3679,37 @@ mod postgres_tests {
         ));
     }
 
-    #[tokio::test]
-    #[ignore = "requires Postgres and Redis"]
-    async fn http_observer_frame_rejects_banned_owner_control_frame() {
-        let (state, tenant, agent, owner) = observer_ingest_fixture().await;
+    fn owner_control_event(agent: &Keys, owner: &Keys) -> nostr::Event {
         let encrypted = buzz_core::observer::encrypt_observer_payload(
-            &owner,
+            owner,
             &agent.public_key(),
             &serde_json::json!({"kind": "cancel"}),
         )
         .expect("encrypt control payload");
-        let control = || {
-            buzz_sdk::build_agent_observer_frame(
-                &agent.public_key().to_hex(),
-                &agent.public_key().to_hex(),
-                buzz_core::observer::OBSERVER_FRAME_CONTROL,
-                &encrypted,
-            )
-            .expect("build control frame")
-            .sign_with_keys(&owner)
-            .expect("sign control frame")
-        };
+        buzz_sdk::build_agent_observer_frame(
+            &agent.public_key().to_hex(),
+            &agent.public_key().to_hex(),
+            buzz_core::observer::OBSERVER_FRAME_CONTROL,
+            &encrypted,
+        )
+        .expect("build control frame")
+        .sign_with_keys(owner)
+        .expect("sign control frame")
+    }
 
+    #[tokio::test]
+    #[ignore = "requires Postgres and Redis"]
+    async fn http_observer_frame_rejects_banned_owner_control_frame() {
+        let (state, tenant, agent, owner) = observer_ingest_fixture().await;
         assert!(
-            ingest_observer_test_event(&state, &tenant, &owner, control())
-                .await
-                .is_ok(),
+            ingest_observer_test_event(
+                &state,
+                &tenant,
+                &owner,
+                owner_control_event(&agent, &owner)
+            )
+            .await
+            .is_ok(),
             "unbanned owner control frame should be accepted"
         );
 
@@ -3725,8 +3725,29 @@ mod postgres_tests {
             .await
             .expect("ban owner");
         assert!(matches!(
-            ingest_observer_test_event(&state, &tenant, &owner, control()).await,
+            ingest_observer_test_event(&state, &tenant, &owner, owner_control_event(&agent, &owner)).await,
             Err(IngestError::AuthFailed(message)) if message.contains("banned")
+        ));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres and Redis"]
+    async fn http_observer_frame_rejects_timed_out_owner_control_frame() {
+        let (state, tenant, agent, owner) = observer_ingest_fixture().await;
+        state
+            .db
+            .timeout_community_member(
+                tenant.community(),
+                &owner.public_key().to_bytes(),
+                &Keys::generate().public_key().to_bytes(),
+                chrono::Utc::now() + chrono::Duration::minutes(10),
+                None,
+            )
+            .await
+            .expect("time out owner");
+        assert!(matches!(
+            ingest_observer_test_event(&state, &tenant, &owner, owner_control_event(&agent, &owner)).await,
+            Err(IngestError::AuthFailed(message)) if message.contains("timed out")
         ));
     }
 
