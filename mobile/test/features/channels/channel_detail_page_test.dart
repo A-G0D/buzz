@@ -510,7 +510,7 @@ void main() {
               };
               final keys = [
                 first,
-                second.toUpperCase(),
+                second,
                 sibling,
                 if (bystander != null) 'd' * 64,
               ];
