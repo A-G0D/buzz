@@ -7820,6 +7820,7 @@ mod postgres_tests {
         ) {
             let (send_tx, send_rx) = tokio::sync::mpsc::channel(64);
             let (ctrl_tx, _ctrl_rx) = tokio::sync::mpsc::channel(4);
+            let cancel = tokio_util::sync::CancellationToken::new();
             let conn = Arc::new(crate::connection::ConnectionState {
                 conn_id: uuid::Uuid::new_v4(),
                 tenant: TenantContext::resolved(self.community, self.host.clone()),
@@ -7835,10 +7836,15 @@ mod postgres_tests {
                 )),
                 subscriptions: Arc::new(tokio::sync::Mutex::new(Default::default())),
                 send_tx,
+                terminal_ctrl_tx: ctrl_tx.clone(),
                 ctrl_tx,
-                cancel: tokio_util::sync::CancellationToken::new(),
+                cancel: cancel.clone(),
                 backpressure_count: Arc::new(std::sync::atomic::AtomicU8::new(0)),
                 grace_limit: 3,
+                nip_fi_assertion: None,
+                session_deadline: None,
+                nip_fi_gate: crate::nip_fi_gate::SessionAdmissionGate::off_mode(cancel.clone()),
+                community_control: crate::state::CommunityConnectionControl::new(cancel),
             });
             (conn, send_rx)
         }
