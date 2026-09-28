@@ -155,9 +155,9 @@ run_unit_tests() {
   run_test_step "buzz-acp unit tests" \
     cargo test -p buzz-acp --lib -- --nocapture
 
-  # Mirror the three infra-free relay handler modules in `just test-unit`'s
-  # nextest expression. Keep the side-effects filter pinned to `::tests::` so
-  # it does not select the sibling Postgres-backed test module.
+  # Mirror the relay filters from `just test-unit`: the three handler modules,
+  # storage-snapshot helpers, readiness and router unit suites, and the single
+  # scoped admission regression in state::tests.
   run_test_step "buzz-relay channel authorization tests" \
     cargo test -p buzz-relay --lib handlers::channel_authz:: -- --nocapture
 
@@ -190,6 +190,12 @@ run_unit_tests() {
   # each exact name. Keep this list in step with that stanza's `test(=...)`s.
   run_test_step "buzz-relay NIP-FI config tests" \
     cargo test -p buzz-relay --lib nip_fi_config:: -- --nocapture
+
+  run_test_step "buzz-relay readiness tests" \
+    cargo test -p buzz-relay --lib readiness::tests:: -- --nocapture
+
+  run_test_step "buzz-relay admission regression test" \
+    cargo test -p buzz-relay --lib state::tests::neither_a_confirmed_inactive_community_nor_a_failed_lookup_admits_the_socket -- --nocapture
 
   run_test_step "buzz-relay router tests" \
     cargo test -p buzz-relay --lib router::tests:: -- --nocapture
