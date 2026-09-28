@@ -1140,7 +1140,7 @@ mod postgres_tests {
         let CreateCommunityWithOwnerResult::Created(created) = created else {
             panic!("expected created community")
         };
-        let request_id = Uuid::new_v4();
+        let mut request_id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO community_deletion_requests \
              (id, community_id, community_host, requested_by, request_origin, owner_pubkey, \
@@ -1169,9 +1169,12 @@ mod postgres_tests {
             "membership and request deduplicate"
         );
 
-        sqlx::query("UPDATE community_deletion_requests SET stage = 'aborted' WHERE id = $1")
-            .bind(request_id)
-            .execute(&db.pool)
+        db.deletion_store()
+            .abort(
+                request_id,
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "quota reservation test abort",
+            )
             .await
             .expect("abort quota fixture");
         let aborted = db
@@ -1183,11 +1186,21 @@ mod postgres_tests {
             aborted.quota_used, 1,
             "abort must fall back to the preserved membership"
         );
-        sqlx::query("UPDATE community_deletion_requests SET stage = 'submitted' WHERE id = $1")
-            .bind(request_id)
-            .execute(&db.pool)
-            .await
-            .expect("restore pending quota fixture");
+        request_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO community_deletion_requests \
+             (id, community_id, community_host, requested_by, request_origin, owner_pubkey, \
+              mediating_operator_pubkey, acknowledgement_version) \
+             VALUES ($1, $2, $3, $4, 'owner', $4, $5, 1)",
+        )
+        .bind(request_id)
+        .bind(created.id.as_uuid())
+        .bind(&host)
+        .bind(&owner)
+        .bind("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        .execute(&db.pool)
+        .await
+        .expect("insert replacement pending quota fixture");
 
         sqlx::query("DELETE FROM relay_members WHERE community_id = $1")
             .bind(created.id.as_uuid())
