@@ -187,6 +187,25 @@ type MockBridgeOptions = {
   }>;
   builderlabQuota?: { used: number; limit: number; canCreate: boolean };
   builderlabDeletionError?: { code: string; message?: string };
+  builderlabDeletionErrorSequence?: Array<{
+    code: string;
+    message?: string;
+  } | null>;
+  builderlabAuthSequence?: Array<{
+    email?: string;
+    name?: string;
+    expiresAt: string;
+    canDeleteBuzzCommunities?: boolean;
+  } | null>;
+  builderlabCommunitiesSequence?: Array<
+    Array<{
+      id?: string;
+      name?: string;
+      slug?: string;
+      normalized_host?: string;
+      archived_at?: string | null;
+    }>
+  >;
   acpRuntimesCatalog?: Record<string, unknown>[];
   /** Catalog returned after a successful mocked install. */
   acpRuntimesCatalogAfterInstall?: Record<string, unknown>[];

@@ -26,6 +26,23 @@ export type PendingCommunityDeletion = CommunityDeletionRequest & {
   backend_origin: string;
 };
 
+export type CommunityDeletionAttempt = "initial" | "receipt" | "resubmit";
+
+type CommunityDeletionResponseLike = {
+  request_id?: string;
+  community_id?: string;
+  host?: string;
+  acknowledgement_version?: number;
+  status?: string;
+  error?: { code?: string };
+};
+
+export type CommunityDeletionDisposition =
+  | "accept"
+  | "abort"
+  | "clear"
+  | "retain";
+
 type StorageLike = Pick<Storage, "getItem" | "setItem" | "removeItem">;
 
 function isPendingCommunityDeletion(
@@ -123,4 +140,38 @@ export function publicDeletionRequest(
     request_id: envelope.request_id,
     acknowledgement_version: envelope.acknowledgement_version,
   };
+}
+
+function responseMatchesDeletionTuple(
+  response: CommunityDeletionResponseLike,
+  envelope: PendingCommunityDeletion,
+): boolean {
+  return (
+    response.request_id === envelope.request_id &&
+    response.community_id === envelope.community_id &&
+    response.host === envelope.host &&
+    response.acknowledgement_version === envelope.acknowledgement_version
+  );
+}
+
+/**
+ * Decide whether one server result can terminate a persisted deletion intent.
+ * Once dispatch is ambiguous, ordinary receipt/resubmit errors retain the same
+ * UUID; only a tuple-bound acceptance or abort is terminal.
+ */
+export function deletionResponseDisposition(
+  response: CommunityDeletionResponseLike,
+  envelope: PendingCommunityDeletion,
+  attempt: CommunityDeletionAttempt,
+): CommunityDeletionDisposition {
+  const tupleMatches = responseMatchesDeletionTuple(response, envelope);
+  if (response.error?.code === "deletion_aborted") {
+    return tupleMatches ? "abort" : "retain";
+  }
+  if (response.error) {
+    return attempt === "initial" && response.error.code !== "acceptance_unknown"
+      ? "clear"
+      : "retain";
+  }
+  return response.status === "accepted" && tupleMatches ? "accept" : "retain";
 }

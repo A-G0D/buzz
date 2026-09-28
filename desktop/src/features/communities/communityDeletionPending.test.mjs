@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   clearPendingCommunityDeletion,
+  deletionResponseDisposition,
   loadPendingCommunityDeletion,
   persistPendingCommunityDeletion,
   pendingCommunityDeletionMatchesAccount,
@@ -81,4 +82,62 @@ test("persistence failure is observable and clear is bounded to the deletion key
   assert.equal(persistPendingCommunityDeletion(envelope, target), true);
   clearPendingCommunityDeletion(target);
   assert.equal(target.getItem("unrelated"), "keep");
+});
+
+test("ambiguous receipt and same-UUID resubmit misses retain the envelope", () => {
+  for (const attempt of ["receipt", "resubmit"]) {
+    assert.equal(
+      deletionResponseDisposition(
+        { error: { code: "not_owner" } },
+        envelope,
+        attempt,
+      ),
+      "retain",
+    );
+  }
+  assert.equal(
+    deletionResponseDisposition(
+      { error: { code: "acceptance_unknown" } },
+      envelope,
+      "initial",
+    ),
+    "retain",
+  );
+});
+
+test("only tuple-bound acceptance or abort terminates ambiguous recovery", () => {
+  const tuple = {
+    request_id: envelope.request_id,
+    community_id: envelope.community_id,
+    host: envelope.host,
+    acknowledgement_version: envelope.acknowledgement_version,
+  };
+  assert.equal(
+    deletionResponseDisposition(
+      { ...tuple, status: "accepted" },
+      envelope,
+      "receipt",
+    ),
+    "accept",
+  );
+  assert.equal(
+    deletionResponseDisposition(
+      { ...tuple, error: { code: "deletion_aborted" } },
+      envelope,
+      "receipt",
+    ),
+    "abort",
+  );
+  assert.equal(
+    deletionResponseDisposition(
+      {
+        ...tuple,
+        request_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        error: { code: "deletion_aborted" },
+      },
+      envelope,
+      "receipt",
+    ),
+    "retain",
+  );
 });

@@ -9,6 +9,19 @@ const OUTDIR = "test-results/hosted-communities";
 const DEFAULT_MOCK_PUBKEY = "deadbeef".repeat(8);
 /** A second valid identity key, used only as a contradictory hosted npub. */
 const OTHER_HEX = "b".repeat(64);
+const DELETION_COMMUNITIES = [
+  {
+    id: "11111111-1111-4111-8111-111111111111",
+    name: "Active team",
+    normalized_host: "active.communities.buzz.xyz",
+  },
+  {
+    id: "22222222-2222-4222-8222-222222222222",
+    name: "Archived team",
+    normalized_host: "Exact-Host.communities.buzz.xyz",
+    archived_at: "2026-09-28T00:00:00Z",
+  },
+];
 
 /**
  * Install the default hosted-communities fixture and open its settings
@@ -56,6 +69,9 @@ async function openDeletionFixture(
     capability?: boolean;
     mismatch?: boolean;
     errorCode?: string;
+    errorSequence?: Array<{ code: string; message?: string } | null>;
+    capabilitySequence?: boolean[];
+    communitiesSequence?: Array<typeof DELETION_COMMUNITIES>;
   } = {},
 ) {
   await installMockBridge(page, {
@@ -67,23 +83,18 @@ async function openDeletionFixture(
     builderlabIdentity: {
       pubkey_hex: options.mismatch ? "f".repeat(64) : DEFAULT_MOCK_PUBKEY,
     },
-    builderlabCommunities: [
-      {
-        id: "11111111-1111-4111-8111-111111111111",
-        name: "Active team",
-        normalized_host: "active.communities.buzz.xyz",
-      },
-      {
-        id: "22222222-2222-4222-8222-222222222222",
-        name: "Archived team",
-        normalized_host: "Exact-Host.communities.buzz.xyz",
-        archived_at: "2026-09-28T00:00:00Z",
-      },
-    ],
+    builderlabCommunities: DELETION_COMMUNITIES,
+    builderlabCommunitiesSequence: options.communitiesSequence,
     builderlabQuota: { used: 2, limit: 5, canCreate: true },
     builderlabDeletionError: options.errorCode
       ? { code: options.errorCode, message: "mock deletion error" }
       : undefined,
+    builderlabDeletionErrorSequence: options.errorSequence,
+    builderlabAuthSequence: options.capabilitySequence?.map((capability) => ({
+      email: "owner@example.com",
+      expiresAt: "2099-01-01T00:00:00Z",
+      canDeleteBuzzCommunities: capability,
+    })),
   });
   await page.goto("/");
   await openSettings(page, "hosted-communities");
@@ -208,6 +219,128 @@ test("ambiguous deletion keeps the same pending request and exposes receipt look
     page.getByText(/Correlation ID: mock-delete-correlation/),
   ).toBeVisible();
   await expect(archived).toBeVisible();
+});
+
+test("ambiguous resubmit not_owner retains the same request UUID", async ({
+  page,
+}) => {
+  await openDeletionFixture(page, {
+    capability: true,
+    errorSequence: [{ code: "acceptance_unknown" }, { code: "not_owner" }],
+    capabilitySequence: [true, true, true],
+    communitiesSequence: [DELETION_COMMUNITIES, DELETION_COMMUNITIES],
+  });
+  const archived = page
+    .getByTestId("hosted-community-row")
+    .filter({ hasText: "Archived team" });
+  const exactHost = "Exact-Host.communities.buzz.xyz";
+  await archived.getByRole("button", { name: "Delete", exact: true }).click();
+  await page
+    .getByLabel(`Type the exact host to continue: ${exactHost}`)
+    .fill(exactHost);
+  await page.getByRole("button", { name: "Continue" }).click();
+  await page
+    .getByRole("button", { name: "Delete community permanently" })
+    .click();
+  const requestId = await page.evaluate(() => {
+    const raw = window.localStorage.getItem(
+      "buzz:hosted-community-delete-pending:v1",
+    );
+    return raw ? JSON.parse(raw).request_id : null;
+  });
+  await expect(page.getByText(requestId, { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Resubmit same request" }).click();
+  await expect(page.getByText(/Only the community owner/)).toBeVisible();
+  await expect(page.getByText(requestId, { exact: true })).toBeVisible();
+  await expect
+    .poll(() =>
+      page.evaluate(() => {
+        const raw = window.localStorage.getItem(
+          "buzz:hosted-community-delete-pending:v1",
+        );
+        return raw ? JSON.parse(raw).request_id : null;
+      }),
+    )
+    .toBe(requestId);
+});
+
+test("resubmit rechecks capability after the fresh owner list", async ({
+  page,
+}) => {
+  await openDeletionFixture(page, {
+    capability: true,
+    errorSequence: [{ code: "acceptance_unknown" }],
+    capabilitySequence: [true, true, false],
+    communitiesSequence: [DELETION_COMMUNITIES, DELETION_COMMUNITIES],
+  });
+  const exactHost = "Exact-Host.communities.buzz.xyz";
+  await page
+    .getByTestId("hosted-community-row")
+    .filter({ hasText: "Archived team" })
+    .getByRole("button", { name: "Delete", exact: true })
+    .click();
+  await page
+    .getByLabel(`Type the exact host to continue: ${exactHost}`)
+    .fill(exactHost);
+  await page.getByRole("button", { name: "Continue" }).click();
+  await page
+    .getByRole("button", { name: "Delete community permanently" })
+    .click();
+  await page.getByRole("button", { name: "Resubmit same request" }).click();
+  await expect(
+    page.getByText(/Community deletion is no longer enabled/),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "Resubmit same request" }),
+  ).toHaveCount(0);
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          window.__BUZZ_E2E_COMMANDS__?.filter(
+            (command) => command === "delete_builderlab_community",
+          ).length ?? 0,
+      ),
+    )
+    .toBe(1);
+});
+
+test("resubmit fails closed when the fresh owner list misses", async ({
+  page,
+}) => {
+  await openDeletionFixture(page, {
+    capability: true,
+    errorSequence: [{ code: "acceptance_unknown" }],
+    capabilitySequence: [true, true, true],
+    communitiesSequence: [DELETION_COMMUNITIES, []],
+  });
+  const exactHost = "Exact-Host.communities.buzz.xyz";
+  await page
+    .getByTestId("hosted-community-row")
+    .filter({ hasText: "Archived team" })
+    .getByRole("button", { name: "Delete", exact: true })
+    .click();
+  await page
+    .getByLabel(`Type the exact host to continue: ${exactHost}`)
+    .fill(exactHost);
+  await page.getByRole("button", { name: "Continue" }).click();
+  await page
+    .getByRole("button", { name: "Delete community permanently" })
+    .click();
+  await page.getByRole("button", { name: "Resubmit same request" }).click();
+  await expect(
+    page.getByText(/not present in the fresh owner list/),
+  ).toBeVisible();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          window.__BUZZ_E2E_COMMANDS__?.filter(
+            (command) => command === "delete_builderlab_community",
+          ).length ?? 0,
+      ),
+    )
+    .toBe(1);
 });
 
 test("identity: mismatch rows follow pubkey_hex, never the hosted npub or raw hex", async ({

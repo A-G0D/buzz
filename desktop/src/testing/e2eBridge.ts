@@ -256,6 +256,25 @@ type E2eConfig = {
     }>;
     builderlabQuota?: { used: number; limit: number; canCreate: boolean };
     builderlabDeletionError?: { code: string; message?: string };
+    builderlabDeletionErrorSequence?: Array<{
+      code: string;
+      message?: string;
+    } | null>;
+    builderlabAuthSequence?: Array<{
+      email?: string;
+      name?: string;
+      expiresAt: string;
+      canDeleteBuzzCommunities?: boolean;
+    } | null>;
+    builderlabCommunitiesSequence?: Array<
+      Array<{
+        id?: string;
+        name?: string;
+        slug?: string;
+        normalized_host?: string;
+        archived_at?: string | null;
+      }>
+    >;
     /** Override the community returned after hosted creation. */
     builderlabCreatedCommunity?: {
       id?: string;
@@ -12536,8 +12555,13 @@ export function maybeInstallE2eTauriMocks() {
           registry: await handleMockCommand("list_voice_registry", null),
         };
       }
-      case "get_builderlab_auth":
+      case "get_builderlab_auth": {
+        const sequence = activeConfig?.mock?.builderlabAuthSequence;
+        if (sequence?.length) {
+          return sequence.length > 1 ? sequence.shift() : sequence[0];
+        }
         return activeConfig?.mock?.builderlabAuth ?? null;
+      }
       case "start_builderlab_login": {
         const delayMs = activeConfig?.mock?.builderlabLoginDelayMs ?? 0;
         if (delayMs > 0)
@@ -12574,8 +12598,13 @@ export function maybeInstallE2eTauriMocks() {
         if (activeConfig?.mock) activeConfig.mock.builderlabIdentity = null;
         return {};
       case "list_builderlab_communities": {
+        const sequence = activeConfig?.mock?.builderlabCommunitiesSequence;
         const hostedCommunities =
-          activeConfig?.mock?.builderlabCommunities ?? [];
+          (sequence?.length
+            ? sequence.length > 1
+              ? sequence.shift()
+              : sequence[0]
+            : activeConfig?.mock?.builderlabCommunities) ?? [];
         const hostedQuota = activeConfig?.mock?.builderlabQuota ?? {
           used: hostedCommunities.length,
           limit: 5,
@@ -12605,9 +12634,15 @@ export function maybeInstallE2eTauriMocks() {
       }
       case "delete_builderlab_community":
       case "get_builderlab_community_deletion_receipt": {
-        if (activeConfig?.mock?.builderlabDeletionError) {
+        const sequence = activeConfig?.mock?.builderlabDeletionErrorSequence;
+        const deletionError = sequence?.length
+          ? sequence.length > 1
+            ? sequence.shift()
+            : sequence[0]
+          : activeConfig?.mock?.builderlabDeletionError;
+        if (deletionError) {
           return {
-            error: activeConfig.mock.builderlabDeletionError,
+            error: deletionError,
             correlation_id: "mock-delete-correlation",
           };
         }
