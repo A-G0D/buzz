@@ -144,11 +144,10 @@ pub fn decide_put_user(
     // real error instead of an OK for an event whose side effect then fails.
     // Re-adding at the same role stays idempotent — the huddle bot-add path
     // relies on that.
-    if let Some((existing, role)) = members
-        .iter()
-        .find(|m| m.pubkey == target)
+    let active_target = members.iter().find(|member| member.pubkey == target);
+    if let Some((existing, role)) = active_target
         .zip(requested_role)
-        .filter(|(m, role)| m.role != role.as_str())
+        .filter(|(member, role)| member.role != role.as_str())
     {
         if !actor_role.is_some_and(|r| r.is_elevated()) {
             return Err(ChannelAuthzError::RoleChangeDenied);
@@ -156,6 +155,13 @@ pub fn decide_put_user(
         if existing.role == "owner" && role != MemberRole::Owner && is_sole_owner(members, target) {
             return Err(ChannelAuthzError::LastOwnerDemotion);
         }
+    }
+
+    // Existing active membership has already satisfied the channel's admission
+    // policy. A role change governs authority inside the channel; it must not
+    // re-run an agent's policy for joining new channels.
+    if active_target.is_some() {
+        return Ok(PutUserDecision::Allow);
     }
 
     // Self-add: always allowed regardless of the target's agent policy.
@@ -460,7 +466,8 @@ mod tests {
                 Some(Member),
                 Err(E::RoleChangeDenied),
             ),
-            // An elevated actor may change roles.
+            // An elevated actor may change roles without re-running the
+            // target's channel-add policy.
             (
                 "open",
                 &[(1, "owner"), (2, "member")],
@@ -468,7 +475,7 @@ mod tests {
                 Some(Owner),
                 2,
                 Some(Admin),
-                Ok(CheckAddPolicy),
+                Ok(Allow),
             ),
             // ── Last-owner demotion guard ──
             // The sole owner demoting themselves.
@@ -500,7 +507,7 @@ mod tests {
                 Some(Owner),
                 2,
                 Some(Member),
-                Ok(CheckAddPolicy),
+                Ok(Allow),
             ),
             // Owner → Owner is not a demotion, so the guard does not fire; it is
             // also not a role change, so it short-circuits as idempotent.
@@ -521,7 +528,7 @@ mod tests {
                 None,
                 2,
                 Some(MemberRole::Bot),
-                Ok(CheckAddPolicy),
+                Ok(Allow),
             ),
             // An absent role tag requests no change, so the role-change gate
             // never fires even for an unprivileged actor.
@@ -532,7 +539,7 @@ mod tests {
                 None,
                 2,
                 None,
-                Ok(CheckAddPolicy),
+                Ok(Allow),
             ),
             // ── Self-add short-circuits the agent channel-add policy ──
             ("open", &[(1, "owner")], 9, None, 9, Some(Member), Ok(Allow)),
