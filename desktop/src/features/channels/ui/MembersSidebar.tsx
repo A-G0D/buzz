@@ -174,6 +174,22 @@ export function MembersSidebar({
       : null;
 
   const rawMembers = membersQuery.data ?? [];
+  const allMemberPubkeys = React.useMemo(
+    () => rawMembers.map((member) => member.pubkey),
+    [rawMembers],
+  );
+  const memberProfilesQuery = useUsersBatchQuery(allMemberPubkeys, {
+    enabled: open && rawMembers.length > 0,
+  });
+  const profileAgentPubkeys = React.useMemo(
+    () =>
+      new Set(
+        Object.entries(memberProfilesQuery.data?.profiles ?? {})
+          .filter(([, profile]) => profile.isAgent)
+          .map(([pubkey]) => normalizePubkey(pubkey)),
+      ),
+    [memberProfilesQuery.data?.profiles],
+  );
   const selfMember =
     rawMembers.find((member) => member.pubkey === currentPubkey) ?? null;
   const {
@@ -184,7 +200,7 @@ export function MembersSidebar({
     isMyBot,
     managedAgentsQuery,
     relayAgentsQuery,
-  } = useClassifiedMembers(rawMembers, currentPubkey);
+  } = useClassifiedMembers(rawMembers, currentPubkey, profileAgentPubkeys);
   const activeMembers = React.useMemo(
     () =>
       [...people, ...bots].sort((left, right) =>
@@ -192,14 +208,7 @@ export function MembersSidebar({
       ),
     [bots, currentPubkey, people],
   );
-  const allMemberPubkeys = React.useMemo(
-    () => rawMembers.map((member) => member.pubkey),
-    [rawMembers],
-  );
   const { getAvailability } = useAgentAvailabilityLookup(allMemberPubkeys, {
-    enabled: open && rawMembers.length > 0,
-  });
-  const memberProfilesQuery = useUsersBatchQuery(allMemberPubkeys, {
     enabled: open && rawMembers.length > 0,
   });
   const normalizedSearchQuery = searchQuery.trim().toLowerCase();

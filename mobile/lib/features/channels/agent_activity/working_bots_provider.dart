@@ -16,6 +16,9 @@ final workingBotPubkeysProvider = Provider.autoDispose
       final membersAsync = ref.watch(channelMembersProvider(channelId));
       final allMembers = membersAsync.asData?.value ?? const <ChannelMember>[];
       final userCache = ref.watch(userCacheProvider);
+      final memberPubkeys = allMembers
+          .map((member) => member.pubkey.toLowerCase())
+          .toSet();
       final agentPubkeys = agentPubkeysWithChannelBots(
         knownAgentPubkeys: agentPubkeysWithProfileOwners(
           knownAgentPubkeys: ref.watch(knownAgentPubkeysProvider),
@@ -30,7 +33,8 @@ final workingBotPubkeysProvider = Provider.autoDispose
 
       return <String>{
         for (final entry in typingEntries)
-          if (agentPubkeys.contains(entry.pubkey.toLowerCase()))
+          if (memberPubkeys.contains(entry.pubkey.toLowerCase()) &&
+              agentPubkeys.contains(entry.pubkey.toLowerCase()))
             entry.pubkey.toLowerCase(),
       };
     });

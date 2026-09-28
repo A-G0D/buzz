@@ -239,6 +239,41 @@ void main() {
     });
   });
 
+  test(
+    'ignores working state from a verified agent outside the channel',
+    () async {
+      final relaySession = _MembershipRelaySessionNotifier([
+        _membershipEvent(role: 'member'),
+      ]);
+      const nonmemberAgentPubkey =
+          'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+      final container = ProviderContainer(
+        overrides: [
+          relaySessionProvider.overrideWith(() => relaySession),
+          knownAgentPubkeysProvider.overrideWithValue(const {
+            _agentPubkey,
+            nonmemberAgentPubkey,
+          }),
+          channelTypingProvider(_channelId).overrideWith(
+            () => _StaticTypingNotifier([
+              const TypingEntry(
+                pubkey: nonmemberAgentPubkey,
+                expiresAtMs: 9999999999999,
+              ),
+            ]),
+          ),
+        ],
+      );
+      addTearDown(container.dispose);
+
+      expect(
+        await container.read(channelMembersProvider(_channelId).future),
+        hasLength(1),
+      );
+      expect(container.read(workingBotPubkeysProvider(_channelId)), isEmpty);
+    },
+  );
+
   test('blank profile labels defer to the directory label', () {
     const pubkey = 'deadbeef0123456789';
 

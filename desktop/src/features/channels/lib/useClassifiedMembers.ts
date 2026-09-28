@@ -10,9 +10,28 @@ import { normalizePubkey } from "@/shared/lib/pubkey";
 
 import { compareMembersByRole } from "./memberUtils";
 
+const EMPTY_AGENT_PUBKEYS: ReadonlySet<string> = new Set();
+
+export function isVerifiedAgentMember(
+  member: ChannelMember,
+  profileAgentPubkeys: ReadonlySet<string>,
+  managedAgentPubkeys: ReadonlySet<string>,
+  relayAgentPubkeys: ReadonlySet<string>,
+) {
+  const normalized = normalizePubkey(member.pubkey);
+  return (
+    member.role === "bot" ||
+    member.isAgent ||
+    profileAgentPubkeys.has(normalized) ||
+    managedAgentPubkeys.has(normalized) ||
+    relayAgentPubkeys.has(normalized)
+  );
+}
+
 export function useClassifiedMembers(
   members: ChannelMember[],
   currentPubkey?: string,
+  profileAgentPubkeys: ReadonlySet<string> = EMPTY_AGENT_PUBKEYS,
 ) {
   const managedAgentsQuery = useManagedAgentsQuery();
   const relayAgentsQuery = useRelayAgentsQuery();
@@ -31,16 +50,14 @@ export function useClassifiedMembers(
   );
 
   const isBot = React.useCallback(
-    (member: ChannelMember) => {
-      const normalized = normalizePubkey(member.pubkey);
-      return (
-        member.role === "bot" ||
-        member.isAgent ||
-        managedAgentPubkeys.has(normalized) ||
-        relayAgentPubkeys.has(normalized)
-      );
-    },
-    [managedAgentPubkeys, relayAgentPubkeys],
+    (member: ChannelMember) =>
+      isVerifiedAgentMember(
+        member,
+        profileAgentPubkeys,
+        managedAgentPubkeys,
+        relayAgentPubkeys,
+      ),
+    [profileAgentPubkeys, managedAgentPubkeys, relayAgentPubkeys],
   );
 
   const isMyBot = React.useCallback(
