@@ -366,7 +366,7 @@ class _OriginalPost extends ConsumerWidget {
                 onTap: () => showUserProfileSheet(
                   context,
                   post.pubkey,
-                  channelId: post.channelId,
+                  names: channelIdentityNamesProvider(post.channelId),
                 ),
                 child: _Avatar(
                   key: ValueKey('forum-original-avatar-${post.eventId}'),
@@ -385,7 +385,7 @@ class _OriginalPost extends ConsumerWidget {
                         onTap: () => showUserProfileSheet(
                           context,
                           post.pubkey,
-                          channelId: post.channelId,
+                          names: channelIdentityNamesProvider(post.channelId),
                         ),
                         child: Text(
                           displayName,
@@ -425,7 +425,7 @@ class _OriginalPost extends ConsumerWidget {
             onMentionTap: (pubkey) => showUserProfileSheet(
               context,
               pubkey,
-              channelId: post.channelId,
+              names: channelIdentityNamesProvider(post.channelId),
             ),
           ),
         ],
@@ -489,7 +489,7 @@ class _ReplyRow extends ConsumerWidget {
                 onTap: () => showUserProfileSheet(
                   context,
                   reply.pubkey,
-                  channelId: channelId,
+                  names: channelIdentityNamesProvider(channelId),
                 ),
                 child: _Avatar(
                   key: ValueKey('forum-reply-avatar-${reply.eventId}'),
@@ -508,7 +508,7 @@ class _ReplyRow extends ConsumerWidget {
                         onTap: () => showUserProfileSheet(
                           context,
                           reply.pubkey,
-                          channelId: channelId,
+                          names: channelIdentityNamesProvider(channelId),
                         ),
                         child: Text(
                           displayName,
@@ -560,8 +560,11 @@ class _ReplyRow extends ConsumerWidget {
               baseStyle: messageBodyTextStyle.copyWith(
                 color: context.colors.onSurface,
               ),
-              onMentionTap: (pubkey) =>
-                  showUserProfileSheet(context, pubkey, channelId: channelId),
+              onMentionTap: (pubkey) => showUserProfileSheet(
+                context,
+                pubkey,
+                names: channelIdentityNamesProvider(channelId),
+              ),
             ),
           ),
         ],
