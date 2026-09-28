@@ -1901,7 +1901,7 @@ mod postgres_tests {
         let personal = surface(
             MIGRATOR
                 .iter()
-                .find(|m| m.version == 50)
+                .find(|m| m.version == 51)
                 .expect("personal read migration")
                 .sql
                 .as_ref(),
