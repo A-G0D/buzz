@@ -898,6 +898,28 @@ async fn flush_terminal_frames<S>(
     let _ = tokio::time::timeout_at(deadline, sink.send(close)).await;
 }
 
+/// Writes a WebSocket exit path's frames before a writer task owns the socket.
+///
+/// Every write shares one `WS_TERMINAL_FLUSH_TIMEOUT` deadline and the first
+/// failed or timed-out write ends the drain, so a never-ready sink cannot hold
+/// the exit, or the cleanup that follows it, open. [FI-TRACE-TERMINAL-BOUNDED]
+pub(crate) async fn send_exit_frames_bounded<S>(
+    sink: &mut S,
+    frames: impl IntoIterator<Item = WsMessage>,
+) where
+    S: Sink<WsMessage> + Unpin,
+{
+    let deadline = tokio::time::Instant::now() + WS_TERMINAL_FLUSH_TIMEOUT;
+    for frame in frames {
+        if !matches!(
+            tokio::time::timeout_at(deadline, sink.send(frame)).await,
+            Ok(Ok(()))
+        ) {
+            return;
+        }
+    }
+}
+
 async fn send_loop_inner<S>(
     mut ws_send: S,
     mut data_rx: mpsc::Receiver<WsMessage>,

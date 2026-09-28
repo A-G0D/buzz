@@ -319,6 +319,40 @@ pub(crate) async fn handle_audio_connection(
     .await;
 }
 
+/// Mid-admission cancellation fence for the audio route: if `$cancel` fired,
+/// run any exit cleanup, drain the terminal channel (which holds the denial
+/// frame queued by the expiry task) through the bounded exit writer while the
+/// handler still owns the socket, and return. Used at every async boundary in
+/// the admission sequence before `send_loop` takes the socket.
+macro_rules! check_cancel {
+    ($cancel:ident, $terminal_rx:ident, $ws_send:ident) => {
+        check_cancel!($cancel, $terminal_rx, $ws_send, cleanup: ())
+    };
+    ($cancel:ident, $terminal_rx:ident, $ws_send:ident, cleanup: $cleanup:expr) => {
+        if $cancel.is_cancelled() {
+            $cleanup;
+            crate::connection::send_exit_frames_bounded(
+                &mut $ws_send,
+                std::iter::from_fn(|| $terminal_rx.try_recv().ok()),
+            )
+            .await;
+            return;
+        }
+    };
+    ($cancel:ident, $terminal_rx:ident, $ws_send:ident, release_lease: $lease:expr) => {
+        check_cancel!($cancel, $terminal_rx, $ws_send, cleanup: {
+            // Release any acquired lease before returning. Pre-guard path:
+            // staged_lease may hold a lease that must be released before we
+            // return, since the guard hasn't been built yet.
+            if let Some((lease, directory)) = ($lease).take() {
+                if let Err(e) = directory.release(&lease).await {
+                    tracing::warn!("pre-guard staged_lease release failed on cancel: {e}");
+                }
+            }
+        })
+    };
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_active_audio_connection(
     socket: WebSocket,
@@ -393,12 +427,13 @@ pub(crate) async fn handle_active_audio_connection(
                 channel_id = %channel_id,
                 "NIP-FI session deadline already expired at audio upgrade — rejecting before auth"
             );
-            use futures_util::SinkExt as _;
-            let _ = ws_send
-                .send(crate::nip_fi_session::authorization_denied_frame(
+            let _ = crate::connection::send_exit_frames_bounded(
+                &mut ws_send,
+                [crate::nip_fi_session::authorization_denied_frame(
                     crate::nip_fi_session::NipFiWsRoute::Audio,
-                ))
-                .await;
+                )],
+            )
+            .await;
             cancel.cancel();
             return;
         }
@@ -419,10 +454,11 @@ pub(crate) async fn handle_active_audio_connection(
         biased;
         _ = cancel.cancelled() => {
             // Gate or external cancel fired during auth. Drain denial frame.
-            use futures_util::SinkExt as _;
-            while let Ok(msg) = terminal_ctrl_rx.try_recv() {
-                let _ = ws_send.send(msg).await;
-            }
+            crate::connection::send_exit_frames_bounded(
+                &mut ws_send,
+                std::iter::from_fn(|| terminal_ctrl_rx.try_recv().ok()),
+            )
+            .await;
             return;
         },
         result = tokio::time::timeout(AUTH_TIMEOUT, async {
@@ -473,10 +509,11 @@ pub(crate) async fn handle_active_audio_connection(
         _ = cancel.cancelled() => {
             // Expiry fired while waiting for verify_auth_event. Drain the
             // terminal channel so the denial frame reaches the client.
-            use futures_util::SinkExt as _;
-            while let Ok(msg) = terminal_ctrl_rx.try_recv() {
-                let _ = ws_send.send(msg).await;
-            }
+            crate::connection::send_exit_frames_bounded(
+                &mut ws_send,
+                std::iter::from_fn(|| terminal_ctrl_rx.try_recv().ok()),
+            )
+            .await;
             return;
         },
         result = state.auth.verify_auth_event(auth_msg.event, &challenge, &relay_url) => {
@@ -484,12 +521,11 @@ pub(crate) async fn handle_active_audio_connection(
                 Ok(ctx) => ctx,
                 Err(e) => {
                     warn!(channel_id = %channel_id, "audio auth failed: {e}");
-                    let _ = ws_send
-                        .send(WsMessage::Text(
+                    let _ = crate::connection::send_exit_frames_bounded(&mut ws_send, [WsMessage::Text(
                             serde_json::json!({"type":"error","message":"auth failed"})
                                 .to_string()
                                 .into(),
-                        ))
+                        )])
                         .await;
                     return;
                 }
@@ -542,61 +578,16 @@ pub(crate) async fn handle_active_audio_connection(
                 pubkey = %pubkey_hex,
                 "NIP-FI session deadline already expired at pairing — rejecting audio admission"
             );
-            use futures_util::SinkExt as _;
-            let _ = ws_send
-                .send(crate::nip_fi_session::authorization_denied_frame(
+            let _ = crate::connection::send_exit_frames_bounded(
+                &mut ws_send,
+                [crate::nip_fi_session::authorization_denied_frame(
                     crate::nip_fi_session::NipFiWsRoute::Audio,
-                ))
-                .await;
+                )],
+            )
+            .await;
             cancel.cancel();
             return;
         }
-    }
-
-    // Helper macro: check for NIP-FI mid-admission cancellation, drain the
-    // terminal channel (which holds the denial frame queued by the expiry
-    // task), send it via ws_send (still owned), and return.
-    // Used at every async boundary in the admission sequence below.
-    macro_rules! check_cancel {
-        () => {
-            if cancel.is_cancelled() {
-                use futures_util::SinkExt as _;
-                while let Ok(msg) = terminal_ctrl_rx.try_recv() {
-                    let _ = ws_send.send(msg).await;
-                }
-                return;
-            }
-        };
-        (cleanup: $cleanup:expr) => {
-            if cancel.is_cancelled() {
-                $cleanup;
-                use futures_util::SinkExt as _;
-                while let Ok(msg) = terminal_ctrl_rx.try_recv() {
-                    let _ = ws_send.send(msg).await;
-                }
-                return;
-            }
-        };
-        (release_lease: $lease:expr) => {
-            if cancel.is_cancelled() {
-                // Release any acquired lease before returning. Pre-guard path:
-                // staged_lease may hold a lease that must be released before we
-                // return, since the guard hasn't been built yet.
-                if let Some((lease, directory)) = ($lease).take() {
-                    match directory.release(&lease).await {
-                        Ok(_) => {}
-                        Err(e) => {
-                            tracing::warn!("pre-guard staged_lease release failed on cancel: {e}");
-                        }
-                    }
-                }
-                use futures_util::SinkExt as _;
-                while let Ok(msg) = terminal_ctrl_rx.try_recv() {
-                    let _ = ws_send.send(msg).await;
-                }
-                return;
-            }
-        };
     }
 
     if crate::api::relay_members::enforce_relay_membership(
@@ -613,27 +604,24 @@ pub(crate) async fn handle_active_audio_connection(
         // Fix 4: when an FI assertion is present, use the uniform NIP-FI denial
         // text so relay-membership status is not distinguishable.
         // [FI-TRACE-DENIAL-ORACLE, NIP-FI §authorization_denied]
-        let _ = if nip_fi_assertion.is_some() {
+        let deny_frame = if nip_fi_assertion.is_some() {
             // Fix 4b: route through the canonical constructor when FI assertion
             // is present — emits `{"type":"restricted",...}`, byte-exact denial.
             // [FI-TRACE-DENIAL-ORACLE, NIP-FI §authorization_denied]
-            ws_send
-                .send(crate::nip_fi_session::authorization_denied_frame(
-                    crate::nip_fi_session::NipFiWsRoute::Audio,
-                ))
-                .await
+            crate::nip_fi_session::authorization_denied_frame(
+                crate::nip_fi_session::NipFiWsRoute::Audio,
+            )
         } else {
-            ws_send
-                .send(WsMessage::Text(
-                    serde_json::json!({"type": "error", "message": "restricted: not a relay member"})
-                        .to_string()
-                        .into(),
-                ))
-                .await
+            WsMessage::Text(
+                serde_json::json!({"type": "error", "message": "restricted: not a relay member"})
+                    .to_string()
+                    .into(),
+            )
         };
+        crate::connection::send_exit_frames_bounded(&mut ws_send, [deny_frame]).await;
         return;
     }
-    check_cancel!();
+    check_cancel!(cancel, terminal_ctrl_rx, ws_send);
 
     // ── Step 3: membership check / auto-add ───────────────────────────────────
     let membership_admission = match check_membership_for_admission(
@@ -648,24 +636,21 @@ pub(crate) async fn handle_active_audio_connection(
         Ok(admission) => admission,
         Err(e) => {
             warn!(channel_id = %channel_id, pubkey = %pubkey_hex, "audio membership denied: {e}");
-            let _ = if nip_fi_assertion.is_some() {
+            let deny_frame = if nip_fi_assertion.is_some() {
                 // Fix 4b: route through the canonical constructor when FI assertion
                 // is present — emits `{"type":"restricted",...}`, byte-exact denial.
                 // [FI-TRACE-DENIAL-ORACLE, NIP-FI §authorization_denied]
-                ws_send
-                    .send(crate::nip_fi_session::authorization_denied_frame(
-                        crate::nip_fi_session::NipFiWsRoute::Audio,
-                    ))
-                    .await
+                crate::nip_fi_session::authorization_denied_frame(
+                    crate::nip_fi_session::NipFiWsRoute::Audio,
+                )
             } else {
-                ws_send
-                    .send(WsMessage::Text(
-                        serde_json::json!({"type": "error", "message": "not a member"})
-                            .to_string()
-                            .into(),
-                    ))
-                    .await
+                WsMessage::Text(
+                    serde_json::json!({"type": "error", "message": "not a member"})
+                        .to_string()
+                        .into(),
+                )
             };
+            crate::connection::send_exit_frames_bounded(&mut ws_send, [deny_frame]).await;
             return;
         }
     };
@@ -677,7 +662,7 @@ pub(crate) async fn handle_active_audio_connection(
             parent_channel_id, ..
         } => *parent_channel_id,
     };
-    check_cancel!();
+    check_cancel!(cancel, terminal_ctrl_rx, ws_send);
 
     // Huddle cross-pod routing (mesh) OR single-pod guardrail.
     //
@@ -702,8 +687,9 @@ pub(crate) async fn handle_active_audio_connection(
     match state.mesh() {
         Some(mesh) => {
             if mesh.owners.is_draining() {
-                let _ = ws_send
-                    .send(WsMessage::Text(
+                let _ = crate::connection::send_exit_frames_bounded(
+                    &mut ws_send,
+                    [WsMessage::Text(
                         serde_json::json!({
                             "type": "error",
                             "code": "huddle_relay_draining",
@@ -711,8 +697,9 @@ pub(crate) async fn handle_active_audio_connection(
                         })
                         .to_string()
                         .into(),
-                    ))
-                    .await;
+                    )],
+                )
+                .await;
                 return;
             }
             match crate::audio::join::resolve_join_owner_ready(
@@ -738,8 +725,9 @@ pub(crate) async fn handle_active_audio_connection(
                         pubkey = %pubkey_hex,
                         "huddle join rejected by fence: {e}"
                     );
-                    let _ = ws_send
-                        .send(WsMessage::Text(
+                    let _ = crate::connection::send_exit_frames_bounded(
+                        &mut ws_send,
+                        [WsMessage::Text(
                             serde_json::json!({
                                 "type": "error",
                                 "code": "join_rejected",
@@ -747,14 +735,15 @@ pub(crate) async fn handle_active_audio_connection(
                             })
                             .to_string()
                             .into(),
-                        ))
-                        .await;
+                        )],
+                    )
+                    .await;
                     return;
                 }
             }
             // I1 residual: staged_lease may now hold an acquired lease. Release
             // it (awaited, not detached) before returning on cancel.
-            check_cancel!(release_lease: staged_lease);
+            check_cancel!(cancel, terminal_ctrl_rx, ws_send, release_lease: staged_lease);
         }
         None => {
             if !state.config.huddle_audio_available {
@@ -763,8 +752,9 @@ pub(crate) async fn handle_active_audio_connection(
                     pubkey = %pubkey_hex,
                     "huddle audio unavailable under horizontal scaling — rejecting join"
                 );
-                let _ = ws_send
-                    .send(WsMessage::Text(
+                let _ = crate::connection::send_exit_frames_bounded(
+                    &mut ws_send,
+                    [WsMessage::Text(
                         serde_json::json!({
                             "type": "error",
                             "code": "huddle_audio_unavailable",
@@ -772,8 +762,9 @@ pub(crate) async fn handle_active_audio_connection(
                         })
                         .to_string()
                         .into(),
-                    ))
-                    .await;
+                    )],
+                )
+                .await;
                 return;
             }
         }
@@ -797,13 +788,15 @@ pub(crate) async fn handle_active_audio_connection(
     match state.db.get_channel(tenant.community(), channel_id).await {
         Ok(ch) if ch.archived_at.is_some() => {
             debug!(channel_id = %channel_id, "channel archived before room join");
-            let _ = ws_send
-                .send(WsMessage::Text(
+            let _ = crate::connection::send_exit_frames_bounded(
+                &mut ws_send,
+                [WsMessage::Text(
                     serde_json::json!({"type":"error","message":"huddle has ended"})
                         .to_string()
                         .into(),
-                ))
-                .await;
+                )],
+            )
+            .await;
             // I1 residual: release lease with an awaited call, not a detached task.
             if let Some((lease, directory)) = staged_lease {
                 if let Err(e) = directory.release(&lease).await {
@@ -832,7 +825,7 @@ pub(crate) async fn handle_active_audio_connection(
     }
     // I1 residual: staged_lease may hold an acquired lease. Release it
     // (awaited, not detached) before returning on cancel.
-    check_cancel!(release_lease: staged_lease);
+    check_cancel!(cancel, terminal_ctrl_rx, ws_send, release_lease: staged_lease);
 
     // Reject unsupported future versions up-front so we don't accidentally
     // pin a room to a version we can't speak. Versions 1..=CURRENT are OK.
@@ -845,8 +838,7 @@ pub(crate) async fn handle_active_audio_connection(
             current = CURRENT_PROTOCOL_VERSION,
             "audio: client requested unsupported protocol version"
         );
-        let _ = ws_send
-            .send(WsMessage::Text(
+        let _ = crate::connection::send_exit_frames_bounded(&mut ws_send, [WsMessage::Text(
                 serde_json::json!({
                     "type": "error",
                     "code": "unsupported_version",
@@ -857,7 +849,7 @@ pub(crate) async fn handle_active_audio_connection(
                 })
                 .to_string()
                 .into(),
-            ))
+            )])
             .await;
         if let Some((lease, directory)) = staged_lease {
             // I1 residual: release lease with an awaited call, not a detached task.
@@ -917,11 +909,13 @@ pub(crate) async fn handle_active_audio_connection(
             }
             Err(crate::audio::join::DialError::Rejected(reason)) => {
                 warn!(channel_id = %channel_id, pubkey = %pubkey_hex, "huddle owner rejected registration: {reason:?}");
-                let _ = ws_send
-                    .send(WsMessage::Text(
+                let _ = crate::connection::send_exit_frames_bounded(
+                    &mut ws_send,
+                    [WsMessage::Text(
                         remote_rejection_ws_error(&reason).to_string().into(),
-                    ))
-                    .await;
+                    )],
+                )
+                .await;
                 // I3 residual: await expiry task before resource teardown.
                 cancel.cancel();
                 if let Some(t) = _nip_fi_admission_expiry.take() {
@@ -935,16 +929,18 @@ pub(crate) async fn handle_active_audio_connection(
             }
             Err(crate::audio::join::DialError::Mesh(e)) => {
                 warn!(channel_id = %channel_id, pubkey = %pubkey_hex, "huddle owner registration failed: {e}");
-                let _ = ws_send
-                    .send(WsMessage::Text(
+                let _ = crate::connection::send_exit_frames_bounded(
+                    &mut ws_send,
+                    [WsMessage::Text(
                         serde_json::json!({
                             "type": "error", "code": "huddle_owner_unreachable",
                             "message": "could not reach the huddle owner"
                         })
                         .to_string()
                         .into(),
-                    ))
-                    .await;
+                    )],
+                )
+                .await;
                 // I3 residual: await expiry task before resource teardown.
                 cancel.cancel();
                 if let Some(t) = _nip_fi_admission_expiry.take() {
@@ -965,11 +961,12 @@ pub(crate) async fn handle_active_audio_connection(
             if let Some(t) = _nip_fi_admission_expiry.take() {
                 let _ = t.await;
             }
-            use futures_util::SinkExt as _;
             let _ = guard.release_before_commit().await; // pre-add-peer; owner_generation not set
-            while let Ok(msg) = terminal_ctrl_rx.try_recv() {
-                let _ = ws_send.send(msg).await;
-            }
+            crate::connection::send_exit_frames_bounded(
+                &mut ws_send,
+                std::iter::from_fn(|| terminal_ctrl_rx.try_recv().ok()),
+            )
+            .await;
             return;
         }
     }
@@ -988,11 +985,12 @@ pub(crate) async fn handle_active_audio_connection(
                 if let Some(t) = _nip_fi_admission_expiry.take() {
                     let _ = t.await;
                 }
-                use futures_util::SinkExt as _;
                 let _ = guard.release_before_commit().await; // pre-add-peer; owner_generation not set
-                while let Ok(msg) = terminal_ctrl_rx.try_recv() {
-                    let _ = ws_send.send(msg).await;
-                }
+                crate::connection::send_exit_frames_bounded(
+                    &mut ws_send,
+                    std::iter::from_fn(|| terminal_ctrl_rx.try_recv().ok()),
+                )
+                .await;
                 return;
             }
         };
@@ -1025,7 +1023,7 @@ pub(crate) async fn handle_active_audio_connection(
             Ok(v) => v,
             Err(crate::audio::room::AdmissionError::Full) => {
                 warn!(channel_id = %channel_id, "audio room participant capacity reached");
-                let _ = ws_send.send(WsMessage::Text(serde_json::json!({"type":"error","code":"room_full","message":"room participant capacity reached"}).to_string().into())).await;
+                let _ = crate::connection::send_exit_frames_bounded(&mut ws_send, [WsMessage::Text(serde_json::json!({"type":"error","code":"room_full","message":"room participant capacity reached"}).to_string().into())]).await;
                 // IMPORTANT 3: cancel + await expiry task before guard release.
                 cancel.cancel();
                 if let Some(t) = _nip_fi_admission_expiry.take() {
@@ -1036,7 +1034,7 @@ pub(crate) async fn handle_active_audio_connection(
             }
             Err(crate::audio::room::AdmissionError::Ended) => {
                 debug!(channel_id = %channel_id, "room ended before admission");
-                let _ = ws_send.send(WsMessage::Text(serde_json::json!({"type":"error","code":"room_ended","message":"huddle has ended"}).to_string().into())).await;
+                let _ = crate::connection::send_exit_frames_bounded(&mut ws_send, [WsMessage::Text(serde_json::json!({"type":"error","code":"room_ended","message":"huddle has ended"}).to_string().into())]).await;
                 // IMPORTANT 3: cancel + await expiry task before guard release.
                 cancel.cancel();
                 if let Some(t) = _nip_fi_admission_expiry.take() {
@@ -1047,11 +1045,11 @@ pub(crate) async fn handle_active_audio_connection(
             }
             Err(crate::audio::room::AdmissionError::VersionMismatch { pinned, requested }) => {
                 info!(channel_id = %channel_id, pubkey = %pubkey_hex, pinned, requested, "audio: protocol version mismatch — upgrade required");
-                let _ = ws_send.send(WsMessage::Text(serde_json::json!({
+                let _ = crate::connection::send_exit_frames_bounded(&mut ws_send, [WsMessage::Text(serde_json::json!({
                 "type": "error", "code": "upgrade_required",
                 "message": format!("this huddle is using audio protocol v{pinned}; your client requested v{requested}"),
                 "pinned_version": pinned, "requested_version": requested,
-            }).to_string().into())).await;
+            }).to_string().into())]).await;
                 // IMPORTANT 3: cancel + await expiry task before guard release.
                 cancel.cancel();
                 if let Some(t) = _nip_fi_admission_expiry.take() {
@@ -1145,7 +1143,6 @@ pub(crate) async fn handle_active_audio_connection(
         if let Some(t) = _nip_fi_admission_expiry.take() {
             let _ = t.await;
         }
-        use futures_util::SinkExt as _;
         // Fix 7c: owner_generation is now resolved before this exit, so we can
         // correctly fence the room-empty owner lease release. [FI-TRACE-OWNER-CLEANUP-GAP]
         let room_cleaned = guard.release_before_commit().await;
@@ -1154,9 +1151,11 @@ pub(crate) async fn handle_active_audio_connection(
                 mesh.owners.release(channel_id, generation);
             }
         }
-        while let Ok(msg) = terminal_ctrl_rx.try_recv() {
-            let _ = ws_send.send(msg).await;
-        }
+        crate::connection::send_exit_frames_bounded(
+            &mut ws_send,
+            std::iter::from_fn(|| terminal_ctrl_rx.try_recv().ok()),
+        )
+        .await;
         return;
     }
 
@@ -1333,7 +1332,6 @@ pub(crate) async fn handle_active_audio_connection(
                 // precede Close, and neither may wait on the owner stream below.
                 // [FI-TRACE-COMMIT-CONFIRM-CANCEL, FI-TRACE-TERMINAL-BOUNDED]
                 {
-                    use futures_util::SinkExt as _;
                     let deadline =
                         tokio::time::Instant::now() + crate::connection::WS_TERMINAL_FLUSH_TIMEOUT;
                     while let Ok(msg) = terminal_ctrl_rx.try_recv() {
@@ -1455,10 +1453,11 @@ pub(crate) async fn handle_active_audio_connection(
                 }
             }
             // Drain the terminal denial frame (already queued by expiry task).
-            use futures_util::SinkExt as _;
-            while let Ok(msg) = terminal_ctrl_rx.try_recv() {
-                let _ = ws_send.send(msg).await;
-            }
+            crate::connection::send_exit_frames_bounded(
+                &mut ws_send,
+                std::iter::from_fn(|| terminal_ctrl_rx.try_recv().ok()),
+            )
+            .await;
             return;
         }
         Err(JoinCommitError::Archived) => {
@@ -1478,13 +1477,15 @@ pub(crate) async fn handle_active_audio_connection(
                     mesh.owners.release(channel_id, generation);
                 }
             }
-            let _ = ws_send
-                .send(WsMessage::Text(
+            let _ = crate::connection::send_exit_frames_bounded(
+                &mut ws_send,
+                [WsMessage::Text(
                     serde_json::json!({"type":"error","message":"huddle has ended"})
                         .to_string()
                         .into(),
-                ))
-                .await;
+                )],
+            )
+            .await;
             return;
         }
         Err(JoinCommitError::ParentMembershipLost) => {
@@ -1519,7 +1520,7 @@ pub(crate) async fn handle_active_audio_connection(
                         .into(),
                 )
             };
-            let _ = ws_send.send(deny_frame).await;
+            let _ = crate::connection::send_exit_frames_bounded(&mut ws_send, [deny_frame]).await;
             return;
         }
         Err(JoinCommitError::HuddleLinkGone) => {
@@ -1540,13 +1541,15 @@ pub(crate) async fn handle_active_audio_connection(
                     mesh.owners.release(channel_id, generation);
                 }
             }
-            let _ = ws_send
-                .send(WsMessage::Text(
+            let _ = crate::connection::send_exit_frames_bounded(
+                &mut ws_send,
+                [WsMessage::Text(
                     serde_json::json!({"type":"error","message":"huddle has ended"})
                         .to_string()
                         .into(),
-                ))
-                .await;
+                )],
+            )
+            .await;
             return;
         }
         Err(JoinCommitError::Db(e)) => {
@@ -1566,13 +1569,15 @@ pub(crate) async fn handle_active_audio_connection(
                     mesh.owners.release(channel_id, generation);
                 }
             }
-            let _ = ws_send
-                .send(WsMessage::Text(
+            let _ = crate::connection::send_exit_frames_bounded(
+                &mut ws_send,
+                [WsMessage::Text(
                     serde_json::json!({"type":"error","message":"error: join commit failed"})
                         .to_string()
                         .into(),
-                ))
-                .await;
+                )],
+            )
+            .await;
             return;
         }
     }
@@ -10977,6 +10982,44 @@ mod tests {
                      → never-ready sink blocks on denial → WS_TERMINAL_FLUSH_TIMEOUT+1ms → \
                      task never returns → RED",
         );
+    }
+
+    /// Luke P2: an audio exit path that writes before `send_loop` owns the
+    /// socket must not wait on a never-ready sink. This drives the production
+    /// `check_cancel!` fence with a queued FI denial and requires it to return
+    /// within the shared `WS_TERMINAL_FLUSH_TIMEOUT` budget.
+    ///
+    /// Mutation oracle: revert `check_cancel!`'s drain to the unbounded
+    /// `while let Ok(msg) = rx.try_recv() { let _ = ws_send.send(msg).await; }`
+    /// → the send parks on the never-ready sink → the outer timeout fires → RED.
+    #[tokio::test(start_paused = true)]
+    async fn check_cancel_exit_with_never_ready_sink_returns_within_flush_budget() {
+        let ready_polled = std::sync::Arc::new(tokio::sync::Notify::new());
+        let mut ws_send = NeverReadyAudioSink {
+            ready_polled: std::sync::Arc::clone(&ready_polled),
+        };
+        let (terminal_tx, mut terminal_ctrl_rx) = tokio::sync::mpsc::channel::<WsMessage>(1);
+        terminal_tx
+            .try_send(crate::nip_fi_session::authorization_denied_frame(
+                crate::nip_fi_session::NipFiWsRoute::Audio,
+            ))
+            .expect("queue terminal frame");
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let fence = async {
+            check_cancel!(cancel, terminal_ctrl_rx, ws_send);
+            panic!("check_cancel! must return on a cancelled token");
+        };
+        tokio::time::timeout(
+            crate::connection::WS_TERMINAL_FLUSH_TIMEOUT + std::time::Duration::from_millis(1),
+            fence,
+        )
+        .await
+        .expect("check_cancel! exit must be bounded by WS_TERMINAL_FLUSH_TIMEOUT");
+        tokio::time::timeout(std::time::Duration::ZERO, ready_polled.notified())
+            .await
+            .expect("the exit must have attempted the queued denial on the sink");
     }
 
     // ── CommitConfirmed send timeout (Item 2): mechanism sanity check ─────────

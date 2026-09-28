@@ -123,10 +123,11 @@ pub(crate) async fn enforce_nip_fi_key_pairing(
                 proven_pubkey = %proven_pubkey.to_hex(),
                 "NIP-FI key pairing mismatch — closing connection"
             );
-            use futures_util::SinkExt as _;
-            let _ = ws_send
-                .send(authorization_denied_frame(NipFiWsRoute::Audio))
-                .await;
+            crate::connection::send_exit_frames_bounded(
+                ws_send,
+                [authorization_denied_frame(NipFiWsRoute::Audio)],
+            )
+            .await;
             cancel.cancel();
         }
     }

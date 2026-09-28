@@ -2487,7 +2487,7 @@ mod tests {
 
     #[test]
     fn malformed_operator_listener_config_prevents_startup() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guards = env_guards();
         let result = config_with_operator_listeners(Some(";"));
 
         assert!(matches!(
@@ -2502,7 +2502,7 @@ mod tests {
     fn non_utf8_operator_listener_config_prevents_startup() {
         use std::os::unix::ffi::OsStringExt;
 
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guards = env_guards();
         let previous = std::env::var_os("BUZZ_OPERATOR_LISTENERS");
         std::env::set_var(
             "BUZZ_OPERATOR_LISTENERS",
@@ -2525,7 +2525,7 @@ mod tests {
 
     #[test]
     fn valid_and_absent_operator_listener_config_preserve_routes() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guards = env_guards();
         let key = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let raw = format!("{key}:https://listener.example/mentions");
         let config = config_with_operator_listeners(Some(&raw)).expect("valid listener config");

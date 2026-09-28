@@ -36,9 +36,11 @@
 //!
 //! ## Off-mode
 //!
-//! When `deadline` is `None`, `acquire_effect` always succeeds (no cancel is ever
-//! issued by the gate itself, and `None` deadline is treated as infinite). The
-//! gate has zero overhead in off-mode: one arc read per effect acquire.
+//! When `deadline` is `None`, the gate has no deadline and never expires on its
+//! own. `acquire_effect` still takes an owned Tokio read lock on the phase, and
+//! it still rejects with `SessionExpired` once the connection's cancellation
+//! token has been cancelled externally (for example by community archival or
+//! shutdown).
 
 use std::sync::Arc;
 
