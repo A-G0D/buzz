@@ -1,10 +1,12 @@
 use std::collections::HashMap;
 
 use buzz_core_pkg::PresenceStatus;
+use futures_util::{stream, StreamExt, TryStreamExt};
 use serde_json::Value;
 use tauri::State;
 
 const USER_PROFILE_QUERY_BATCH_SIZE: usize = 500;
+const USER_PROFILE_QUERY_MAX_CONCURRENCY: usize = 8;
 
 fn user_profile_query_filters(pubkeys: &[String]) -> Vec<Value> {
     pubkeys
@@ -231,13 +233,16 @@ pub async fn get_users_batch(
         });
     }
     let filters = user_profile_query_filters(&pubkeys);
-    let pages = futures_util::future::try_join_all(
-        filters
-            .iter()
-            .map(|filter| query_relay(&state, std::slice::from_ref(filter))),
-    )
+    let events = stream::iter(filters.into_iter().map(|filter| {
+        let state = &state;
+        async move { query_relay(state, std::slice::from_ref(&filter)).await }
+    }))
+    .buffer_unordered(USER_PROFILE_QUERY_MAX_CONCURRENCY)
+    .try_fold(Vec::new(), |mut events, page| async move {
+        events.extend(page);
+        Ok(events)
+    })
     .await?;
-    let events = pages.into_iter().flatten().collect::<Vec<_>>();
 
     Ok(nostr_convert::users_batch_from_events(&events, &pubkeys))
 }
@@ -496,6 +501,7 @@ mod tests {
         assert_eq!(filters[1]["authors"].as_array().unwrap().len(), 500);
         assert_eq!(filters[2]["authors"].as_array().unwrap().len(), 1);
         assert_eq!(filters[2]["limit"], serde_json::json!(1));
+        assert_eq!(USER_PROFILE_QUERY_MAX_CONCURRENCY, 8);
     }
 
     #[test]
