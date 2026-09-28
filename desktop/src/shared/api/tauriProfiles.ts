@@ -86,8 +86,10 @@ export async function updateProfile(
 export async function updateProfileAtRelay(input: {
   relayUrl: string;
   expectedPubkey: string;
-  expectedAvatarUrl: string | null;
-  avatarUrl: string;
+  expectedAvatarUrl?: string | null;
+  avatarUrl?: string | null;
+  displayName?: string | null;
+  name?: string | null;
 }): Promise<Profile> {
   const profile = await invokeTauri<RawProfile>(
     "update_profile_at_relay",

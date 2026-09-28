@@ -40,11 +40,19 @@ GET {adapter_base}/v1/login/start?return_to={callback_url}&handoff_challenge={ba
 ```
 
 The adapter authenticates the user however the operator chooses, binds the
-completed browser login to `handoff_challenge`, and redirects to:
+completed browser login to `handoff_challenge`, and redirects to the exact
+`return_to` loopback callback. Desktop always supplies
+`http://127.0.0.1:{ephemeral_port}/callback/{nonce}`; adapters should accept
+loopback callbacks on any port as recommended by RFC 8252 §7.3 and reject
+non-loopback callback hosts. Success redirects to:
 
 ```text
 {callback_url}?code={single_use_code}
 ```
+
+Failures may redirect to the same callback with `error` and optional
+`error_description` query parameters. Desktop surfaces `error_description` when
+present, otherwise `error`.
 
 The code alone is not a credential. The adapter MUST accept it only when the
 exchange presents the matching handoff secret. Browser navigation may follow the
@@ -83,7 +91,10 @@ Success response:
 
 `email` and `profile_projection` are optional. `profile_projection` is ignored by
 Desktop unless `BUZZ_BUILD_ENTERPRISE_PROFILE_PROJECTION` opts into publishing
-those fields as the user's public Buzz profile.
+those fields as the user's public Buzz profile. The exchange `expires_at` and a
+later session-check `expires_at` must describe the same fixed adapter session;
+Desktop rejects mismatched values during login so a code exchange cannot commit a
+different session than the one verified by `/v1/session`.
 
 ## Session check
 

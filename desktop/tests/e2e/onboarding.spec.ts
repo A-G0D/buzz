@@ -1729,13 +1729,23 @@ test("authoritative corporate profile save failure stays non-editable and retrie
     .poll(() =>
       page.evaluate(() =>
         (window.__BUZZ_E2E_COMMAND_PAYLOADS__ ?? [])
-          .filter(({ command }) => command === "update_profile")
+          .filter(({ command }) => command === "update_profile_at_relay")
           .map(({ payload }) => payload),
       ),
     )
     .toEqual([
-      { displayName: "Brad Seiler", name: "seiler" },
-      { displayName: "Brad Seiler", name: "seiler" },
+      {
+        relayUrl,
+        expectedPubkey: BLANK_TYLER_IDENTITY.pubkey,
+        displayName: "Brad Seiler",
+        name: "seiler",
+      },
+      {
+        relayUrl,
+        expectedPubkey: BLANK_TYLER_IDENTITY.pubkey,
+        displayName: "Brad Seiler",
+        name: "seiler",
+      },
     ]);
 });
 

@@ -106,7 +106,9 @@ pub async fn update_profile_at_relay(
     relay_url: String,
     expected_pubkey: String,
     expected_avatar_url: Option<String>,
-    avatar_url: String,
+    avatar_url: Option<String>,
+    display_name: Option<String>,
+    name: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<ProfileInfo, String> {
     let signer = capture_expected_signer(&state, &expected_pubkey)?;
@@ -129,17 +131,25 @@ pub async fn update_profile_at_relay(
     let current: Value = prior_event
         .and_then(|event| serde_json::from_str::<Value>(&event.content).ok())
         .unwrap_or(Value::Null);
-    let current_avatar_url = current
-        .get("picture")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    if normalized_avatar_url(current_avatar_url.as_deref())
-        != normalized_avatar_url(expected_avatar_url.as_deref())
-    {
-        return Err("profile avatar changed before deferred save".to_string());
+    if expected_avatar_url.is_some() {
+        let current_avatar_url = current
+            .get("picture")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        if normalized_avatar_url(current_avatar_url.as_deref())
+            != normalized_avatar_url(expected_avatar_url.as_deref())
+        {
+            return Err("profile avatar changed before deferred save".to_string());
+        }
     }
 
-    let builder = build_deferred_profile_event(&current, &avatar_url, prior_event)?;
+    let builder = build_scoped_profile_event(
+        &current,
+        display_name.as_deref(),
+        name.as_deref(),
+        avatar_url.as_deref(),
+        prior_event,
+    )?;
     submit_event_at_with_keys(builder, &state, &api_base_url, &signer).await?;
 
     let events = query_relay_at_with_keys(&state, &api_base_url, &[filter], &signer, None).await?;
@@ -150,22 +160,31 @@ pub async fn update_profile_at_relay(
         .unwrap_or_else(|| empty_profile_info(&expected_pubkey)))
 }
 
-fn build_deferred_profile_event(
+fn build_scoped_profile_event(
     current: &Value,
-    avatar_url: &str,
+    display_name: Option<&str>,
+    name: Option<&str>,
+    avatar_url: Option<&str>,
     prior_event: Option<&nostr::Event>,
 ) -> Result<nostr::EventBuilder, String> {
-    let display_name = current.get("display_name").and_then(Value::as_str);
-    let name = current.get("name").and_then(Value::as_str);
+    let display_name = normalized_profile_field(display_name)
+        .or_else(|| current.get("display_name").and_then(Value::as_str));
+    let name =
+        normalized_profile_field(name).or_else(|| current.get("name").and_then(Value::as_str));
+    let picture = normalized_profile_field(avatar_url)
+        .or_else(|| current.get("picture").and_then(Value::as_str));
     let about = current.get("about").and_then(Value::as_str);
     let nip05 = current.get("nip05").and_then(Value::as_str);
 
     Ok(
-        events::build_profile(display_name, name, Some(avatar_url), about, nip05)?
-            .custom_created_at(monotonic_created_at(
-                prior_event.map(|event| event.created_at.as_secs() as i64),
-            )),
+        events::build_profile(display_name, name, picture, about, nip05)?.custom_created_at(
+            monotonic_created_at(prior_event.map(|event| event.created_at.as_secs() as i64)),
+        ),
     )
+}
+
+fn normalized_profile_field(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
 }
 
 fn capture_expected_signer(state: &AppState, expected_pubkey: &str) -> Result<nostr::Keys, String> {
@@ -453,9 +472,11 @@ mod tests {
         .sign_with_keys(&keys)
         .expect("sign prior profile");
 
-        let builder = build_deferred_profile_event(
+        let builder = build_scoped_profile_event(
             &serde_json::json!({"display_name": "Larry"}),
-            "https://example.com/avatar.png",
+            None,
+            None,
+            Some("https://example.com/avatar.png"),
             Some(&prior_event),
         )
         .expect("build deferred profile");

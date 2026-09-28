@@ -61,10 +61,7 @@ pub(crate) fn validate_builderlab_api_base_url(raw: &str) -> Result<String, Stri
     validate_api_base_url(raw, ApiBaseUrlKind::Builderlab)
 }
 
-pub(crate) fn resolve_builderlab_api_base_url(
-    configured: Option<&str>,
-    _enterprise_relays: Option<&str>,
-) -> Result<String, String> {
+pub(crate) fn resolve_builderlab_api_base_url(configured: Option<&str>) -> Result<String, String> {
     if let Some(configured) = configured {
         return validate_builderlab_api_base_url(configured);
     }
@@ -101,17 +98,8 @@ mod tests {
     #[test]
     fn configured_builderlab_api_base_url_normalizes_trailing_slash() {
         assert_eq!(
-            resolve_builderlab_api_base_url(Some(" https://login.example/api/goose/ "), None)
-                .unwrap(),
+            resolve_builderlab_api_base_url(Some(" https://login.example/api/goose/ ")).unwrap(),
             "https://login.example/api/goose",
-        );
-    }
-
-    #[test]
-    fn hosted_builderlab_api_keeps_default_when_enterprise_auth_uses_separate_adapter() {
-        assert_eq!(
-            resolve_builderlab_api_base_url(None, Some("wss://buzz.block.example")).unwrap(),
-            DEFAULT_BUILDERLAB_API_BASE_URL,
         );
     }
 

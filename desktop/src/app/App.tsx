@@ -67,7 +67,7 @@ import { createBuzzQueryClient } from "@/shared/api/queryClient";
 import { hydrateChannelHeads } from "@/features/messages/lib/channelHeadCache";
 import { useIdentityQuery } from "@/shared/api/hooks";
 import { isSharedIdentity as isSharedIdentityCmd } from "@/shared/api/tauri";
-import { getProfile, updateProfile } from "@/shared/api/tauriProfiles";
+import { getProfile, updateProfileAtRelay } from "@/shared/api/tauriProfiles";
 import {
   type AddCommunityDeepLinkPayload,
   listenForDeepLinks,
@@ -548,6 +548,21 @@ function CommunityApp({
   const enterpriseProfile = community.isReady
     ? community.enterpriseProfile
     : null;
+  const identityPubkey = community.isReady ? community.identityPubkey : null;
+  useEffect(() => {
+    if (
+      !transaction ||
+      transaction.stage !== "connecting" ||
+      !("error" in community) ||
+      !community.error
+    ) {
+      return;
+    }
+    communityOnboarding.update(
+      { stage: "corporate-profile", error: community.error },
+      transaction.id,
+    );
+  }, [community, communityOnboarding, transaction]);
   useEffect(() => {
     if (transaction?.stage !== "connecting" || !targetIsReady) return;
     const transactionId = transaction.id;
@@ -556,7 +571,24 @@ function CommunityApp({
     profileCheckTransactionRef.current = transactionId;
 
     if (enterpriseProfile) {
-      void updateProfile({
+      if (!identityPubkey) {
+        communityOnboarding.update(
+          {
+            stage: "corporate-profile",
+            error:
+              "Could not save your corporate profile because the active identity is unavailable",
+          },
+          transactionId,
+        );
+        return;
+      }
+      communityOnboarding.update(
+        { stage: "corporate-profile", error: undefined },
+        transactionId,
+      );
+      void updateProfileAtRelay({
+        relayUrl,
+        expectedPubkey: identityPubkey,
         displayName: enterpriseProfile.displayName,
         name: enterpriseProfile.username,
       })
@@ -617,6 +649,7 @@ function CommunityApp({
     transaction?.id,
     transaction?.relayUrl,
     enterpriseProfile,
+    identityPubkey,
   ]);
   // During "entering" the transaction stays alive as a curtain: the app mounts
   // underneath (already pointed at the Welcome channel route) while the

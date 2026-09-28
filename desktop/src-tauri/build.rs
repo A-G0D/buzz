@@ -142,7 +142,6 @@ fn main() {
         std::env::var("BUZZ_BUILD_BUILDERLAB_API_BASE_URL")
             .ok()
             .as_deref(),
-        enterprise_auth_relays.as_deref(),
     )
     .unwrap_or_else(|error| panic!("{error}"));
     println!(

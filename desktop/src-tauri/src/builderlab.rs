@@ -1,8 +1,4 @@
-use std::{
-    collections::{HashMap, VecDeque},
-    sync::Mutex,
-    time::Duration,
-};
+use std::{collections::HashMap, sync::Mutex, time::Duration};
 
 use axum::{
     extract::{Path, Query, State as AxumState},
@@ -17,8 +13,6 @@ use tokio::{net::TcpListener, sync::oneshot};
 use url::Url;
 
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
-const BUILDERLAB_LOGIN_ATTEMPT_PREFIX: &str = "builderlab-login-";
-const CANCELED_LOGIN_ATTEMPT_TOMBSTONE_LIMIT: usize = 64;
 const BB_SESSION_CREDENTIAL_HEADER: &str = "X-BB-Session-Credential";
 // Builderlab enforces an Origin check on the identity bind endpoints. Browsers
 // attach this automatically; the desktop reqwest client must set it explicitly
@@ -152,7 +146,6 @@ pub(crate) struct BuilderlabLogin(Mutex<BuilderlabLoginState>);
 #[derive(Default)]
 struct BuilderlabLoginState {
     pending: Option<PendingLogin>,
-    canceled_attempts: VecDeque<String>,
 }
 
 struct PendingLogin {
@@ -168,8 +161,6 @@ struct StoredSession {
 struct LoginExchangeResponse {
     session_credential: String,
     expires_at: String,
-    username: Option<String>,
-    name: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -177,16 +168,12 @@ struct LoginExchangeResponse {
 pub(crate) struct BuilderlabAuthInfo {
     expires_at: String,
     email: Option<String>,
-    username: Option<String>,
-    name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct AuthMeResponse {
     email: Option<String>,
     expires_at: String,
-    username: Option<String>,
-    name: Option<String>,
 }
 
 struct CallbackState {
@@ -253,27 +240,6 @@ fn login_exchange_body(code: &str) -> serde_json::Value {
     serde_json::json!({ "code": code })
 }
 
-fn remember_canceled_attempt(state: &mut BuilderlabLoginState, attempt_id: String) {
-    if state
-        .canceled_attempts
-        .iter()
-        .any(|canceled| canceled == &attempt_id)
-    {
-        return;
-    }
-    if state.canceled_attempts.len() >= CANCELED_LOGIN_ATTEMPT_TOMBSTONE_LIMIT {
-        state.canceled_attempts.pop_front();
-    }
-    state.canceled_attempts.push_back(attempt_id);
-}
-
-fn is_canceled_attempt(state: &BuilderlabLoginState, attempt_id: &str) -> bool {
-    state
-        .canceled_attempts
-        .iter()
-        .any(|canceled| canceled == attempt_id)
-}
-
 fn clear_matching_pending_login(login: &BuilderlabLogin, login_id: &str) -> Result<(), String> {
     let mut state = login.0.lock().map_err(|error| error.to_string())?;
     if state
@@ -290,30 +256,16 @@ fn register_pending_builderlab_login(
     login: &BuilderlabLogin,
     login_id: &str,
     cancel: oneshot::Sender<()>,
-    is_guarded_attempt: bool,
-) -> Result<bool, String> {
+) -> Result<(), String> {
     let mut state = login.0.lock().map_err(|error| error.to_string())?;
-    if is_guarded_attempt && is_canceled_attempt(&state, login_id) {
-        return Ok(false);
-    }
-    if state.pending.is_some() {
-        if is_guarded_attempt
-            && !state
-                .pending
-                .as_ref()
-                .is_some_and(|pending| pending.id.starts_with(BUILDERLAB_LOGIN_ATTEMPT_PREFIX))
-        {
-            return Err("Builderlab authentication is already in progress".to_owned());
-        }
-        if let Some(previous) = state.pending.take() {
-            let _ = previous.cancel.send(());
-        }
+    if let Some(previous) = state.pending.take() {
+        let _ = previous.cancel.send(());
     }
     state.pending = Some(PendingLogin {
         id: login_id.to_owned(),
         cancel,
     });
-    Ok(true)
+    Ok(())
 }
 
 fn commit_builderlab_login_session(
@@ -390,7 +342,6 @@ pub(crate) async fn start_builderlab_login(
     app_state: tauri::State<'_, crate::app_state::AppState>,
     session: tauri::State<'_, BuilderlabSession>,
     login: tauri::State<'_, BuilderlabLogin>,
-    attempt_id: Option<String>,
 ) -> Result<BuilderlabAuthInfo, String> {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -413,21 +364,11 @@ pub(crate) async fn start_builderlab_login(
         let _ = axum::serve(listener, router).await;
     });
 
-    let login_id = attempt_id
-        .clone()
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let is_guarded_attempt = attempt_id.is_some();
+    let login_id = uuid::Uuid::new_v4().to_string();
     let (cancel_sender, mut cancel_receiver) = oneshot::channel();
-    match register_pending_builderlab_login(&login, &login_id, cancel_sender, is_guarded_attempt) {
-        Ok(true) => {}
-        Ok(false) => {
-            server.abort();
-            return Err("Builderlab authentication canceled".to_owned());
-        }
-        Err(error) => {
-            server.abort();
-            return Err(error);
-        }
+    if let Err(error) = register_pending_builderlab_login(&login, &login_id, cancel_sender) {
+        server.abort();
+        return Err(error);
     }
 
     let login_url = match login_url(&return_to) {
@@ -537,9 +478,6 @@ pub(crate) async fn start_builderlab_login(
     let info = BuilderlabAuthInfo {
         expires_at: me.expires_at.clone(),
         email: me.email,
-        username: normalized_auth_field(me.username)
-            .or_else(|| normalized_auth_field(exchanged.username)),
-        name: normalized_auth_field(me.name).or_else(|| normalized_auth_field(exchanged.name)),
     };
     commit_builderlab_login_session(&login, &session, &login_id, exchanged.session_credential)?;
     Ok(info)
@@ -563,8 +501,6 @@ pub(crate) async fn get_builderlab_auth(
         Ok(me) => Ok(Some(BuilderlabAuthInfo {
             expires_at: me.expires_at,
             email: me.email,
-            username: normalized_auth_field(me.username),
-            name: normalized_auth_field(me.name),
         })),
         Err(error) => {
             *session
@@ -576,39 +512,20 @@ pub(crate) async fn get_builderlab_auth(
     }
 }
 
-fn normalized_auth_field(value: Option<String>) -> Option<String> {
-    let value = value?;
-    let trimmed = value.trim();
-    (!trimmed.is_empty()).then(|| trimmed.to_owned())
-}
-
-fn cancel_builderlab_login_attempt(
-    login: &BuilderlabLogin,
-    attempt_id: Option<&str>,
-) -> Result<bool, String> {
+fn cancel_builderlab_login_attempt(login: &BuilderlabLogin) -> Result<bool, String> {
     let mut state = login.0.lock().map_err(|error| error.to_string())?;
-    if let Some(attempt_id) = attempt_id {
-        remember_canceled_attempt(&mut state, attempt_id.to_owned());
-    }
-    let should_cancel = match (state.pending.as_ref(), attempt_id) {
-        (Some(login), Some(attempt_id)) => login.id == attempt_id,
-        (Some(_), None) => true,
-        (None, _) => false,
+    let Some(pending) = state.pending.take() else {
+        return Ok(false);
     };
-    if should_cancel {
-        if let Some(pending) = state.pending.take() {
-            let _ = pending.cancel.send(());
-        }
-    }
-    Ok(should_cancel)
+    let _ = pending.cancel.send(());
+    Ok(true)
 }
 
 #[tauri::command]
 pub(crate) fn cancel_builderlab_login(
     login: tauri::State<'_, BuilderlabLogin>,
-    attempt_id: Option<String>,
 ) -> Result<(), String> {
-    cancel_builderlab_login_attempt(&login, attempt_id.as_deref()).map(|_| ())
+    cancel_builderlab_login_attempt(&login).map(|_| ())
 }
 
 #[tauri::command]
@@ -852,75 +769,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cancel_with_attempt_id_only_cancels_matching_pending_login() {
-        let login = BuilderlabLogin::default();
-        let (cancel, mut receiver) = oneshot::channel();
-        login.0.lock().unwrap().pending = Some(PendingLogin {
-            id: "attempt-a".to_owned(),
-            cancel,
-        });
-
-        assert!(!cancel_builderlab_login_attempt(&login, Some("attempt-b")).unwrap());
-        assert!(login.0.lock().unwrap().pending.is_some());
-        assert!(receiver.try_recv().is_err());
-
-        assert!(cancel_builderlab_login_attempt(&login, Some("attempt-a")).unwrap());
-        assert!(login.0.lock().unwrap().pending.is_none());
-        assert!(receiver.try_recv().is_ok());
-    }
-
-    #[test]
-    fn cancel_before_registration_tombstones_builderlab_attempt() {
-        let login = BuilderlabLogin::default();
-        assert!(!cancel_builderlab_login_attempt(&login, Some("builderlab-login-a")).unwrap());
-
-        let (cancel, _receiver) = oneshot::channel();
-        assert!(
-            !register_pending_builderlab_login(&login, "builderlab-login-a", cancel, true,)
-                .unwrap()
-        );
-        assert!(login.0.lock().unwrap().pending.is_none());
-    }
-
-    #[test]
-    fn cancel_before_registration_does_not_block_legacy_attempts() {
-        let login = BuilderlabLogin::default();
-        assert!(!cancel_builderlab_login_attempt(&login, Some("legacy-flow")).unwrap());
-
-        let (cancel, _receiver) = oneshot::channel();
-        assert!(register_pending_builderlab_login(&login, "legacy-flow", cancel, false).unwrap());
-        assert_eq!(
-            login
-                .0
-                .lock()
-                .unwrap()
-                .pending
-                .as_ref()
-                .map(|pending| pending.id.as_str()),
-            Some("legacy-flow"),
-        );
-    }
-
-    #[test]
-    fn canceled_attempt_tombstones_are_bounded() {
-        let login = BuilderlabLogin::default();
-        for index in 0..(CANCELED_LOGIN_ATTEMPT_TOMBSTONE_LIMIT + 5) {
-            let attempt_id = format!("builderlab-login-{index}");
-            assert!(!cancel_builderlab_login_attempt(&login, Some(&attempt_id)).unwrap());
-        }
-
-        let state = login.0.lock().unwrap();
-        assert_eq!(
-            state.canceled_attempts.len(),
-            CANCELED_LOGIN_ATTEMPT_TOMBSTONE_LIMIT,
-        );
-        assert_eq!(
-            state.canceled_attempts.front().map(String::as_str),
-            Some("builderlab-login-5"),
-        );
-    }
-
-    #[test]
     fn stale_attempt_cannot_commit_session_after_replacement() {
         let login = BuilderlabLogin::default();
         let session = BuilderlabSession::default();
@@ -996,7 +844,7 @@ mod tests {
             cancel,
         });
 
-        assert!(cancel_builderlab_login_attempt(&login, None).unwrap());
+        assert!(cancel_builderlab_login_attempt(&login).unwrap());
         assert!(login.0.lock().unwrap().pending.is_none());
         assert!(receiver.try_recv().is_ok());
     }
@@ -1026,54 +874,6 @@ mod tests {
             "https://app.builderlab.xyz"
         );
         assert_eq!(login.path(), "/api/goose/v1/auth/login");
-    }
-
-    #[test]
-    fn blank_identity_profile_fields_normalize_to_none() {
-        assert_eq!(normalized_auth_field(Some("  ".to_owned())), None);
-        assert_eq!(
-            normalized_auth_field(Some(" seiler ".to_owned())),
-            Some("seiler".to_owned())
-        );
-    }
-
-    #[test]
-    fn builderlab_auth_json_uses_username_and_name_fields() {
-        let exchange: LoginExchangeResponse = serde_json::from_value(serde_json::json!({
-            "session_credential": "credential",
-            "expires_at": "2099-01-01T00:00:00Z",
-            "username": "seiler",
-            "name": "Brad Seiler",
-        }))
-        .unwrap();
-        assert_eq!(exchange.username.as_deref(), Some("seiler"));
-        assert_eq!(exchange.name.as_deref(), Some("Brad Seiler"));
-
-        let me: AuthMeResponse = serde_json::from_value(serde_json::json!({
-            "email": "brad@example.com",
-            "expires_at": "2099-01-01T00:00:00Z",
-            "username": "seiler",
-            "name": "Brad Seiler",
-        }))
-        .unwrap();
-        assert_eq!(me.username.as_deref(), Some("seiler"));
-        assert_eq!(me.name.as_deref(), Some("Brad Seiler"));
-
-        let info = BuilderlabAuthInfo {
-            expires_at: "2099-01-01T00:00:00Z".to_owned(),
-            email: Some("brad@example.com".to_owned()),
-            username: Some("seiler".to_owned()),
-            name: Some("Brad Seiler".to_owned()),
-        };
-        assert_eq!(
-            serde_json::to_value(info).unwrap(),
-            serde_json::json!({
-                "email": "brad@example.com",
-                "expiresAt": "2099-01-01T00:00:00Z",
-                "username": "seiler",
-                "name": "Brad Seiler",
-            })
-        );
     }
 
     #[test]

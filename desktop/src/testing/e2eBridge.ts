@@ -12935,13 +12935,21 @@ export function maybeInstallE2eTauriMocks() {
           payload as Parameters<typeof handleUpdateProfile>[0],
           activeConfig,
         );
-      case "update_profile_at_relay":
+      case "update_profile_at_relay": {
+        const input = payload as {
+          avatarUrl?: string | null;
+          displayName?: string | null;
+          name?: string | null;
+        };
         return handleUpdateProfile(
           {
-            avatarUrl: (payload as { avatarUrl: string }).avatarUrl,
+            avatarUrl: input.avatarUrl ?? undefined,
+            displayName: input.displayName ?? undefined,
+            name: input.name ?? undefined,
           },
           activeConfig,
         );
+      }
       case "get_user_profile":
         return handleGetUserProfile(
           (payload as Parameters<typeof handleGetUserProfile>[0]) ?? {},
