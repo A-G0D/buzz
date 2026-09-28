@@ -395,6 +395,33 @@ pub async fn resolve_join<D: HuddleDirectory + ?Sized>(
 const OWNER_READY_RETRY_INTERVAL: Duration = Duration::from_millis(20);
 const OWNER_READY_MAX_ATTEMPTS: u32 = 25;
 
+/// Elapsed-time budget for the retry loop, checked only between attempts so an
+/// in-flight attempt (and any lease CAS inside it) is never cut off.
+const OWNER_READY_BUDGET: Duration = Duration::from_secs(2);
+
+/// Worst case of one [`resolve_join`] against the production directory, built
+/// from each await's own bound: Redis pool checkout, the driver's 500 ms
+/// command response timeout, and the serving-write lease SQL bound.
+/// `owner_of` + `acquire` (begin lease, checkout, verify, CAS, verify, finish)
+/// + `validate`.
+#[cfg(test)]
+const RESOLVE_ATTEMPT_WORST_CASE: Duration = {
+    const POOL: Duration = crate::tunnel::directory::POOL_CHECKOUT_TIMEOUT;
+    const REDIS_COMMAND: Duration = Duration::from_millis(500);
+    const LEASE_SQL: Duration = buzz_db::deletion::SERVING_WRITE_LEASE_SQL_TIMEOUT;
+    let redis = POOL.saturating_add(REDIS_COMMAND);
+    redis
+        .saturating_add(LEASE_SQL.saturating_mul(4).saturating_add(redis))
+        .saturating_add(redis)
+};
+
+/// Worst case of [`resolve_join_owner_ready`]: the retry budget plus one
+/// attempt that started just before it ran out. This bounds how long the audio
+/// lease permit can delay NIP-FI expiry quiescence.
+#[cfg(test)]
+pub(crate) const OWNER_READY_WORST_CASE: Duration =
+    OWNER_READY_BUDGET.saturating_add(RESOLVE_ATTEMPT_WORST_CASE);
+
 /// Resolve a join and, on the steady-state `LocalOwner` reuse arm, ensure a
 /// live owner renewer actually exists before the caller admits a local owner
 /// peer.
@@ -429,6 +456,7 @@ pub async fn resolve_join_owner_ready<D: HuddleDirectory + ?Sized>(
     local_runtime_id: RuntimeId,
     owners: &HuddleOwnerRegistry,
 ) -> Result<ResolvedJoin, MeshError> {
+    let budget_end = tokio::time::Instant::now() + OWNER_READY_BUDGET;
     for _ in 0..OWNER_READY_MAX_ATTEMPTS {
         let resolved = resolve_join(directory, community_id, session_id, local_runtime_id).await?;
 
@@ -443,6 +471,9 @@ pub async fn resolve_join_owner_ready<D: HuddleDirectory + ?Sized>(
                 // Ambiguous window: winner not yet attached (or room released
                 // underneath us). Wait and re-resolve — the retry either finds
                 // the installed entry or wins a fresh CAS.
+                if tokio::time::Instant::now() + OWNER_READY_RETRY_INTERVAL >= budget_end {
+                    break;
+                }
                 tokio::time::sleep(OWNER_READY_RETRY_INTERVAL).await;
             }
             _ => return Ok(resolved),
@@ -2271,6 +2302,15 @@ mod tests {
 
     fn community() -> CommunityId {
         CommunityId::from_uuid(Uuid::from_u128(0xC0FFEE))
+    }
+
+    /// Pins the expiry-to-quiescence bound the audio lease permit can impose:
+    /// one attempt is 12.5 s (Redis 1.5 s ×3 + lease SQL 2 s ×4), plus the
+    /// 2 s retry budget. Raising any per-await bound must revisit this number.
+    #[test]
+    fn owner_ready_worst_case_is_bounded() {
+        assert_eq!(RESOLVE_ATTEMPT_WORST_CASE, Duration::from_millis(12_500));
+        assert_eq!(OWNER_READY_WORST_CASE, Duration::from_millis(14_500));
     }
 
     #[test]

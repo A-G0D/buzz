@@ -198,6 +198,10 @@ make_hook!(audio_add_peer_hook, after_add_peer);
 // before the effect permit that covers join-owner resolution. Cancelling here
 // proves the resolver (and its lease CAS) never runs without a permit.
 make_hook!(audio_lease_permit_hook, before_lease_permit);
+// `after_directory_acquire`: fires in `SessionDirectory::acquire` after the
+// fenced Redis write and before the serving-write bookkeeping release, so a
+// test can stall that release after the CAS has landed.
+make_hook!(directory_acquire_hook, after_directory_acquire);
 // `before_archive_recheck`: fires in `commit_participant_join` immediately
 // after the `SELECT archived_at ... FOR UPDATE` row lock is acquired and the
 // snapshot value is read, but before the archived check / any write. At this

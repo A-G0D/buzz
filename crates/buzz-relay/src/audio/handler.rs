@@ -9711,6 +9711,176 @@ mod tests {
             server.abort();
         }
 
+        // ── I1 witness: stalled lease SQL under the permit stays bounded ───────
+        //
+        // Real handler, real `SessionDirectory` (Redis + durable serving-write
+        // lease). After the Redis CAS lands, the test row-locks the bookkeeping
+        // lease row so `finish()`'s DELETE stalls inside the audio lease permit,
+        // then lets the NIP-FI deadline pass. The lease statement bound ends the
+        // stall, the resolver keeps the won lease, expiry reaches quiescence
+        // within `OWNER_READY_WORST_CASE`, and the handler releases the Redis
+        // lease on its cancel exit.
+        //
+        // Mutation oracles:
+        //   a) drop BOTH the lease `SET LOCAL statement_timeout` and the client
+        //      SQL timeout → the DELETE waits on the row lock → the handler
+        //      never closes → RED (hang). Either bound alone keeps it green.
+        //   b) propagate the `finish()` error from `acquire` again → the won
+        //      lease handle is dropped → the Redis lease survives → RED.
+        #[tokio::test]
+        #[ignore = "requires Postgres — runs in postgres-ci nextest lane"]
+        async fn stalled_lease_sql_after_cas_reaches_quiescence_and_releases_lease() {
+            use crate::audio::join::{HuddleOwnerRegistry, OWNER_READY_WORST_CASE};
+            use chrono::{Duration, Utc};
+            use futures_util::StreamExt as _;
+            use std::sync::Arc;
+
+            let state = audio_test_state_real_db()
+                .await
+                .expect("PostgreSQL must be available");
+            let pool = state.db.pool().clone();
+            let (tenant, channel_id, key) = seed_audio_fixture(&pool).await;
+            let community = tenant.community();
+            let relay_url = format!("ws://{}", tenant.host());
+            let redis_url =
+                std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
+            let redis = deadpool_redis::Config::from_url(&redis_url)
+                .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+                .expect("redis pool");
+            let directory =
+                crate::tunnel::directory::SessionDirectory::with_db(redis, state.db.clone());
+            let mut mesh =
+                crate::mesh_boot::MeshHandle::for_test_only(Arc::new(HuddleOwnerRegistry::new()))
+                    .await;
+            mesh.directory = directory.clone();
+            state.mesh.set(mesh).map_err(|_| ()).expect("fresh mesh");
+
+            let deadline = Utc::now() + Duration::seconds(2);
+            let assertion =
+                buzz_auth::VerifiedAssertion::for_test(Some(key.public_key()), vec![deadline]);
+            let conn_cancel = tokio_util::sync::CancellationToken::new();
+            let (arrived_rx, release) =
+                crate::nip_fi_test_hooks::directory_acquire_hook::arm(community);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let app = axum::Router::new().route(
+                "/",
+                axum::routing::get({
+                    let (state, tenant, cancel) =
+                        (Arc::clone(&state), tenant.clone(), conn_cancel.clone());
+                    move |ws: axum::extract::ws::WebSocketUpgrade| {
+                        let (state, tenant, assertion) =
+                            (Arc::clone(&state), tenant.clone(), assertion.clone());
+                        let control = crate::state::CommunityConnectionControl::new(cancel.clone());
+                        async move {
+                            ws.on_upgrade(move |socket| async move {
+                                handle_active_audio_connection(
+                                    socket,
+                                    state,
+                                    tenant,
+                                    channel_id,
+                                    control,
+                                    Some(assertion),
+                                    Utc::now(),
+                                    None,
+                                )
+                                .await
+                            })
+                        }
+                    }
+                }),
+            );
+            let server = tokio::spawn(async move { axum::serve(listener, app).await });
+            let (mut client, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/"))
+                .await
+                .expect("connect");
+            let challenge = match client.next().await {
+                Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t))) => {
+                    serde_json::from_str::<serde_json::Value>(&t).expect("json")["challenge"]
+                        .as_str()
+                        .expect("challenge")
+                        .to_string()
+                }
+                other => panic!("expected challenge; got {other:?}"),
+            };
+            let auth_event = nostr::EventBuilder::new(nostr::Kind::Authentication, "")
+                .tag(nostr::Tag::parse(["relay", &relay_url]).unwrap())
+                .tag(nostr::Tag::parse(["challenge", &challenge]).unwrap())
+                .sign_with_keys(&key)
+                .unwrap();
+            let auth_msg = serde_json::json!({
+                "type": "auth",
+                "event": auth_event,
+                "parent_channel_id": null,
+                "protocol_version": 1,
+            })
+            .to_string();
+            client
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    auth_msg.into(),
+                ))
+                .await
+                .expect("send auth");
+
+            tokio::time::timeout(std::time::Duration::from_secs(5), arrived_rx)
+                .await
+                .expect("CAS must land under the permit")
+                .expect("hook channel");
+            // Stall the bookkeeping release: hold the lease row's lock.
+            let mut blocker = pool.begin().await.expect("blocker tx");
+            let locked: Vec<uuid::Uuid> = sqlx::query_scalar(
+                "SELECT id FROM community_serving_write_leases \
+                 WHERE community_id = $1 FOR UPDATE",
+            )
+            .bind(community.as_uuid())
+            .fetch_all(&mut *blocker)
+            .await
+            .expect("lock lease row");
+            assert_eq!(locked.len(), 1, "exactly the acquire's lease row");
+            // Let the deadline pass while the permit is still held.
+            let wait = (deadline - Utc::now()).to_std().unwrap_or_default();
+            tokio::time::sleep(wait + std::time::Duration::from_millis(200)).await;
+
+            let stalled_at = std::time::Instant::now();
+            release.notify_one();
+            let mut frames = Vec::new();
+            let closed = tokio::time::timeout(OWNER_READY_WORST_CASE, async {
+                while let Some(Ok(message)) = client.next().await {
+                    if let tokio_tungstenite::tungstenite::Message::Text(t) = message {
+                        frames.push(t.to_string());
+                    }
+                }
+            })
+            .await;
+            let elapsed = stalled_at.elapsed();
+            assert!(
+                closed.is_ok(),
+                "handler must quiesce within OWNER_READY_WORST_CASE ({OWNER_READY_WORST_CASE:?})"
+            );
+            assert!(
+                elapsed >= std::time::Duration::from_millis(1000),
+                "the release must actually have stalled; took {elapsed:?}"
+            );
+            let denial = serde_json::json!({
+                "type": "restricted",
+                "message": buzz_auth::DenialClass::AuthorizationDenied.nostr_text()
+            })
+            .to_string();
+            assert_eq!(frames, vec![denial], "exactly one canonical expiry denial");
+            assert!(
+                directory
+                    .lookup(community, channel_id)
+                    .await
+                    .expect("lookup")
+                    .is_none(),
+                "the won Redis lease must be released on the expiry exit"
+            );
+            blocker.rollback().await.expect("rollback blocker");
+            server.abort();
+        }
+
         // ── F4b relay-membership denial wire frame ────────────────────────────
         //
         // When `require_relay_membership = true` and the connecting pubkey is NOT

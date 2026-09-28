@@ -13,6 +13,8 @@ use redis::Script;
 use uuid::Uuid;
 
 const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(30);
+/// Bound on one Redis pool checkout (wait, create, or recycle).
+pub(crate) const POOL_CHECKOUT_TIMEOUT: Duration = Duration::from_secs(1);
 
 const ACQUIRE_SCRIPT: &str = r#"
 local lease_key = KEYS[1]
@@ -210,6 +212,20 @@ impl SessionDirectory {
         }
     }
 
+    /// Check out a Redis connection within [`POOL_CHECKOUT_TIMEOUT`].
+    ///
+    /// Callers may hold a session effect permit, so an exhausted pool must end
+    /// as an ordinary error rather than an indefinite wait.
+    async fn connection(&self) -> Result<deadpool_redis::Connection, deadpool_redis::PoolError> {
+        self.pool
+            .timeout_get(&deadpool_redis::Timeouts {
+                wait: Some(POOL_CHECKOUT_TIMEOUT),
+                create: Some(POOL_CHECKOUT_TIMEOUT),
+                recycle: Some(POOL_CHECKOUT_TIMEOUT),
+            })
+            .await
+    }
+
     async fn begin_serving_write(
         &self,
         community_id: CommunityId,
@@ -238,7 +254,7 @@ impl SessionDirectory {
         let serving_write = self.begin_serving_write(community_id).await?;
         let keys = SessionKeys::new(community_id, session_id);
         let ttl_ms = ttl_ms(self.lease_ttl)?;
-        let mut conn = self.pool.get().await?;
+        let mut conn = self.connection().await?;
         let mutation = async {
             Script::new(ACQUIRE_SCRIPT)
                 .key(&keys.lease)
@@ -257,11 +273,15 @@ impl SessionDirectory {
             None => mutation.await?,
         };
         let lease = parse_lease(community_id, session_id, &value)?;
+        #[cfg(test)]
+        crate::nip_fi_test_hooks::after_directory_acquire(community_id).await;
         if let Some(guard) = serving_write {
-            guard
-                .finish()
-                .await
-                .map_err(|error| DirectoryError::CommunityWriteFenced(error.to_string()))?;
+            // The Redis write already landed under a verified fence, so failing
+            // to delete the bookkeeping row must not drop the lease handle: the
+            // caller owns and releases it. A row left behind self-expires.
+            if let Err(error) = guard.finish().await {
+                tracing::warn!(%community_id, %session_id, "serving write lease release failed after acquire: {error}");
+            }
         }
         match status.as_str() {
             "acquired" => Ok(AcquireResult::Acquired(lease)),
@@ -293,7 +313,7 @@ impl SessionDirectory {
         let serving_write = self.begin_serving_write(lease.community_id).await?;
         let keys = SessionKeys::new(lease.community_id, lease.session_id);
         let ttl_ms = ttl_ms(self.lease_ttl)?;
-        let mut conn = self.pool.get().await?;
+        let mut conn = self.connection().await?;
         let mutation = async {
             Script::new(RENEW_SCRIPT)
                 .key(&keys.lease)
@@ -339,7 +359,7 @@ impl SessionDirectory {
     pub async fn release(&self, lease: &SessionLease) -> Result<ReleaseResult, DirectoryError> {
         let serving_write = self.begin_serving_write(lease.community_id).await?;
         let keys = SessionKeys::new(lease.community_id, lease.session_id);
-        let mut conn = self.pool.get().await?;
+        let mut conn = self.connection().await?;
         let mutation = async {
             Script::new(RELEASE_SCRIPT)
                 .key(&keys.lease)
@@ -386,7 +406,7 @@ impl SessionDirectory {
         session_id: Uuid,
     ) -> Result<Option<SessionLease>, DirectoryError> {
         let keys = SessionKeys::new(community_id, session_id);
-        let mut conn = self.pool.get().await?;
+        let mut conn = self.connection().await?;
         let value: Option<String> = redis::cmd("GET")
             .arg(&keys.lease)
             .query_async(&mut *conn)
@@ -404,7 +424,7 @@ impl SessionDirectory {
         session_id: Uuid,
     ) -> Result<Option<u64>, DirectoryError> {
         let keys = SessionKeys::new(community_id, session_id);
-        let mut conn = self.pool.get().await?;
+        let mut conn = self.connection().await?;
         let value: Option<String> = redis::cmd("GET")
             .arg(&keys.generation)
             .query_async(&mut *conn)
@@ -429,8 +449,7 @@ impl SessionDirectory {
     ) -> Result<(), MeshError> {
         let keys = SessionKeys::new(community_id, fenced.session_id);
         let mut conn = self
-            .pool
-            .get()
+            .connection()
             .await
             .map_err(|e| MeshError::Transport(format!("redis pool: {e}")))?;
         let (lease_value, known_generation): (String, String) = Script::new(VALIDATE_SCRIPT)
