@@ -969,9 +969,14 @@ impl DeletionStore {
 
     /// Read one request.
     pub async fn get(&self, request_id: Uuid) -> Result<DeletionRequest> {
+        let mut conn = crate::observability::acquire_writer(
+            &self.pool,
+            crate::observability::WriterOperation::Authorization,
+        )
+        .await?;
         let row = sqlx::query("SELECT * FROM community_deletion_requests WHERE id = $1")
             .bind(request_id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *conn)
             .await?
             .ok_or_else(|| DbError::NotFound(format!("community deletion {request_id}")))?;
         row_to_request(row)
