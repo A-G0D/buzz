@@ -61,6 +61,15 @@ pub struct OwnedCommunityRecord {
     pub archived_at: Option<DateTime<Utc>>,
 }
 
+/// Owner-list rows plus the authoritative quota projection from one snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedCommunitiesPage {
+    pub communities: Vec<OwnedCommunityRecord>,
+    pub quota_used: i64,
+    pub quota_limit: i64,
+    pub can_create: bool,
+}
+
 /// Community row returned by an owner-authorized archive operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArchivedCommunityRecord {
@@ -206,13 +215,17 @@ impl Db {
     pub async fn list_communities_owned_by(
         &self,
         owner_pubkey: &str,
-    ) -> Result<Vec<OwnedCommunityRecord>> {
+    ) -> Result<OwnedCommunitiesPage> {
         let owner_pubkey = owner_pubkey.to_ascii_lowercase();
-        let mut connection = crate::observability::acquire_writer(
+        let connection = crate::observability::acquire_writer(
             &self.pool,
             crate::observability::WriterOperation::Authorization,
         )
         .await?;
+        let mut tx = sqlx::Transaction::begin(connection, None).await?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            .execute(&mut *tx)
+            .await?;
         let rows = sqlx::query(
             r#"
             SELECT c.id, c.host, c.created_at, c.archived_at
@@ -227,11 +240,11 @@ impl Db {
             ORDER BY c.created_at ASC, c.host ASC
             "#,
         )
-        .bind(owner_pubkey)
-        .fetch_all(&mut *connection)
+        .bind(&owner_pubkey)
+        .fetch_all(&mut *tx)
         .await?;
-
-        rows.into_iter()
+        let communities = rows
+            .into_iter()
             .map(|row| {
                 let id: Uuid = row.try_get("id")?;
                 let host: String = row.try_get("host")?;
@@ -244,7 +257,17 @@ impl Db {
                     archived_at,
                 })
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        let quota_used =
+            relay_members::owner_quota_used_in_transaction(&mut tx, &owner_pubkey).await?;
+        tx.commit().await?;
+        let quota_limit = relay_members::max_communities_per_owner();
+        Ok(OwnedCommunitiesPage {
+            communities,
+            quota_used,
+            quota_limit,
+            can_create: quota_used < quota_limit,
+        })
     }
 
     /// Returns the normalized host mapped to a community id, if the community
@@ -450,12 +473,8 @@ impl Db {
             let host: String = row.try_get("host")?;
 
             // Enforce the limit before inserting the new owner row.
-            let owned_count: i64 = sqlx::query_scalar(
-                "SELECT count(*) FROM relay_members WHERE pubkey = $1 AND role = 'owner'",
-            )
-            .bind(&owner_pubkey)
-            .fetch_one(&mut *tx)
-            .await?;
+            let owned_count =
+                relay_members::owner_quota_used_in_transaction(&mut tx, &owner_pubkey).await?;
 
             if owned_count >= relay_members::max_communities_per_owner() {
                 tx.rollback().await?;
@@ -793,6 +812,7 @@ mod postgres_tests {
             "EnsuredCommunityRecord",
             "CreatedCommunityRecord",
             "OwnedCommunityRecord",
+            "OwnedCommunitiesPage",
             "ArchivedCommunityRecord",
             "UnarchivedCommunityRecord",
         ];
@@ -1093,8 +1113,180 @@ mod postgres_tests {
             .await
             .expect("list owned communities");
 
-        assert_eq!(owned.len(), 1);
-        assert_eq!(owned[0].id, community_a);
+        assert_eq!(owned.communities.len(), 1);
+        assert_eq!(owned.communities[0].id, community_a);
+        assert_eq!(owned.quota_used, 1);
+        assert_eq!(
+            owned.quota_limit,
+            crate::relay_members::max_communities_per_owner()
+        );
+        assert!(owned.can_create);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn owner_quota_reservation_survives_purge_stages_and_releases_terminally() {
+        let db = setup_db().await;
+        let owner = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+        let host = format!("quota-reservation-{}.example", Uuid::new_v4().simple());
+        let created = db
+            .create_community_with_owner(&host, &owner)
+            .await
+            .expect("create owned community");
+        let CreateCommunityWithOwnerResult::Created(created) = created else {
+            panic!("expected created community")
+        };
+        let request_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO community_deletion_requests \
+             (id, community_id, community_host, requested_by, request_origin, owner_pubkey, \
+              mediating_operator_pubkey, acknowledgement_version) \
+             VALUES ($1, $2, $3, $4, 'owner', $4, $5, 1)",
+        )
+        .bind(request_id)
+        .bind(created.id.as_uuid())
+        .bind(&host)
+        .bind(&owner)
+        .bind("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        .execute(&db.pool)
+        .await
+        .expect("insert owner deletion request");
+
+        let pre_purge = db
+            .list_communities_owned_by(&owner)
+            .await
+            .expect("pre-purge quota");
+        assert!(
+            pre_purge.communities.is_empty(),
+            "pending row is suppressed"
+        );
+        assert_eq!(
+            pre_purge.quota_used, 1,
+            "membership and request deduplicate"
+        );
+
+        sqlx::query("DELETE FROM relay_members WHERE community_id = $1")
+            .bind(created.id.as_uuid())
+            .execute(&db.pool)
+            .await
+            .expect("simulate membership purge");
+        for stage in ["postgres_purged", "cache_purged", "logically_verified"] {
+            sqlx::query(
+                "UPDATE community_deletion_requests SET stage = $2, completed_at = NULL WHERE id = $1",
+            )
+            .bind(request_id)
+            .bind(stage)
+            .execute(&db.pool)
+            .await
+            .expect("advance quota fixture");
+            assert_eq!(
+                db.list_communities_owned_by(&owner)
+                    .await
+                    .expect("reserved quota")
+                    .quota_used,
+                1,
+                "{stage} must retain the slot"
+            );
+        }
+
+        sqlx::query(
+            "UPDATE community_deletion_requests \
+             SET stage = 'retention_pending', completed_at = now() WHERE id = $1",
+        )
+        .bind(request_id)
+        .execute(&db.pool)
+        .await
+        .expect("complete quota fixture");
+        assert_eq!(
+            db.list_communities_owned_by(&owner)
+                .await
+                .expect("released quota")
+                .quota_used,
+            0
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn owner_quota_serializes_concurrent_create_and_transfer_with_reservation() {
+        let db = setup_db().await;
+        let recipient = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+        let source_owner = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+
+        for index in 0..3 {
+            let host = format!("quota-live-{index}-{}.example", Uuid::new_v4().simple());
+            assert!(matches!(
+                db.create_community_with_owner(&host, &recipient)
+                    .await
+                    .expect("create live quota fixture"),
+                CreateCommunityWithOwnerResult::Created(_)
+            ));
+        }
+        let reserved_host = format!("quota-held-{}.example", Uuid::new_v4().simple());
+        let reserved = db
+            .create_community_with_owner(&reserved_host, &recipient)
+            .await
+            .expect("create reservation fixture");
+        let CreateCommunityWithOwnerResult::Created(reserved) = reserved else {
+            panic!("expected reservation community")
+        };
+        sqlx::query(
+            "INSERT INTO community_deletion_requests \
+             (id, community_id, community_host, requested_by, request_origin, owner_pubkey, \
+              mediating_operator_pubkey, acknowledgement_version) \
+             VALUES ($1, $2, $3, $4, 'owner', $4, $5, 1)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(reserved.id.as_uuid())
+        .bind(&reserved_host)
+        .bind(&recipient)
+        .bind("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        .execute(&db.pool)
+        .await
+        .expect("insert reservation");
+        sqlx::query("DELETE FROM relay_members WHERE community_id = $1")
+            .bind(reserved.id.as_uuid())
+            .execute(&db.pool)
+            .await
+            .expect("simulate purged membership");
+
+        let transfer_host = format!("quota-transfer-{}.example", Uuid::new_v4().simple());
+        let transfer_target = db
+            .create_community_with_owner(&transfer_host, &source_owner)
+            .await
+            .expect("create transfer target");
+        let CreateCommunityWithOwnerResult::Created(transfer_target) = transfer_target else {
+            panic!("expected transfer target")
+        };
+        let create_host = format!("quota-race-{}.example", Uuid::new_v4().simple());
+
+        let (create, transfer) = tokio::join!(
+            db.create_community_with_owner(&create_host, &recipient),
+            db.transfer_ownership(transfer_target.id, &recipient, &source_owner),
+        );
+        let create = create.expect("concurrent create result");
+        let transfer = transfer.expect("concurrent transfer result");
+        let create_won = matches!(create, CreateCommunityWithOwnerResult::Created(_));
+        let transfer_won = matches!(
+            transfer,
+            crate::relay_members::TransferResult::Transferred { .. }
+        );
+        assert_ne!(create_won, transfer_won, "exactly one owner grant may win");
+        assert!(
+            matches!(create, CreateCommunityWithOwnerResult::LimitReached) || create_won,
+            "create loser must observe the quota"
+        );
+        assert!(
+            matches!(transfer, crate::relay_members::TransferResult::LimitReached) || transfer_won,
+            "transfer loser must observe the quota"
+        );
+        assert_eq!(
+            db.list_communities_owned_by(&recipient)
+                .await
+                .expect("post-race quota")
+                .quota_used,
+            crate::relay_members::max_communities_per_owner()
+        );
     }
 
     #[tokio::test]

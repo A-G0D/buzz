@@ -5013,6 +5013,7 @@ mod postgres_tests {
             db.list_communities_owned_by(&owner)
                 .await
                 .expect("owner list")
+                .communities
                 .iter()
                 .all(|row| row.id != community),
             "accepted deletion requests must not remain actionable archived rows"
@@ -5069,6 +5070,14 @@ mod postgres_tests {
             .expect("privileged abort at the reversible submitted boundary");
         assert_eq!(aborted.stage, DeletionStage::Aborted);
         assert_eq!(aborted.aborted_by.as_deref(), Some("recovery-operator"));
+        assert_eq!(
+            db.list_communities_owned_by(&owner)
+                .await
+                .expect("quota after abort")
+                .quota_used,
+            1,
+            "abort releases the request reservation but preserved membership still counts"
+        );
 
         // Abort reverses deletion intent, not the owner's archive decision.
         let (deletion_state, archived_at): (String, Option<DateTime<Utc>>) =
@@ -5087,6 +5096,7 @@ mod postgres_tests {
             db.list_communities_owned_by(&owner)
                 .await
                 .expect("owner list after abort")
+                .communities
                 .iter()
                 .any(|row| row.id == community),
             "aborting the request must restore the owner's actionable archived row"

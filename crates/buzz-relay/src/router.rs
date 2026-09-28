@@ -335,6 +335,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             post(api::operator::delete_community),
         )
         .route(
+            "/operator/communities/delete/receipt",
+            post(api::operator::delete_community_receipt),
+        )
+        .route(
             "/operator/communities/availability",
             get(api::operator::community_availability),
         )

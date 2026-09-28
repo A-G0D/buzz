@@ -705,11 +705,12 @@ mod postgres_tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 52);
+        assert_eq!(migrations.len(), 53);
         assert_eq!(migrations[48].version, 49);
         assert_eq!(migrations[49].version, 50);
         assert_eq!(migrations[50].version, 51);
         assert_eq!(migrations[51].version, 52);
+        assert_eq!(migrations[52].version, 53);
         assert!(migrations[48]
             .sql
             .as_str()
@@ -718,6 +719,10 @@ mod postgres_tests {
             .sql
             .as_str()
             .contains("community_deletion_owner_provenance"));
+        assert!(migrations[52]
+            .sql
+            .as_str()
+            .contains("community_deletion_requests_owner_quota_reservations"));
         assert!(migrations[51].sql.as_str().contains("approval_origin"));
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
@@ -1744,6 +1749,32 @@ mod postgres_tests {
             assert!(sql.contains("community_deletion_requests_owner_preparable"));
             assert!(sql.contains("request_origin = 'owner'"));
             assert!(sql.contains("stage = 'submitted'"));
+        }
+        assert!(migration.contains("set local lock_timeout = '5s'"));
+    }
+
+    #[test]
+    fn owner_deletion_quota_reservation_index_matches_desired_schema() {
+        let migration = MIGRATOR
+            .iter()
+            .find(|migration| migration.version == 53)
+            .expect("embedded migration 0053")
+            .sql
+            .as_ref()
+            .to_ascii_lowercase();
+        let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("workspace root");
+        let schema = std::fs::read_to_string(workspace_root.join("schema/schema.sql"))
+            .expect("read schema/schema.sql")
+            .to_ascii_lowercase();
+
+        for sql in [&migration, &schema] {
+            assert!(sql.contains("community_deletion_requests_owner_quota_reservations"));
+            assert!(sql.contains("request_origin = 'owner'"));
+            assert!(sql.contains("stage <> 'aborted'"));
+            assert!(sql.contains("completed_at is null"));
         }
         assert!(migration.contains("set local lock_timeout = '5s'"));
     }

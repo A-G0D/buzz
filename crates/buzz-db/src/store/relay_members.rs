@@ -604,6 +604,38 @@ pub fn owner_count_advisory_lock_key(pubkey_hex: &str) -> i64 {
     h as i64
 }
 
+/// Count live ownership plus incomplete owner-deletion reservations.
+///
+/// `UNION` deliberately de-duplicates the live membership and deletion row
+/// before PostgreSQL purges membership. The reservation remains until the
+/// logical-completion transition records `completed_at`.
+pub(crate) async fn owner_quota_used_in_transaction(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    owner_pubkey: &str,
+) -> Result<i64> {
+    sqlx::query_scalar(
+        r#"
+        SELECT count(*)::BIGINT
+        FROM (
+            SELECT community_id
+            FROM relay_members
+            WHERE pubkey = $1 AND role = 'owner'
+            UNION
+            SELECT community_id
+            FROM community_deletion_requests
+            WHERE request_origin = 'owner'
+              AND owner_pubkey = $1
+              AND stage <> 'aborted'
+              AND completed_at IS NULL
+        ) quota_reservations
+        "#,
+    )
+    .bind(owner_pubkey)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(Into::into)
+}
+
 /// Atomically transfers ownership of `community` to `new_owner_pubkey`.
 ///
 /// Runs in a single transaction:
@@ -698,12 +730,7 @@ pub async fn transfer_ownership(
     // 4. Enforce the transferee's community ownership limit inside the same
     //    transaction that holds the advisory lock. This is the authoritative
     //    check — kgoose's preflight count is advisory only.
-    let owned_count: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM relay_members WHERE pubkey = $1 AND role = 'owner'",
-    )
-    .bind(&pubkey)
-    .fetch_one(&mut *tx)
-    .await?;
+    let owned_count = owner_quota_used_in_transaction(&mut tx, &pubkey).await?;
 
     if owned_count >= max_communities_per_owner() {
         tx.rollback().await?;

@@ -1309,6 +1309,12 @@ CREATE INDEX community_deletion_requests_owner_preparable
     WHERE request_origin = 'owner'
       AND stage = 'submitted'
       AND blocked_at IS NULL;
+CREATE INDEX community_deletion_requests_owner_quota_reservations
+    ON community_deletion_requests (owner_pubkey)
+    INCLUDE (community_id)
+    WHERE request_origin = 'owner'
+      AND stage <> 'aborted'
+      AND completed_at IS NULL;
 
 CREATE TABLE community_deletion_approvals (
     request_id UUID PRIMARY KEY,
