@@ -154,6 +154,11 @@ make_hook!(req_registration_hook, before_req_registration);
 make_hook!(count_query_hook, before_count_query);
 make_hook!(liveness_req_hook, before_liveness_req);
 make_hook!(observer_event_hook, before_observer_event);
+// `before_req_history` / `before_search_query`: fire inside the read-only
+// delivery raced against gate cancellation in `handle_req`, after the permit
+// (and, for REQ, registration). Stalling here stands in for a stalled read.
+make_hook!(req_history_hook, before_req_history);
+make_hook!(search_query_hook, before_search_query);
 
 // ── Audio NIP-42 verify_auth_event fence hook ──────────────────────────────
 // `before_auth_verify`: fires in `audio/handler.rs` immediately before the
