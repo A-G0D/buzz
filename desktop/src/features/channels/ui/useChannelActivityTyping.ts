@@ -38,6 +38,7 @@ export function useChannelActivityTyping({
   channelMembers,
   managedAgents,
   openThreadHeadId,
+  profileAgentPubkeys,
   relayAgents,
   typingEntries,
 }: {
@@ -46,6 +47,7 @@ export function useChannelActivityTyping({
   channelMembers?: ChannelMember[];
   managedAgents: ManagedAgent[];
   openThreadHeadId: string | null;
+  profileAgentPubkeys?: ReadonlySet<string>;
   relayAgents: RelayAgent[];
   typingEntries: TypingIndicatorEntry[];
 }) {
@@ -54,9 +56,10 @@ export function useChannelActivityTyping({
       buildChannelAgentSessionCandidates({
         channelMembers,
         managedAgents,
+        profileAgentPubkeys,
         relayAgents,
       }),
-    [channelMembers, managedAgents, relayAgents],
+    [channelMembers, managedAgents, profileAgentPubkeys, relayAgents],
   );
   const channelAgentSessionAgents = React.useMemo(
     () =>

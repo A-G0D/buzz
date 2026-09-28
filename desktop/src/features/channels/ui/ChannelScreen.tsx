@@ -344,6 +344,15 @@ export function ChannelScreen({
   const messageProfilesQuery = useUsersBatchQuery(messageProfilePubkeys, {
     enabled: messageProfilePubkeys.length > 0,
   });
+  const profileAgentPubkeys = React.useMemo(
+    () =>
+      new Set(
+        Object.entries(messageProfilesQuery.data?.profiles ?? {})
+          .filter(([, profile]) => profile.isAgent)
+          .map(([pubkey]) => normalizePubkey(pubkey)),
+      ),
+    [messageProfilesQuery.data?.profiles],
+  );
   const agentPubkeysPending =
     activeChannel?.channelType === "dm" &&
     (channelMembersQuery.isPending ||
@@ -363,6 +372,7 @@ export function ChannelScreen({
     channelMembers,
     managedAgents,
     openThreadHeadId: effectiveOpenThreadHeadId,
+    profileAgentPubkeys,
     relayAgents,
     typingEntries,
   });

@@ -55,10 +55,12 @@ function relayStatusToManagedStatus(
 export function buildChannelAgentSessionCandidates({
   channelMembers,
   managedAgents,
+  profileAgentPubkeys,
   relayAgents,
 }: {
   channelMembers?: ChannelMember[];
   managedAgents: ManagedAgent[];
+  profileAgentPubkeys?: ReadonlySet<string>;
   relayAgents: RelayAgent[];
 }): ChannelAgentSessionAgent[] {
   const byPubkey = new Map<string, ChannelAgentSessionAgent>();
@@ -91,17 +93,24 @@ export function buildChannelAgentSessionCandidates({
 
   for (const member of channelMembers ?? []) {
     const key = normalizePubkey(member.pubkey);
-    const hasMemberAgentIdentity = member.role === "bot" || member.isAgent;
-    if (!hasMemberAgentIdentity || byPubkey.has(key)) {
+    const hasMemberAgentIdentity =
+      member.role === "bot" ||
+      member.isAgent ||
+      Boolean(profileAgentPubkeys?.has(key));
+    if (!hasMemberAgentIdentity) {
       continue;
     }
 
+    const existing = byPubkey.get(key);
     byPubkey.set(key, {
       pubkey: member.pubkey,
-      name: member.displayName ?? truncateNpub(member.pubkey),
-      status: "deployed",
-      agentSource: "member-bot",
-      canInterruptTurn: false,
+      name: member.displayName ?? existing?.name ?? truncateNpub(member.pubkey),
+      status: existing?.status ?? "deployed",
+      agentSource:
+        existing?.agentSource === "managed" ? "managed" : "member-bot",
+      canInterruptTurn: existing?.canInterruptTurn ?? false,
+      channelIds: existing?.channelIds,
+      channels: existing?.channels,
     });
   }
 

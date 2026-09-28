@@ -82,16 +82,16 @@ describe("thread-only bot typing regression", () => {
 });
 
 describe("promoted agent typing", () => {
+  const promotedMember = {
+    pubkey: AGENT,
+    role: "admin",
+    isAgent: true,
+    displayName: "Deploy Agent",
+  };
+
   it("keeps an explicitly promoted agent in activity classification", () => {
     const [candidate] = buildChannelAgentSessionCandidates({
-      channelMembers: [
-        {
-          pubkey: AGENT,
-          role: "admin",
-          isAgent: true,
-          displayName: "Deploy Agent",
-        },
-      ],
+      channelMembers: [promotedMember],
       managedAgents: [],
       relayAgents: [],
     });
@@ -107,14 +107,44 @@ describe("promoted agent typing", () => {
       },
       activeChannelId: "chan-1",
       agents: [candidate],
-      channelMembers: [
+      channelMembers: [promotedMember],
+    });
+
+    assert.deepEqual(scopedAgents, [candidate]);
+  });
+
+  it("uses uncapped profile identity for a promoted member", () => {
+    const [candidate] = buildChannelAgentSessionCandidates({
+      channelMembers: [{ ...promotedMember, isAgent: false }],
+      managedAgents: [],
+      profileAgentPubkeys: new Set([AGENT]),
+      relayAgents: [],
+    });
+
+    assert.equal(candidate?.agentSource, "member-bot");
+  });
+
+  it("preserves roster provenance when a relay agent is also promoted", () => {
+    const [candidate] = buildChannelAgentSessionCandidates({
+      channelMembers: [promotedMember],
+      managedAgents: [],
+      relayAgents: [
         {
           pubkey: AGENT,
-          role: "admin",
-          isAgent: true,
-          displayName: "Deploy Agent",
+          name: "Deploy Agent",
+          status: "online",
+          channelIds: ["other-channel"],
+          channels: [],
         },
       ],
+    });
+
+    assert.equal(candidate?.agentSource, "member-bot");
+    const scopedAgents = getChannelAgentSessionAgents({
+      activeChannel: { id: "chan-1", name: "deployments" },
+      activeChannelId: "chan-1",
+      agents: [candidate],
+      channelMembers: [promotedMember],
     });
 
     assert.deepEqual(scopedAgents, [candidate]);
