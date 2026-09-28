@@ -3364,15 +3364,6 @@ async fn ingest_event_inner(
             // propagate a race discovered there instead of acknowledging a
             // role change whose side effect did not happen.
             if propagates_side_effect_failure(kind_u32) {
-                state
-                    .db
-                    .remove_rejected_event(tenant.community(), &event)
-                    .await
-                    .map_err(|compensation_error| {
-                        IngestError::Internal(format!(
-                            "error: PUT_USER failed ({e}) and event compensation failed: {compensation_error}"
-                        ))
-                    })?;
                 return Err(IngestError::Rejected(format!("invalid: {e}")));
             }
 

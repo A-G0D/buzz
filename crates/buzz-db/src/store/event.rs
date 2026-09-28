@@ -1662,44 +1662,6 @@ pub async fn insert_event_with_thread_metadata(
     Ok(result)
 }
 
-/// Delete a just-inserted event and its mention index rows after an authoritative
-/// side effect rejects, allowing the same signed event to be retried.
-pub async fn remove_rejected_event(
-    pool: &PgPool,
-    community_id: CommunityId,
-    event: &Event,
-) -> Result<()> {
-    let connection = crate::observability::acquire_writer(
-        pool,
-        crate::observability::WriterOperation::EventWrite,
-    )
-    .await?;
-    let mut tx = sqlx::Transaction::begin(connection, None).await?;
-    let event_id = event.id.as_bytes().as_slice();
-
-    sqlx::query("DELETE FROM event_mentions WHERE community_id = $1 AND event_id = $2")
-        .bind(community_id.as_uuid())
-        .bind(event_id)
-        .execute(&mut *tx)
-        .await?;
-    let deleted = sqlx::query(
-        "DELETE FROM events WHERE community_id = $1 AND created_at = to_timestamp($2) AND id = $3",
-    )
-    .bind(community_id.as_uuid())
-    .bind(event.created_at.as_secs() as i64)
-    .bind(event_id)
-    .execute(&mut *tx)
-    .await?;
-    if deleted.rows_affected() != 1 {
-        return Err(DbError::InvalidData(
-            "rejected event compensation did not delete exactly one event".into(),
-        ));
-    }
-
-    tx.commit().await?;
-    Ok(())
-}
-
 /// Outcome of a channel-head conditional canvas write.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ChannelHeadWriteStatus {
@@ -1873,19 +1835,6 @@ impl Db {
             }
         }
         Ok(result)
-    }
-
-    /// Delete a just-inserted event after its authoritative side effect rejects.
-    ///
-    /// This keeps retries possible: a rejected command must not remain stored as
-    /// a duplicate that future attempts acknowledge without reapplying.
-    #[datastore_span(name = "remove_rejected_event", system = "postgresql")]
-    pub async fn remove_rejected_event(
-        &self,
-        community_id: CommunityId,
-        event: &nostr::Event,
-    ) -> Result<()> {
-        crate::event::remove_rejected_event(&self.pool, community_id, event).await
     }
 
     /// Queries events matching the given filter parameters.
