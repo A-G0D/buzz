@@ -3359,14 +3359,6 @@ async fn ingest_event_inner(
             crate::handlers::side_effects::handle_side_effects(tenant, kind_u32, &event, state)
                 .await
         {
-            // Membership writes are authorization-sensitive. The DB layer
-            // rechecks admission and role authority under the membership lock;
-            // propagate a race discovered there instead of acknowledging a
-            // role change whose side effect did not happen.
-            if propagates_side_effect_failure(kind_u32) {
-                return Err(IngestError::Rejected(format!("invalid: {e}")));
-            }
-
             // error!, not warn!: the event was accepted but its side effects
             // (channel creation, git repo seeding, …) did not run — the relay
             // is now in a state the client believes it isn't. Production runs
@@ -3437,21 +3429,6 @@ async fn ingest_event_inner(
         accepted: true,
         message: String::new(),
     })
-}
-
-fn propagates_side_effect_failure(kind: u32) -> bool {
-    kind == KIND_NIP29_PUT_USER
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn put_user_propagates_atomic_membership_rejection() {
-        assert!(propagates_side_effect_failure(KIND_NIP29_PUT_USER));
-        assert!(!propagates_side_effect_failure(KIND_NIP29_EDIT_METADATA));
-    }
 }
 
 #[cfg(test)]
