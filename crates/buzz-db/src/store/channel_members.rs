@@ -487,6 +487,41 @@ pub async fn add_member(
     // resurrection token: an owner removed by another owner could self-rejoin
     // via kind:9021 (`Member, None`) and silently regain ownership.
     let current_role = get_active_role_tx(&mut tx, community_id, channel_id, pubkey).await?;
+
+    // Admission policy applies only when this write would create or reactivate
+    // membership. Keep the read behind the membership lock and hold a share lock
+    // on the user row through the upsert, so a target removed after relay
+    // validation cannot be re-added under a stale "already active" decision.
+    // Existing active members have already been admitted; changing their role
+    // must not re-run this policy.
+    if current_role.is_none() && invited_by.is_some_and(|inviter| inviter != pubkey) {
+        let policy_row: Option<(String, Option<Vec<u8>>)> = sqlx::query_as(
+            "SELECT channel_add_policy::text, agent_owner_pubkey FROM users \
+             WHERE community_id = $1 AND pubkey = $2 FOR SHARE",
+        )
+        .bind(community_id.as_uuid())
+        .bind(pubkey)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        if let Some((policy, owner)) = policy_row {
+            match policy.as_str() {
+                "owner_only" if owner.as_deref() != invited_by => {
+                    return Err(DbError::AccessDenied(
+                        "policy:owner_only — only the agent owner can add this agent".to_string(),
+                    ));
+                }
+                "nobody" => {
+                    return Err(DbError::AccessDenied(
+                        "policy:nobody — this agent has disabled external channel additions"
+                            .to_string(),
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+
     if let Some(current_role) = current_role.filter(|r| r != effective_role.as_str()) {
         let actor_role = match invited_by {
             Some(inviter) => get_active_role_tx(&mut tx, community_id, channel_id, inviter).await?,
@@ -1730,7 +1765,7 @@ mod postgres_tests {
     use super::*;
     use crate::channel::{ChannelType, ChannelVisibility};
     use crate::migration;
-    use crate::user::{ensure_user, set_agent_owner};
+    use crate::user::{ensure_user, set_agent_owner, set_channel_add_policy};
     use nostr::Keys;
     use sqlx::postgres::PgPoolOptions;
 
@@ -2605,6 +2640,81 @@ mod postgres_tests {
         .await
         .expect_err("last owner must not be demotable");
         println!("last-owner demotion rejected: {err}");
+    }
+
+    /// Admission policy is enforced atomically by `add_member`: an already
+    /// active agent can be promoted without re-admission, while a removed agent
+    /// cannot be reactivated by a third party that its policy rejects.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn agent_admission_policy_distinguishes_role_change_from_reactivation() {
+        let pool = setup_pool().await;
+        let community_id = make_test_community(&pool).await;
+        let community = CommunityId::from_uuid(community_id);
+        let owner = random_pubkey();
+        let agent = random_pubkey();
+
+        for pk in [&owner, &agent] {
+            ensure_user(&pool, community, pk)
+                .await
+                .expect("ensure user");
+        }
+        set_agent_owner(&pool, community, &agent, &owner)
+            .await
+            .expect("set agent owner");
+
+        let channel = create_test_channel(
+            &pool,
+            community_id,
+            "atomic-agent-admission",
+            ChannelType::Stream,
+            ChannelVisibility::Open,
+            None,
+            &owner,
+            None,
+        )
+        .await
+        .expect("create channel");
+
+        add_member(
+            &pool,
+            community,
+            channel.id,
+            &agent,
+            MemberRole::Member,
+            Some(&owner),
+        )
+        .await
+        .expect("owner admits agent");
+        set_channel_add_policy(&pool, community, &agent, "nobody")
+            .await
+            .expect("close agent admission policy");
+
+        add_member(
+            &pool,
+            community,
+            channel.id,
+            &agent,
+            MemberRole::Admin,
+            Some(&owner),
+        )
+        .await
+        .expect("active agent role changes do not re-run admission policy");
+
+        remove_member(&pool, community, channel.id, &agent, &owner)
+            .await
+            .expect("remove agent");
+        let error = add_member(
+            &pool,
+            community,
+            channel.id,
+            &agent,
+            MemberRole::Admin,
+            Some(&owner),
+        )
+        .await
+        .expect_err("removed agent must satisfy admission policy again");
+        assert!(error.to_string().contains("policy:nobody"));
     }
 
     /// Isolates the actor-authorization guard from the last-owner guard.
