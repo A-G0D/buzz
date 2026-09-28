@@ -155,23 +155,9 @@ Requests remain strict: send new parameters or intent types only after the relay
 advertises the corresponding capability. Missing optional data means unsupported
 or not requested, never an empty list, zero count or unchanged revision.
 
-Future thread previews can add an optional bounded summary to each channel row,
-with independent list completeness and count evidence. Expensive signed-event
-expansions should be opt-in and preserve the base sidebar's work/byte budgets;
-fetching detail separately remains valid. Reuse canonical classification and
-read frontiers, not a second definition of unread. Historical-mention eligibility
-or mute-aware attention requires an explicit policy contract, not an unnoticed
-change to today's `attention` field.
-
-Channel-content revisions, personal-state revisions and synchronized preferences
-are separate from read frontiers. Future revisions must describe the same
-snapshot as their payload, and are invalidation tokens, not history cursors or
-access grants. Count reuse also needs time/configuration validity because the
-receipt horizon moves without writes. Mutes and manual-unread overrides must not
-be encoded by advancing or rewinding a read frontier.
-
-These are extension constraints, not implemented capabilities: this version does
-not advertise thread previews, revision-based reuse or synchronized overrides.
+Follow-up design constraints are recorded in
+[the extension design note](buzz-v1-extension-design.md); they do not advertise
+additional capabilities.
 
 ## Privacy and lifecycle
 

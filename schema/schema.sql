@@ -216,8 +216,6 @@ CREATE TABLE personal_read_frontiers (
         REFERENCES channels (community_id, id) ON DELETE CASCADE
 );
 
-
-
 -- ── Events (partitioned by month on created_at) ──────────────────────────────
 -- Conformance: "Channel-less global events and DMs". `community_id` leads the
 -- PK and every hot-path index. Partition stays BY RANGE (created_at) — the
@@ -289,7 +287,7 @@ CREATE INDEX idx_events_community_pubkey_kind_created
 CREATE INDEX idx_events_community_kind_created
     ON events (community_id, kind, created_at DESC, id);
 CREATE INDEX idx_events_community_deleted ON events (community_id, deleted_at);
--- Sidebar receipt window per channel (0051); key order = its ORDER BY.
+-- Sidebar receipt window per channel (0052); key order = its ORDER BY.
 CREATE INDEX idx_events_community_channel_received
     ON events (community_id, channel_id, received_at DESC, id, created_at);
 -- Addressable (replaceable) and NIP-33 parameterized lookups.
