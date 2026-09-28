@@ -21,10 +21,7 @@ pub(super) async fn resolve(
     if targets.is_empty() {
         return Ok(HashMap::new());
     }
-    let mut targets = targets.to_vec();
-    targets.sort_unstable();
-    targets.dedup();
-    targets.truncate(MAX_ROOTS);
+    let targets = select_targets(targets);
     let channels: Vec<_> = targets.iter().map(|(channel, _)| *channel).collect();
     let roots: Vec<_> = targets.iter().map(|(_, root)| root.clone()).collect();
     // Optional inference must not abort authoritative unread/frontier reads.
@@ -85,4 +82,47 @@ pub(super) async fn resolve(
             ))
         })
         .collect()
+}
+
+// Keep selection independent of the optional SQL deadline: a timeout must not
+// hide a regression in the cardinality bound.
+fn select_targets(targets: &[(Uuid, Vec<u8>)]) -> Vec<(Uuid, Vec<u8>)> {
+    let mut targets = targets.to_vec();
+    targets.sort_unstable();
+    targets.dedup();
+    targets.truncate(MAX_ROOTS);
+    targets
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn target_selection_caps_unique_roots_independently_of_sql_timeout() {
+        // Literal contract boundaries deliberately do not derive from MAX_ROOTS.
+        for count in [0_u32, 1, 1023, 1024, 1025] {
+            let unique: Vec<_> = (0..count)
+                .map(|i| (Uuid::nil(), i.to_be_bytes().to_vec()))
+                .collect();
+            let input: Vec<_> = unique
+                .iter()
+                .rev()
+                .chain(unique.iter().rev())
+                .cloned()
+                .collect();
+            let selected = select_targets(&input);
+            assert_eq!(selected, unique[..unique.len().min(1024)], "count {count}");
+        }
+    }
+
+    #[test]
+    fn target_selection_keeps_channel_identity() {
+        let first = (Uuid::from_u128(1), vec![7; 32]);
+        let second = (Uuid::from_u128(2), vec![7; 32]);
+        assert_eq!(
+            select_targets(&[second.clone(), first.clone(), second.clone()]),
+            vec![first, second]
+        );
+    }
 }

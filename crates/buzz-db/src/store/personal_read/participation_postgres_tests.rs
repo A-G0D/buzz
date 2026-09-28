@@ -212,8 +212,14 @@ async fn personal_read_attention_root_budget_does_not_fabricate_absence() {
                 .await
                 .unwrap();
             assert!(matches!(
+                page.channels[0].unread,
+                ReadCount::Exact { value: 2048 }
+            ));
+            // Root selection is tested deterministically at its production seam.
+            // The independent SQL deadline may withhold participation evidence.
+            assert!(matches!(
                 page.channels[0].attention,
-                ReadCount::Exact { value: 0 }
+                ReadCount::Exact { value: 0 } | ReadCount::Unknown
             ));
         }
     }
