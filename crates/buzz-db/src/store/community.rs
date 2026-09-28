@@ -64,9 +64,13 @@ pub struct OwnedCommunityRecord {
 /// Owner-list rows plus the authoritative quota projection from one snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwnedCommunitiesPage {
+    /// Visible live owner memberships, excluding communities already under deletion.
     pub communities: Vec<OwnedCommunityRecord>,
+    /// De-duplicated live memberships and incomplete owner deletion reservations.
     pub quota_used: i64,
+    /// Configured maximum hosted communities for one owner.
     pub quota_limit: i64,
+    /// Whether the authoritative snapshot leaves capacity for another community.
     pub can_create: bool,
 }
 
