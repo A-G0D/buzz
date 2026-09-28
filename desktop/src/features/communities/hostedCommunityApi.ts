@@ -10,6 +10,7 @@ export type BuilderlabAuth = {
   email?: string;
   name?: string;
   expiresAt: string;
+  canDeleteBuzzCommunities?: boolean;
 };
 
 export type HostedCommunityApiError = {
@@ -40,6 +41,19 @@ export type HostedCommunity = {
 
 export type HostedCommunitiesResponse = {
   communities?: HostedCommunity[];
+  quota_used?: number;
+  quota_limit?: number;
+  can_create?: boolean;
+  error?: HostedCommunityApiError;
+  correlation_id?: string;
+};
+
+export type HostedCommunityDeletionResponse = {
+  request_id?: string;
+  community_id?: string;
+  host?: string;
+  acknowledgement_version?: number;
+  status?: string;
   error?: HostedCommunityApiError;
   correlation_id?: string;
 };
@@ -60,6 +74,9 @@ export type HostedCommunityMutationResponse = {
 export type HostedCommunityAccount = {
   communities: HostedCommunity[];
   identity: HostedNostrIdentity | null;
+  quotaUsed: number | null;
+  quotaLimit: number | null;
+  canCreate: boolean;
 };
 
 export function hostedCommunityErrorMessage(
@@ -80,6 +97,17 @@ export function hostedCommunityErrorMessage(
     not_owner: "Only the community owner can do that.",
     transferee_not_registered:
       "That person needs a connected Buzz identity before you can transfer ownership to them.",
+    confirmation_mismatch: "The host acknowledgement did not match exactly.",
+    must_archive: "Archive this community before deleting it.",
+    protected_target: "This community cannot be deleted.",
+    deletion_conflict:
+      "This community already has a conflicting deletion request.",
+    unsupported_acknowledgement_version:
+      "This app version cannot confirm the current deletion terms.",
+    deletion_aborted: "The deletion request was stopped by an operator.",
+    acceptance_unknown:
+      "Deletion acceptance is uncertain. Check deletion status; do not start a new request.",
+    unknown: "The deletion service returned an invalid response.",
   };
   const message = messages[error?.code ?? ""] ?? error?.message ?? fallback;
   return correlationId
@@ -187,6 +215,16 @@ export async function loadHostedCommunityAccount(): Promise<HostedCommunityAccou
   return {
     identity: identityResponse.identity ?? null,
     communities: communitiesResponse.communities ?? [],
+    quotaUsed: Number.isInteger(communitiesResponse.quota_used)
+      ? (communitiesResponse.quota_used as number)
+      : null,
+    quotaLimit: Number.isInteger(communitiesResponse.quota_limit)
+      ? (communitiesResponse.quota_limit as number)
+      : null,
+    canCreate:
+      Number.isInteger(communitiesResponse.quota_used) &&
+      Number.isInteger(communitiesResponse.quota_limit) &&
+      communitiesResponse.can_create === true,
   };
 }
 

@@ -50,6 +50,166 @@ test.beforeEach(async ({ page }) => {
   await openHostedCommunitiesSettings(page);
 });
 
+async function openDeletionFixture(
+  page: Page,
+  options: {
+    capability?: boolean;
+    mismatch?: boolean;
+    errorCode?: string;
+  } = {},
+) {
+  await installMockBridge(page, {
+    builderlabAuth: {
+      email: "owner@example.com",
+      expiresAt: "2099-01-01T00:00:00Z",
+      canDeleteBuzzCommunities: options.capability,
+    },
+    builderlabIdentity: {
+      pubkey_hex: options.mismatch ? "f".repeat(64) : DEFAULT_MOCK_PUBKEY,
+    },
+    builderlabCommunities: [
+      {
+        id: "11111111-1111-4111-8111-111111111111",
+        name: "Active team",
+        normalized_host: "active.communities.buzz.xyz",
+      },
+      {
+        id: "22222222-2222-4222-8222-222222222222",
+        name: "Archived team",
+        normalized_host: "Exact-Host.communities.buzz.xyz",
+        archived_at: "2026-09-28T00:00:00Z",
+      },
+    ],
+    builderlabQuota: { used: 2, limit: 5, canCreate: true },
+    builderlabDeletionError: options.errorCode
+      ? { code: options.errorCode, message: "mock deletion error" }
+      : undefined,
+  });
+  await page.goto("/");
+  await openSettings(page, "hosted-communities");
+}
+
+test("deletion is default-off and identity mismatch preserves the gate", async ({
+  page,
+}) => {
+  await openDeletionFixture(page);
+  await expect(
+    page.getByRole("button", { name: "Delete", exact: true }),
+  ).toHaveCount(0);
+
+  await openDeletionFixture(page, { capability: true, mismatch: true });
+  await expect(
+    page.getByRole("button", { name: "Delete", exact: true }),
+  ).toHaveCount(0);
+});
+
+test("archived deletion requires exact host and two confirmations, then removes the row", async ({
+  page,
+}) => {
+  await openDeletionFixture(page, { capability: true });
+  const active = page
+    .getByTestId("hosted-community-row")
+    .filter({ hasText: "Active team" });
+  const archived = page
+    .getByTestId("hosted-community-row")
+    .filter({ hasText: "Archived team" });
+  await expect(
+    active.getByRole("button", { name: "Delete", exact: true }),
+  ).toHaveCount(0);
+
+  await archived.getByRole("button", { name: "Delete", exact: true }).click();
+  const exactHost = "Exact-Host.communities.buzz.xyz";
+  const input = page.getByLabel(
+    `Type the exact host to continue: ${exactHost}`,
+  );
+  await input.fill(exactHost.toLowerCase());
+  await expect(page.getByRole("button", { name: "Continue" })).toBeDisabled();
+  await input.fill(` ${exactHost}`);
+  await expect(page.getByRole("button", { name: "Continue" })).toBeDisabled();
+  await page.getByRole("button", { name: "Cancel" }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          window.__BUZZ_E2E_COMMANDS__?.filter(
+            (command) => command === "delete_builderlab_community",
+          ).length ?? 0,
+      ),
+    )
+    .toBe(0);
+
+  await archived.getByRole("button", { name: "Delete", exact: true }).click();
+  await page
+    .getByLabel(`Type the exact host to continue: ${exactHost}`)
+    .fill(exactHost);
+  await page.getByRole("button", { name: "Continue" }).click();
+  await expect(
+    page.getByRole("button", { name: "Delete community permanently" }),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "Cancel" }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          window.__BUZZ_E2E_COMMANDS__?.filter(
+            (command) => command === "delete_builderlab_community",
+          ).length ?? 0,
+      ),
+    )
+    .toBe(0);
+
+  await archived.getByRole("button", { name: "Delete", exact: true }).click();
+  await page
+    .getByLabel(`Type the exact host to continue: ${exactHost}`)
+    .fill(exactHost);
+  await page.getByRole("button", { name: "Continue" }).click();
+  await page
+    .getByRole("button", { name: "Delete community permanently" })
+    .dblclick();
+  await expect(
+    page.getByText("Deletion started", { exact: true }),
+  ).toBeVisible();
+  await expect(archived).toHaveCount(0);
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          window.__BUZZ_E2E_COMMANDS__?.filter(
+            (command) => command === "delete_builderlab_community",
+          ).length ?? 0,
+      ),
+    )
+    .toBe(1);
+});
+
+test("ambiguous deletion keeps the same pending request and exposes receipt lookup", async ({
+  page,
+}) => {
+  await openDeletionFixture(page, {
+    capability: true,
+    errorCode: "acceptance_unknown",
+  });
+  const archived = page
+    .getByTestId("hosted-community-row")
+    .filter({ hasText: "Archived team" });
+  const exactHost = "Exact-Host.communities.buzz.xyz";
+  await archived.getByRole("button", { name: "Delete", exact: true }).click();
+  await page
+    .getByLabel(`Type the exact host to continue: ${exactHost}`)
+    .fill(exactHost);
+  await page.getByRole("button", { name: "Continue" }).click();
+  await page
+    .getByRole("button", { name: "Delete community permanently" })
+    .click();
+  await expect(
+    page.getByRole("button", { name: "Check deletion status" }),
+  ).toBeVisible();
+  await expect(
+    page.getByText(/Correlation ID: mock-delete-correlation/),
+  ).toBeVisible();
+  await expect(archived).toBeVisible();
+});
+
 test("identity: mismatch rows follow pubkey_hex, never the hosted npub or raw hex", async ({
   page,
 }) => {

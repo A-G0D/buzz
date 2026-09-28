@@ -9,7 +9,6 @@ import {
   createHostedCommunity,
   deleteBuilderlabIdentity,
   getBuilderlabAuth,
-  HOSTED_COMMUNITY_LIMIT,
   HOSTED_COMMUNITY_SUFFIX,
   hostedCommunityErrorMessage,
   hostedCommunityRelayUrl,
@@ -19,7 +18,6 @@ import {
   usableBoundIdentityNpub,
   VALID_HOSTED_COMMUNITY_NAME,
   type BuilderlabAuth,
-  type HostedCommunity,
   type HostedNostrIdentity,
 } from "@/features/communities/hostedCommunityApi";
 import { useCommunityOnboarding } from "@/features/onboarding/communityOnboarding";
@@ -47,7 +45,11 @@ export function HostedCommunityCreateFlow({
   const [identity, setIdentity] = React.useState<HostedNostrIdentity | null>(
     null,
   );
-  const [communities, setCommunities] = React.useState<HostedCommunity[]>([]);
+  const [quota, setQuota] = React.useState<{
+    used: number | null;
+    limit: number | null;
+    canCreate: boolean;
+  }>({ used: null, limit: null, canCreate: false });
   const [name, setName] = React.useState("");
   const [availability, setAvailability] = React.useState<boolean | null>(null);
   const [checkingName, setCheckingName] = React.useState(false);
@@ -60,7 +62,11 @@ export function HostedCommunityCreateFlow({
   const loadAccount = React.useCallback(async () => {
     const account = await loadHostedCommunityAccount();
     setIdentity(account.identity);
-    setCommunities(account.communities);
+    setQuota({
+      used: account.quotaUsed,
+      limit: account.quotaLimit,
+      canCreate: account.canCreate,
+    });
   }, []);
 
   React.useEffect(() => {
@@ -147,7 +153,7 @@ export function HostedCommunityCreateFlow({
       await clearBuilderlabAuth();
       setAuth(null);
       setIdentity(null);
-      setCommunities([]);
+      setQuota({ used: null, limit: null, canCreate: false });
     });
 
   // Identity rows display npubs derived from the same key the mismatch gate
@@ -209,7 +215,7 @@ export function HostedCommunityCreateFlow({
   const validName =
     normalizedName.length <= 63 &&
     VALID_HOSTED_COMMUNITY_NAME.test(normalizedName);
-  const atCommunityLimit = communities.length >= HOSTED_COMMUNITY_LIMIT;
+  const atCommunityLimit = quota.canCreate !== true;
   const ready = Boolean(auth && usableBoundIdentity && !identityMismatch);
 
   React.useEffect(() => {
@@ -400,7 +406,9 @@ export function HostedCommunityCreateFlow({
   }
 
   const feedback = atCommunityLimit
-    ? `You’ve reached the limit of ${HOSTED_COMMUNITY_LIMIT} hosted communities.`
+    ? quota.limit === null
+      ? "Community quota is unavailable. Creation stays disabled."
+      : `You’ve reached the limit of ${quota.limit} hosted communities.`
     : name && !validName
       ? "Use lowercase letters, numbers, and single hyphens."
       : checkingName

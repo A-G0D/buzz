@@ -7,6 +7,7 @@ use axum::{
     routing::get,
     Router,
 };
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use tauri_plugin_opener::OpenerExt;
 use tokio::{net::TcpListener, sync::oneshot};
@@ -20,6 +21,7 @@ const BB_SESSION_CREDENTIAL_HEADER: &str = "X-BB-Session-Credential";
 // or challenge/verify fail with `invalid_origin`. It also seeds the challenge
 // body's `origin` field so both agree.
 const BUILDERLAB_ORIGIN: &str = "https://app.builderlab.xyz";
+const BUILDERLAB_JSON_RESPONSE_LIMIT: usize = 64 * 1024;
 const AUTH_COMPLETE_HTML: &str = r#"<!doctype html>
 <html lang="en">
 <head>
@@ -166,6 +168,7 @@ pub(crate) struct BuilderlabAuthInfo {
     expires_at: String,
     email: Option<String>,
     name: Option<String>,
+    can_delete_buzz_communities: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -173,6 +176,17 @@ struct AuthMeResponse {
     email: Option<String>,
     name: Option<String>,
     expires_at: String,
+    #[serde(default)]
+    capabilities: serde_json::Value,
+}
+
+impl AuthMeResponse {
+    fn can_delete_buzz_communities(&self) -> bool {
+        self.capabilities
+            .get("can_delete_buzz_communities")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+    }
 }
 
 struct CallbackState {
@@ -343,10 +357,12 @@ pub(crate) async fn start_builderlab_login(
     if exchanged.expires_at != me.expires_at {
         return Err("Builderlab session expiry did not match code exchange".to_owned());
     }
+    let can_delete_buzz_communities = me.can_delete_buzz_communities();
     let info = BuilderlabAuthInfo {
         expires_at: me.expires_at.clone(),
         email: me.email,
         name: me.name,
+        can_delete_buzz_communities,
     };
     {
         let mut pending = login.0.lock().map_err(|error| error.to_string())?;
@@ -379,11 +395,15 @@ pub(crate) async fn get_builderlab_auth(
         return Ok(None);
     };
     match authenticated_user(&app_state.http_client, &credential).await {
-        Ok(me) => Ok(Some(BuilderlabAuthInfo {
-            expires_at: me.expires_at,
-            email: me.email,
-            name: me.name,
-        })),
+        Ok(me) => {
+            let can_delete_buzz_communities = me.can_delete_buzz_communities();
+            Ok(Some(BuilderlabAuthInfo {
+                expires_at: me.expires_at,
+                email: me.email,
+                name: me.name,
+                can_delete_buzz_communities,
+            }))
+        }
         Err(error) => {
             *session
                 .0
@@ -445,9 +465,16 @@ async fn authenticated_json(
         .await
         .map_err(|error| format!("Builderlab request failed: {error}"))?;
     let status = response.status();
-    let value: serde_json::Value = response
-        .json()
-        .await
+    let mut bytes = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| format!("Builderlab response failed: {error}"))?;
+        if bytes.len().saturating_add(chunk.len()) > BUILDERLAB_JSON_RESPONSE_LIMIT {
+            return Err("Builderlab response exceeded the size limit".to_owned());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let value: serde_json::Value = serde_json::from_slice(&bytes)
         .map_err(|error| format!("invalid Builderlab response: {error}"))?;
     if !status.is_success() {
         // Builderlab error responses carry a structured `{ error: { code,
@@ -640,6 +667,58 @@ pub(crate) async fn transfer_builderlab_community(
     .await
 }
 
+fn community_deletion_body(
+    community_id: String,
+    host: String,
+    request_id: String,
+    acknowledgement_version: i32,
+) -> serde_json::Value {
+    serde_json::json!({
+        "community_id": community_id,
+        "host": host,
+        "request_id": request_id,
+        "acknowledgement_version": acknowledgement_version,
+    })
+}
+
+#[tauri::command]
+pub(crate) async fn delete_builderlab_community(
+    community_id: String,
+    host: String,
+    request_id: String,
+    acknowledgement_version: i32,
+    app_state: tauri::State<'_, crate::app_state::AppState>,
+    session: tauri::State<'_, BuilderlabSession>,
+) -> Result<serde_json::Value, String> {
+    authenticated_json(
+        &app_state.http_client,
+        &session,
+        reqwest::Method::POST,
+        "/v1/buzz/communities/delete",
+        community_deletion_body(community_id, host, request_id, acknowledgement_version),
+    )
+    .await
+}
+
+#[tauri::command]
+pub(crate) async fn get_builderlab_community_deletion_receipt(
+    community_id: String,
+    host: String,
+    request_id: String,
+    acknowledgement_version: i32,
+    app_state: tauri::State<'_, crate::app_state::AppState>,
+    session: tauri::State<'_, BuilderlabSession>,
+) -> Result<serde_json::Value, String> {
+    authenticated_json(
+        &app_state.http_client,
+        &session,
+        reqwest::Method::POST,
+        "/v1/buzz/communities/delete/receipt",
+        community_deletion_body(community_id, host, request_id, acknowledgement_version),
+    )
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -683,5 +762,75 @@ mod tests {
             Some("http://127.0.0.1:1234/callback/nonce")
         );
         assert!(!query.contains_key("screen_hint"));
+    }
+
+    #[test]
+    fn deletion_capability_requires_literal_true() {
+        for (capabilities, expected) in [
+            (serde_json::json!({}), false),
+            (
+                serde_json::json!({ "can_delete_buzz_communities": "true" }),
+                false,
+            ),
+            (
+                serde_json::json!({ "can_delete_buzz_communities": false }),
+                false,
+            ),
+            (
+                serde_json::json!({ "can_delete_buzz_communities": true }),
+                true,
+            ),
+        ] {
+            let response: AuthMeResponse = serde_json::from_value(serde_json::json!({
+                "expires_at": "2099-01-01T00:00:00Z",
+                "capabilities": capabilities,
+            }))
+            .expect("auth-me fixture");
+            assert_eq!(response.can_delete_buzz_communities(), expected);
+        }
+    }
+
+    #[test]
+    fn community_deletion_commands_share_the_exact_public_tuple() {
+        let body = community_deletion_body(
+            "2f6c6a10-6513-45a6-9605-4694333d8feb".to_owned(),
+            "Exact-Host.communities.buzz.xyz".to_owned(),
+            "2e1b354d-6f7c-44e8-8928-cf743c77bbbc".to_owned(),
+            1,
+        );
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "community_id": "2f6c6a10-6513-45a6-9605-4694333d8feb",
+                "host": "Exact-Host.communities.buzz.xyz",
+                "request_id": "2e1b354d-6f7c-44e8-8928-cf743c77bbbc",
+                "acknowledgement_version": 1,
+            })
+        );
+        for path in [
+            "/v1/buzz/communities/delete",
+            "/v1/buzz/communities/delete/receipt",
+        ] {
+            let url = api_url(path).expect("deletion URL");
+            assert_eq!(url.origin().ascii_serialization(), BUILDERLAB_ORIGIN);
+            assert_eq!(url.path(), format!("/api/goose{path}"));
+        }
+    }
+
+    #[test]
+    fn community_deletion_commands_are_registered_on_the_native_boundary() {
+        let lib = include_str!("lib.rs");
+        for command in [
+            "delete_builderlab_community,",
+            "get_builderlab_community_deletion_receipt,",
+        ] {
+            assert_eq!(
+                lib.matches(command).count(),
+                1,
+                "{command} must be registered exactly once"
+            );
+        }
+        let source = include_str!("builderlab.rs");
+        assert!(source.contains(".header(reqwest::header::ORIGIN, BUILDERLAB_ORIGIN)"));
     }
 }

@@ -162,7 +162,12 @@ type MockBridgeOptions = {
   /** Native-like huddle state seeded from authoritative role-bearing membership. */
   huddle?: MockHuddleSeed;
   /** Builderlab account returned by hosted-community onboarding. Null/omitted = signed out. */
-  builderlabAuth?: { email?: string; name?: string; expiresAt: string } | null;
+  builderlabAuth?: {
+    email?: string;
+    name?: string;
+    expiresAt: string;
+    canDeleteBuzzCommunities?: boolean;
+  } | null;
   /** Optional policy returned by the native join-policy discovery command. */
   joinPolicy?: {
     terms_markdown?: string;
@@ -180,6 +185,8 @@ type MockBridgeOptions = {
     normalized_host?: string;
     archived_at?: string | null;
   }>;
+  builderlabQuota?: { used: number; limit: number; canCreate: boolean };
+  builderlabDeletionError?: { code: string; message?: string };
   acpRuntimesCatalog?: Record<string, unknown>[];
   /** Catalog returned after a successful mocked install. */
   acpRuntimesCatalogAfterInstall?: Record<string, unknown>[];

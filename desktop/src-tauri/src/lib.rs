@@ -556,6 +556,8 @@ pub fn run() {
             archive_builderlab_community,
             unarchive_builderlab_community,
             transfer_builderlab_community,
+            delete_builderlab_community,
+            get_builderlab_community_deletion_receipt,
             title_bar_double_click,
             get_identity,
             get_nsec,

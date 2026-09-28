@@ -231,6 +231,7 @@ type E2eConfig = {
       email?: string;
       name?: string;
       expiresAt: string;
+      canDeleteBuzzCommunities?: boolean;
     } | null;
     /** Optional policy returned by the native join-policy discovery command. */
     joinPolicy?: {
@@ -253,6 +254,8 @@ type E2eConfig = {
       normalized_host?: string;
       archived_at?: string | null;
     }>;
+    builderlabQuota?: { used: number; limit: number; canCreate: boolean };
+    builderlabDeletionError?: { code: string; message?: string };
     /** Override the community returned after hosted creation. */
     builderlabCreatedCommunity?: {
       id?: string;
@@ -12570,10 +12573,21 @@ export function maybeInstallE2eTauriMocks() {
       case "delete_builderlab_nostr_identity":
         if (activeConfig?.mock) activeConfig.mock.builderlabIdentity = null;
         return {};
-      case "list_builderlab_communities":
-        return {
-          communities: activeConfig?.mock?.builderlabCommunities ?? [],
+      case "list_builderlab_communities": {
+        const hostedCommunities =
+          activeConfig?.mock?.builderlabCommunities ?? [];
+        const hostedQuota = activeConfig?.mock?.builderlabQuota ?? {
+          used: hostedCommunities.length,
+          limit: 5,
+          canCreate: hostedCommunities.length < 5,
         };
+        return {
+          communities: hostedCommunities,
+          quota_used: hostedQuota.used,
+          quota_limit: hostedQuota.limit,
+          can_create: hostedQuota.canCreate,
+        };
+      }
       case "check_builderlab_community_name":
         return {
           available: true,
@@ -12587,6 +12601,28 @@ export function maybeInstallE2eTauriMocks() {
             name,
             normalized_host: `${name}.communities.buzz.xyz`,
           },
+        };
+      }
+      case "delete_builderlab_community":
+      case "get_builderlab_community_deletion_receipt": {
+        if (activeConfig?.mock?.builderlabDeletionError) {
+          return {
+            error: activeConfig.mock.builderlabDeletionError,
+            correlation_id: "mock-delete-correlation",
+          };
+        }
+        const input = payload as {
+          communityId?: string;
+          host?: string;
+          requestId?: string;
+          acknowledgementVersion?: number;
+        };
+        return {
+          community_id: input.communityId,
+          host: input.host,
+          request_id: input.requestId,
+          acknowledgement_version: input.acknowledgementVersion,
+          status: "accepted",
         };
       }
       case "mesh_installed_models":

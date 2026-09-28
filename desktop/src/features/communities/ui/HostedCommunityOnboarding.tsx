@@ -10,7 +10,6 @@ import {
   createHostedCommunity,
   deleteBuilderlabIdentity,
   getBuilderlabAuth,
-  HOSTED_COMMUNITY_LIMIT,
   HOSTED_COMMUNITY_SUFFIX,
   hostedCommunityErrorMessage,
   hostedCommunityRelayUrl,
@@ -87,6 +86,11 @@ export function HostedCommunityOnboarding({
     null,
   );
   const [communities, setCommunities] = React.useState<HostedCommunity[]>([]);
+  const [quota, setQuota] = React.useState<{
+    used: number | null;
+    limit: number | null;
+    canCreate: boolean;
+  }>({ used: null, limit: null, canCreate: false });
   const [showCreate, setShowCreate] = React.useState(false);
   const [name, setName] = React.useState("");
   const [availability, setAvailability] = React.useState<boolean | null>(null);
@@ -100,6 +104,11 @@ export function HostedCommunityOnboarding({
     const account = await loadHostedCommunityAccount();
     setIdentity(account.identity);
     setCommunities(account.communities);
+    setQuota({
+      used: account.quotaUsed,
+      limit: account.quotaLimit,
+      canCreate: account.canCreate,
+    });
   }, []);
 
   React.useEffect(() => {
@@ -170,6 +179,7 @@ export function HostedCommunityOnboarding({
       setAuth(null);
       setIdentity(null);
       setCommunities([]);
+      setQuota({ used: null, limit: null, canCreate: false });
       setShowCreate(false);
       setName("");
       setAvailability(null);
@@ -259,7 +269,7 @@ export function HostedCommunityOnboarding({
   const validName =
     normalizedName.length <= 63 &&
     VALID_HOSTED_COMMUNITY_NAME.test(normalizedName);
-  const atCommunityLimit = communities.length >= HOSTED_COMMUNITY_LIMIT;
+  const atCommunityLimit = quota.canCreate !== true;
   const hasCommunities = activeCommunities.length > 0;
 
   React.useEffect(() => {
@@ -385,7 +395,9 @@ export function HostedCommunityOnboarding({
   ) : null;
 
   const creationFeedback = atCommunityLimit
-    ? `You’ve reached the limit of ${HOSTED_COMMUNITY_LIMIT} hosted communities.`
+    ? quota.limit === null
+      ? "Community quota is unavailable. Creation stays disabled."
+      : `You’ve reached the limit of ${quota.limit} hosted communities.`
     : name && !validName
       ? "Use lowercase letters, numbers, and single hyphens."
       : checkingName

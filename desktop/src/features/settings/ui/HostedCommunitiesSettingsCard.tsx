@@ -2,9 +2,6 @@ import * as React from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   AlertCircle,
-  Archive,
-  ArchiveRestore,
-  ArrowLeftRight,
   CheckCircle2,
   ExternalLink,
   LoaderCircle,
@@ -15,7 +12,6 @@ import {
 
 import { useIdentityQuery } from "@/shared/api/hooks";
 import {
-  HOSTED_COMMUNITY_LIMIT as MAX_COMMUNITIES,
   HOSTED_COMMUNITY_SUFFIX as HOST_SUFFIX,
   hostedCommunityErrorMessage as errorMessage,
   hostedCommunityRelayUrl as relayUrl,
@@ -25,12 +21,21 @@ import {
   type HostedCommunityAvailabilityResponse as AvailabilityResponse,
   type HostedCommunitiesResponse as CommunitiesResponse,
   type HostedCommunity,
+  type HostedCommunityDeletionResponse,
   type HostedCommunityMutationResponse as CommunityMutationResponse,
   type HostedIdentityResponse as IdentityResponse,
   type HostedNostrIdentity as NostrIdentity,
   VALID_HOSTED_COMMUNITY_NAME as VALID_NAME,
 } from "@/features/communities/hostedCommunityApi";
-import { CommunityIconSettingsCard } from "@/features/communities/ui/CommunityIconSettingsCard";
+import {
+  BUILDERLAB_BACKEND_ORIGIN,
+  clearPendingCommunityDeletion,
+  loadPendingCommunityDeletion,
+  pendingCommunityDeletionMatchesAccount,
+  persistPendingCommunityDeletion,
+  publicDeletionRequest,
+  type PendingCommunityDeletion,
+} from "@/features/communities/communityDeletionPending";
 import { useCommunities } from "@/features/communities/useCommunities";
 import { useCommunityOnboarding } from "@/features/onboarding/communityOnboarding";
 import { safeNpub } from "@/shared/lib/nostrUtils";
@@ -46,16 +51,9 @@ import {
   AlertDialogTitle,
 } from "@/shared/ui/alert-dialog";
 import { Button, buttonVariants } from "@/shared/ui/button";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/shared/ui/dialog";
 import { Input } from "@/shared/ui/input";
 import { SettingsSectionHeader } from "./SettingsSectionHeader";
+import { HostedCommunityRow } from "./HostedCommunityRow";
 
 function relayHost(url: string | null | undefined) {
   if (!url) return null;
@@ -79,6 +77,18 @@ export function HostedCommunitiesSettingsCard() {
   const [loading, setLoading] = React.useState(true);
   const [action, setAction] = React.useState<string | null>(null);
   const [error, setError] = React.useState<string | null>(null);
+  const [statusMessage, setStatusMessage] = React.useState<string | null>(null);
+  const [quota, setQuota] = React.useState<{
+    used: number;
+    limit: number;
+    canCreate: boolean;
+  } | null>(null);
+  const [pendingDeletion, setPendingDeletion] =
+    React.useState<PendingCommunityDeletion | null>(null);
+  const hiddenCommunityIds = React.useRef(new Set<string>());
+  const recoveryAccount = React.useRef<string | null>(null);
+  const deleteInFlight = React.useRef(false);
+  const accountOwner = React.useRef<string | null>(null);
 
   const loadAccount = React.useCallback(async () => {
     setError(null);
@@ -111,8 +121,42 @@ export function HostedCommunitiesSettingsCard() {
         ),
       );
     }
+    const nextOwner = normalizedBoundKeyHex(
+      identityResponse.identity?.pubkey_hex,
+    );
+    const storedDeletion = loadPendingCommunityDeletion();
+    if (
+      storedDeletion &&
+      (!nextOwner ||
+        !pendingCommunityDeletionMatchesAccount(
+          storedDeletion,
+          nextOwner,
+          BUILDERLAB_BACKEND_ORIGIN,
+        ))
+    ) {
+      clearPendingCommunityDeletion();
+      setPendingDeletion(null);
+    }
     setIdentity(identityResponse.identity ?? null);
-    setCommunities(communitiesResponse.communities ?? []);
+    setCommunities(
+      (communitiesResponse.communities ?? []).filter(
+        (community) =>
+          !community.id || !hiddenCommunityIds.current.has(community.id),
+      ),
+    );
+    const hasQuota =
+      Number.isInteger(communitiesResponse.quota_used) &&
+      Number.isInteger(communitiesResponse.quota_limit) &&
+      typeof communitiesResponse.can_create === "boolean";
+    setQuota(
+      hasQuota
+        ? {
+            used: communitiesResponse.quota_used as number,
+            limit: communitiesResponse.quota_limit as number,
+            canCreate: communitiesResponse.can_create === true,
+          }
+        : null,
+    );
   }, []);
 
   React.useEffect(() => {
@@ -163,6 +207,10 @@ export function HostedCommunitiesSettingsCard() {
       setAuth(null);
       setIdentity(null);
       setCommunities([]);
+      setQuota(null);
+      setPendingDeletion(null);
+      setStatusMessage(null);
+      clearPendingCommunityDeletion();
       setName("");
       setAvailability(null);
     });
@@ -200,6 +248,9 @@ export function HostedCommunitiesSettingsCard() {
         );
       }
       setIdentity(null);
+      clearPendingCommunityDeletion();
+      setPendingDeletion(null);
+      setStatusMessage(null);
       await loadAccount();
     });
 
@@ -235,6 +286,7 @@ export function HostedCommunitiesSettingsCard() {
       (!usableBoundIdentity ||
         (boundHex !== null && localHex !== null && boundHex !== localHex)),
   );
+  accountOwner.current = boundHex;
 
   const switchToDeviceIdentity = () =>
     run("Switching identity…", async () => {
@@ -255,6 +307,9 @@ export function HostedCommunitiesSettingsCard() {
           ),
         );
       }
+      clearPendingCommunityDeletion();
+      setPendingDeletion(null);
+      setStatusMessage(null);
       const bound = await invoke<IdentityResponse>(
         "bind_builderlab_nostr_identity",
       );
@@ -336,6 +391,173 @@ export function HostedCommunitiesSettingsCard() {
       await loadAccount();
     });
 
+  const applyDeletionResponse = async (
+    response: HostedCommunityDeletionResponse,
+    envelope: PendingCommunityDeletion,
+    receiptOnly: boolean,
+  ) => {
+    if (
+      !pendingCommunityDeletionMatchesAccount(
+        envelope,
+        accountOwner.current ?? "",
+        BUILDERLAB_BACKEND_ORIGIN,
+      )
+    ) {
+      clearPendingCommunityDeletion();
+      setPendingDeletion(null);
+      return;
+    }
+    if (response.error) {
+      if (response.error.code === "deletion_aborted") {
+        clearPendingCommunityDeletion();
+        setPendingDeletion(null);
+      } else if (!receiptOnly && response.error.code !== "acceptance_unknown") {
+        clearPendingCommunityDeletion();
+        setPendingDeletion(null);
+      }
+      throw new Error(
+        errorMessage(
+          response.error,
+          response.correlation_id,
+          receiptOnly
+            ? "Could not confirm deletion status. The existing request remains pending."
+            : "Could not start community deletion.",
+        ),
+      );
+    }
+    const accepted =
+      response.status === "accepted" &&
+      response.request_id === envelope.request_id &&
+      response.community_id === envelope.community_id &&
+      response.host === envelope.host &&
+      response.acknowledgement_version === envelope.acknowledgement_version;
+    if (!accepted) {
+      throw new Error(
+        "Deletion acceptance is uncertain. Check deletion status; do not start a new request.",
+      );
+    }
+    clearPendingCommunityDeletion();
+    setPendingDeletion(null);
+    hiddenCommunityIds.current.add(envelope.community_id);
+    setCommunities((current) =>
+      current.filter((community) => community.id !== envelope.community_id),
+    );
+    setStatusMessage("Deletion started");
+    await loadAccount();
+  };
+
+  const invokeDeletion = async (
+    command:
+      | "delete_builderlab_community"
+      | "get_builderlab_community_deletion_receipt",
+    envelope: PendingCommunityDeletion,
+    receiptOnly: boolean,
+  ) => {
+    const request = publicDeletionRequest(envelope);
+    const response = await invoke<HostedCommunityDeletionResponse>(command, {
+      communityId: request.community_id,
+      host: request.host,
+      requestId: request.request_id,
+      acknowledgementVersion: request.acknowledgement_version,
+    });
+    await applyDeletionResponse(response, envelope, receiptOnly);
+  };
+
+  const startCommunityDeletion = (community: HostedCommunity) => {
+    if (
+      deleteInFlight.current ||
+      auth?.canDeleteBuzzCommunities !== true ||
+      identityMismatch ||
+      !community.archived_at ||
+      !community.id ||
+      !community.normalized_host ||
+      !boundHex
+    )
+      return;
+    deleteInFlight.current = true;
+    const envelope: PendingCommunityDeletion = {
+      community_id: community.id,
+      host: community.normalized_host,
+      request_id: crypto.randomUUID().toLowerCase(),
+      acknowledgement_version: 1,
+      bound_owner_pubkey: boundHex,
+      backend_origin: BUILDERLAB_BACKEND_ORIGIN,
+    };
+    if (!persistPendingCommunityDeletion(envelope)) {
+      deleteInFlight.current = false;
+      setError(
+        "Could not safely save the pending deletion request. Nothing was sent.",
+      );
+      return;
+    }
+    setPendingDeletion(envelope);
+    void run("Starting deletion…", async () => {
+      try {
+        await invokeDeletion("delete_builderlab_community", envelope, false);
+      } finally {
+        deleteInFlight.current = false;
+      }
+    });
+  };
+
+  const checkDeletionStatus = (envelope: PendingCommunityDeletion) =>
+    run("Checking deletion status…", async () => {
+      await invokeDeletion(
+        "get_builderlab_community_deletion_receipt",
+        envelope,
+        true,
+      );
+    });
+
+  const resubmitPendingDeletion = (envelope: PendingCommunityDeletion) => {
+    const current = communities.find(
+      (community) =>
+        community.id === envelope.community_id &&
+        community.normalized_host === envelope.host &&
+        Boolean(community.archived_at),
+    );
+    if (
+      !current ||
+      deletionCapability !== true ||
+      identityMismatch ||
+      accountOwner.current !== envelope.bound_owner_pubkey ||
+      deleteInFlight.current
+    )
+      return;
+    deleteInFlight.current = true;
+    void run("Resubmitting deletion…", async () => {
+      try {
+        await invokeDeletion("delete_builderlab_community", envelope, false);
+      } finally {
+        deleteInFlight.current = false;
+      }
+    });
+  };
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: account key bounds the one recovery lookup
+  React.useEffect(() => {
+    if (!auth || loading || !boundHex) return;
+    const accountKey = `${BUILDERLAB_BACKEND_ORIGIN}:${boundHex}`;
+    if (recoveryAccount.current === accountKey) return;
+    recoveryAccount.current = accountKey;
+    const envelope = loadPendingCommunityDeletion();
+    if (!envelope) return;
+    if (
+      !pendingCommunityDeletionMatchesAccount(
+        envelope,
+        boundHex,
+        BUILDERLAB_BACKEND_ORIGIN,
+      )
+    ) {
+      clearPendingCommunityDeletion();
+      setPendingDeletion(null);
+      return;
+    }
+    setPendingDeletion(envelope);
+    void checkDeletionStatus(envelope);
+    // One lookup per authoritative account/origin on reopen; later checks are manual.
+  }, [auth, boundHex, loading]);
+
   const normalizedName = name.trim().toLowerCase();
   const validName =
     normalizedName.length <= 63 && VALID_NAME.test(normalizedName);
@@ -386,7 +608,7 @@ export function HostedCommunitiesSettingsCard() {
       !validName ||
       !usableBoundIdentity ||
       identityMismatch ||
-      communities.length >= MAX_COMMUNITIES
+      quota?.canCreate !== true
     )
       return;
     void run("Creating community…", async () => {
@@ -438,7 +660,8 @@ export function HostedCommunitiesSettingsCard() {
   };
 
   const busy = action != null;
-  const atCommunityLimit = communities.length >= MAX_COMMUNITIES;
+  const atCommunityLimit = quota?.canCreate !== true;
+  const deletionCapability = auth?.canDeleteBuzzCommunities === true;
 
   return (
     <section className="space-y-6" data-testid="hosted-communities-settings">
@@ -451,6 +674,50 @@ export function HostedCommunitiesSettingsCard() {
         <div className="flex items-start gap-2 rounded-lg border border-destructive/40 bg-destructive/5 p-3 text-sm text-destructive">
           <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
           <span>{error}</span>
+        </div>
+      ) : null}
+
+      {statusMessage ? (
+        <div
+          className="rounded-lg border border-emerald-500/40 bg-emerald-500/5 p-3 text-sm"
+          aria-live="polite"
+        >
+          {statusMessage}
+        </div>
+      ) : null}
+
+      {pendingDeletion ? (
+        <div className="space-y-2 rounded-lg border border-amber-500/40 bg-amber-500/5 p-3 text-sm">
+          <p>
+            Deletion acceptance for {pendingDeletion.host} is uncertain. Keep
+            this request pending until its existing receipt is confirmed.
+          </p>
+          <div className="flex flex-wrap gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={busy}
+              onClick={() => void checkDeletionStatus(pendingDeletion)}
+            >
+              Check deletion status
+            </Button>
+            {deletionCapability &&
+            communities.some(
+              (community) =>
+                community.id === pendingDeletion.community_id &&
+                community.normalized_host === pendingDeletion.host &&
+                Boolean(community.archived_at),
+            ) ? (
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={busy || identityMismatch}
+                onClick={() => resubmitPendingDeletion(pendingDeletion)}
+              >
+                Resubmit same request
+              </Button>
+            ) : null}
+          </div>
         </div>
       ) : null}
 
@@ -592,7 +859,9 @@ export function HostedCommunitiesSettingsCard() {
               <h3 className="font-medium">
                 Your communities
                 <span className="ml-2 text-xs font-normal text-muted-foreground">
-                  {communities.length} of {MAX_COMMUNITIES} used
+                  {quota
+                    ? `${quota.used} of ${quota.limit} used`
+                    : "Quota unavailable"}
                 </span>
               </h3>
               <Button
@@ -617,10 +886,20 @@ export function HostedCommunitiesSettingsCard() {
                       Number(Boolean(b.archived_at)),
                   )
                   .map((community, index) => (
-                    <CommunityRow
+                    <HostedCommunityRow
                       key={community.id ?? community.normalized_host ?? index}
                       community={community}
-                      busy={busy}
+                      busy={
+                        busy || pendingDeletion?.community_id === community.id
+                      }
+                      deletionPending={
+                        pendingDeletion?.community_id === community.id
+                      }
+                      canDelete={
+                        deletionCapability &&
+                        usableBoundIdentity &&
+                        !identityMismatch
+                      }
                       canConnect={usableBoundIdentity && !identityMismatch}
                       showIconPicker={
                         relayHost(relayUrl(community)) ===
@@ -646,6 +925,7 @@ export function HostedCommunitiesSettingsCard() {
                       onArchive={() => void archiveCommunity(community)}
                       onUnarchive={() => void unarchiveCommunity(community)}
                       onTransfer={(npub) => transferCommunity(community, npub)}
+                      onDelete={() => startCommunityDeletion(community)}
                     />
                   ))}
               </ul>
@@ -667,9 +947,9 @@ export function HostedCommunitiesSettingsCard() {
             </div>
             {atCommunityLimit ? (
               <p className="text-sm text-muted-foreground">
-                You&apos;ve reached the limit of {MAX_COMMUNITIES} hosted
-                communities. Transfer one to free up a slot before creating
-                another.
+                {quota
+                  ? `You've reached the limit of ${quota.limit} hosted communities. A deletion frees its slot only after logical cleanup completes.`
+                  : "Community quota is unavailable. Creation stays disabled until the server returns an authoritative quota."}
               </p>
             ) : null}
             <div className="flex max-w-xl items-center gap-2">
@@ -775,220 +1055,5 @@ function UnpairIdentityButton({
         </AlertDialogFooter>
       </AlertDialogContent>
     </AlertDialog>
-  );
-}
-
-function CommunityRow({
-  community,
-  busy,
-  canConnect,
-  onConnect,
-  onArchive,
-  onUnarchive,
-  onTransfer,
-  showIconPicker,
-}: {
-  community: HostedCommunity;
-  busy: boolean;
-  canConnect: boolean;
-  onConnect: () => void;
-  onArchive: () => void;
-  onUnarchive: () => void;
-  onTransfer: (npub: string) => Promise<boolean>;
-  showIconPicker: boolean;
-}) {
-  const [confirmArchive, setConfirmArchive] = React.useState(false);
-  const [confirmUnarchive, setConfirmUnarchive] = React.useState(false);
-  const [transferOpen, setTransferOpen] = React.useState(false);
-  const url = relayUrl(community);
-  const archived = Boolean(community.archived_at);
-  const displayName = community.name ?? community.slug ?? "Hosted community";
-
-  return (
-    <li
-      className={`flex flex-wrap items-center justify-between gap-3 rounded-xl border border-border/70 p-4 ${
-        archived ? "opacity-70" : ""
-      }`}
-      data-testid="hosted-community-row"
-    >
-      <div className="flex min-w-0 flex-1 items-center gap-3">
-        {showIconPicker ? <CommunityIconSettingsCard compact /> : null}
-        <div className="min-w-0">
-          <p className="truncate text-sm font-medium">{displayName}</p>
-          <p
-            className="truncate text-xs text-muted-foreground/70"
-            data-settings-subcopy
-          >
-            {community.normalized_host}
-            {archived ? " · Archived" : ""}
-          </p>
-        </div>
-      </div>
-
-      {archived ? (
-        <>
-          <Button
-            variant="outline"
-            size="sm"
-            disabled={busy || !community.id}
-            onClick={() => setConfirmUnarchive(true)}
-          >
-            <ArchiveRestore className="h-4 w-4" /> Unarchive
-          </Button>
-          <AlertDialog
-            open={confirmUnarchive}
-            onOpenChange={setConfirmUnarchive}
-          >
-            <AlertDialogContent>
-              <AlertDialogHeader>
-                <AlertDialogTitle>Unarchive {displayName}?</AlertDialogTitle>
-                <AlertDialogDescription>
-                  This address becomes connectable again. Connections that
-                  closed during archival will not reconnect automatically.
-                </AlertDialogDescription>
-              </AlertDialogHeader>
-              <AlertDialogFooter>
-                <AlertDialogCancel>Cancel</AlertDialogCancel>
-                <AlertDialogAction onClick={onUnarchive}>
-                  Unarchive
-                </AlertDialogAction>
-              </AlertDialogFooter>
-            </AlertDialogContent>
-          </AlertDialog>
-        </>
-      ) : (
-        <div className="flex flex-wrap items-center gap-2">
-          {url && canConnect ? (
-            <Button
-              variant="outline"
-              size="sm"
-              disabled={busy}
-              onClick={onConnect}
-            >
-              Connect
-            </Button>
-          ) : null}
-          <Button
-            variant="ghost"
-            size="sm"
-            disabled={busy || !community.id}
-            onClick={() => setTransferOpen(true)}
-          >
-            <ArrowLeftRight className="h-4 w-4" /> Transfer
-          </Button>
-          <Button
-            variant="ghost"
-            size="sm"
-            className="text-destructive hover:text-destructive"
-            disabled={busy || !community.id}
-            onClick={() => setConfirmArchive(true)}
-          >
-            <Archive className="h-4 w-4" /> Archive
-          </Button>
-
-          <AlertDialog open={confirmArchive} onOpenChange={setConfirmArchive}>
-            <AlertDialogContent>
-              <AlertDialogHeader>
-                <AlertDialogTitle>Archive {displayName}?</AlertDialogTitle>
-                <AlertDialogDescription>
-                  New and existing connections stop and the address stays
-                  reserved. Archiving can&apos;t be undone from here without
-                  unarchiving, and the community keeps counting toward your
-                  quota — it isn&apos;t deleted.
-                </AlertDialogDescription>
-              </AlertDialogHeader>
-              <AlertDialogFooter>
-                <AlertDialogCancel>Cancel</AlertDialogCancel>
-                <AlertDialogAction
-                  className={buttonVariants({ variant: "destructive" })}
-                  onClick={onArchive}
-                >
-                  Archive
-                </AlertDialogAction>
-              </AlertDialogFooter>
-            </AlertDialogContent>
-          </AlertDialog>
-
-          <TransferOwnershipDialog
-            open={transferOpen}
-            onOpenChange={setTransferOpen}
-            communityName={displayName}
-            busy={busy}
-            onTransfer={onTransfer}
-          />
-        </div>
-      )}
-    </li>
-  );
-}
-
-function TransferOwnershipDialog({
-  open,
-  onOpenChange,
-  communityName,
-  busy,
-  onTransfer,
-}: {
-  open: boolean;
-  onOpenChange: (open: boolean) => void;
-  communityName: string;
-  busy: boolean;
-  onTransfer: (npub: string) => Promise<boolean>;
-}) {
-  const [npub, setNpub] = React.useState("");
-  const npubIsValid = npub.startsWith("npub1") && npub.length >= 50;
-
-  React.useEffect(() => {
-    if (!open) setNpub("");
-  }, [open]);
-
-  const submit = async () => {
-    if (!npubIsValid) return;
-    const ok = await onTransfer(npub.trim());
-    if (ok) onOpenChange(false);
-  };
-
-  return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent>
-        <DialogHeader>
-          <DialogTitle>Transfer ownership</DialogTitle>
-          <DialogDescription>
-            Transfer {communityName} to another person. You become a regular
-            member. The recipient needs a connected Buzz identity first, and
-            this can&apos;t be undone.
-          </DialogDescription>
-        </DialogHeader>
-        <div className="space-y-2">
-          <Input
-            aria-label="Recipient npub"
-            autoComplete="off"
-            className="font-mono text-sm"
-            placeholder="npub1…"
-            spellCheck={false}
-            value={npub}
-            onChange={(event) => setNpub(event.target.value.trim())}
-          />
-          {npub.length > 0 && !npubIsValid ? (
-            <p className="text-sm text-destructive">
-              Enter a valid npub that starts with npub1.
-            </p>
-          ) : null}
-        </div>
-        <DialogFooter>
-          <Button variant="outline" onClick={() => onOpenChange(false)}>
-            Cancel
-          </Button>
-          <Button
-            variant="destructive"
-            disabled={!npubIsValid || busy}
-            onClick={() => void submit()}
-          >
-            {busy ? <LoaderCircle className="h-4 w-4 animate-spin" /> : null}
-            Transfer ownership
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
   );
 }
