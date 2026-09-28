@@ -2207,7 +2207,8 @@ impl DeletionStore {
     /// privileged path is the only recovery when preparation cannot continue.
     /// Abort reverses deletion intent, not the owner's archive decision: the
     /// community stays archived and the owner restores it explicitly.
-    /// Stages from `drained` onward have destroyed tenant state and stay closed.
+    /// Stages from `drained` onward stay closed because tenant-state destruction
+    /// may have begun.
     pub async fn abort(
         &self,
         request_id: Uuid,
@@ -4758,8 +4759,8 @@ mod postgres_tests {
         );
     }
 
-    /// The reversible boundary stops at `inventoried`. Once execution has
-    /// destroyed anything, abort must stay closed.
+    /// The reversible boundary extends through `fenced`. From `drained`
+    /// onward, destruction may have begun, so abort must stay closed.
     #[tokio::test]
     #[ignore = "requires Postgres"]
     async fn privileged_abort_spans_only_the_reversible_pre_destruction_boundary() {
