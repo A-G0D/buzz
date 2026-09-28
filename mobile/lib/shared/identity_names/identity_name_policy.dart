@@ -9,7 +9,8 @@ import '../utils/string_utils.dart';
 const identityNamePolicyVersion = 1;
 
 /// One naming fact for an identity. [pubkey] and [ownerPubkey] must be valid
-/// 64-character hex public keys; callers choose names and fallbacks first.
+/// 64-character hex public keys (either case); callers choose names and
+/// fallbacks first.
 @immutable
 class NamingIdentity {
   final String pubkey;
@@ -85,6 +86,14 @@ String trimIdentityName(String value) {
   return value.substring(start, end);
 }
 
+final RegExp _hexKey = RegExp(r'^[0-9a-fA-F]{64}$');
+
+void _requireKey(String key, String name) {
+  if (!_hexKey.hasMatch(key)) {
+    throw ArgumentError.value(key, name, 'not a 64-character hex public key');
+  }
+}
+
 class _Row {
   final String key;
   final NamingIdentity identity;
@@ -111,18 +120,34 @@ class _Row {
 /// Display policy only: a readable owner or key suffix grants no authority.
 /// Implements contextual identity names v1 (see [identityNamePolicyVersion]).
 /// Omitting [candidates] selects every supplied fact; an empty set selects
-/// none. Throws [ArgumentError] for an invalid public key.
+/// none.
+///
+/// Every supplied key — each fact's [NamingIdentity.pubkey] and
+/// [NamingIdentity.ownerPubkey], [viewer], and each candidate — must be a
+/// valid public key. The contract leaves invalid keys to the caller, so this
+/// throws [ArgumentError] before resolving anything rather than returning a
+/// label for a value that is not an identity.
 Map<String, ResolvedIdentityName> resolveIdentityNames(
   List<NamingIdentity> identities, {
   String? viewer,
   Iterable<String>? candidates,
 }) {
+  for (final identity in identities) {
+    _requireKey(identity.pubkey, 'pubkey');
+    if (identity.ownerPubkey case final owner?) {
+      _requireKey(owner, 'ownerPubkey');
+    }
+  }
+  if (viewer != null) _requireKey(viewer, 'viewer');
+  final selected = candidates?.map((key) {
+    _requireKey(key, 'candidates');
+    return key.toLowerCase();
+  }).toSet();
   final normalizedViewer = viewer?.toLowerCase();
   // Last fact per key: the preferred alias and the owner-lookup name.
   final preferred = <String, NamingIdentity>{
     for (final identity in identities) identity.pubkey.toLowerCase(): identity,
   };
-  final selected = candidates?.map((key) => key.toLowerCase()).toSet();
   // One working row per (key, trimmed name); the last fact supplies metadata.
   final aliases = <(String, String), NamingIdentity>{};
   for (final identity in identities) {
@@ -152,13 +177,7 @@ Map<String, ResolvedIdentityName> resolveIdentityNames(
         }(),
   ];
   final npubs = <String, String>{};
-  String npubFor(String key) => npubs[key] ??= () {
-    final npub = fullNpub(key);
-    if (npub == null || key.length != 64) {
-      throw ArgumentError.value(key, 'pubkey', 'not a hex public key');
-    }
-    return npub;
-  }();
+  String npubFor(String key) => npubs[key] ??= fullNpub(key)!;
 
   while (true) {
     final groups = <String, List<_Row>>{};

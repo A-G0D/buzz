@@ -52,17 +52,78 @@ void main() {
     expect(result[key], const ResolvedIdentityName('\u0085Honey'));
   });
 
-  test('rejects an invalid public key instead of inventing an identity', () {
-    expect(
-      () => resolveIdentityNames(const [
-        NamingIdentity(pubkey: 'not-a-key', name: 'Honey'),
-        NamingIdentity(
-          pubkey:
-              '1111111111111111111111111111111111111111111111111111111111111111',
-          name: 'Honey',
+  group('rejects an invalid key before resolving', () {
+    const valid =
+        '1111111111111111111111111111111111111111111111111111111111111111';
+
+    test('for a fact that needs no suffix', () {
+      expect(
+        () => resolveIdentityNames(const [
+          NamingIdentity(pubkey: 'not-a-key', name: 'Unique'),
+        ]),
+        throwsArgumentError,
+      );
+    });
+
+    test('for a colliding fact', () {
+      expect(
+        () => resolveIdentityNames(const [
+          NamingIdentity(pubkey: 'not-a-key', name: 'Honey'),
+          NamingIdentity(pubkey: valid, name: 'Honey'),
+        ]),
+        throwsArgumentError,
+      );
+    });
+
+    test('for an owner key', () {
+      expect(
+        () => resolveIdentityNames(const [
+          NamingIdentity(
+            pubkey: valid,
+            name: 'Scout',
+            isAgent: true,
+            ownerPubkey: 'not-a-key',
+          ),
+        ]),
+        throwsArgumentError,
+      );
+    });
+
+    test('for the viewer', () {
+      expect(
+        () => resolveIdentityNames(const [
+          NamingIdentity(pubkey: valid, name: 'Honey'),
+        ], viewer: 'not-a-key'),
+        throwsArgumentError,
+      );
+    });
+
+    test('for a candidate', () {
+      expect(
+        () => resolveIdentityNames(
+          const [NamingIdentity(pubkey: valid, name: 'Honey')],
+          candidates: const [valid, 'not-a-key'],
         ),
-      ]),
-      throwsArgumentError,
-    );
+        throwsArgumentError,
+      );
+    });
+
+    test('for a 64-character value that is not hex', () {
+      expect(
+        () => resolveIdentityNames([
+          NamingIdentity(pubkey: 'g' * 64, name: 'Unique'),
+        ]),
+        throwsArgumentError,
+      );
+    });
+
+    test('but accepts an upper-case hex key', () {
+      expect(
+        resolveIdentityNames([
+          NamingIdentity(pubkey: valid.replaceAll('1', 'A'), name: 'Honey'),
+        ]),
+        {valid.replaceAll('1', 'a'): const ResolvedIdentityName('Honey')},
+      );
+    });
   });
 }
