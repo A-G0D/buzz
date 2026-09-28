@@ -220,7 +220,10 @@ pub async fn handle_count(
                 match state.db.count_events_routed("count_req", &query).await {
                     Ok(n) => total += n as u64,
                     Err(e) => {
-                        conn.send(RelayMessage::closed(&sub_id, &format!("error: {e}")));
+                        conn.send(RelayMessage::closed(
+                            &sub_id,
+                            &super::req::db_read_closed_reason(&e),
+                        ));
                         return;
                     }
                 }
@@ -254,7 +257,10 @@ pub async fn handle_count(
                         }
                     }
                     Err(e) => {
-                        conn.send(RelayMessage::closed(&sub_id, &format!("error: {e}")));
+                        conn.send(RelayMessage::closed(
+                            &sub_id,
+                            &super::req::db_read_closed_reason(&e),
+                        ));
                         return;
                     }
                 }
@@ -294,7 +300,10 @@ pub async fn handle_count(
                 match state.db.count_events_routed("count_req", &query).await {
                     Ok(n) => total += n as u64,
                     Err(e) => {
-                        conn.send(RelayMessage::closed(&sub_id, &format!("error: {e}")));
+                        conn.send(RelayMessage::closed(
+                            &sub_id,
+                            &super::req::db_read_closed_reason(&e),
+                        ));
                         return;
                     }
                 }
@@ -327,7 +336,10 @@ pub async fn handle_count(
                         }
                     }
                     Err(e) => {
-                        conn.send(RelayMessage::closed(&sub_id, &format!("error: {e}")));
+                        conn.send(RelayMessage::closed(
+                            &sub_id,
+                            &super::req::db_read_closed_reason(&e),
+                        ));
                         return;
                     }
                 }
