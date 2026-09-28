@@ -554,7 +554,8 @@ pub(crate) async fn handle_active_audio_connection(
                     warn!(channel_id = %channel_id, "audio auth failed: {e}");
                     // Under NIP-FI the failure is classified exactly as on the
                     // root route; Off-mode keeps the legacy bespoke frame.
-                    let frame = if nip_fi_assertion.is_some() {
+                    let fi = nip_fi_assertion.is_some();
+                    let frame = if fi {
                         crate::nip_fi_session::denial_frame(
                             crate::nip_fi_session::NipFiWsRoute::Audio,
                             crate::handlers::auth::nip42_denial_class(&e),
@@ -567,7 +568,7 @@ pub(crate) async fn handle_active_audio_connection(
                         )
                     };
                     crate::connection::send_exit_frames_bounded(&mut ws_send, [frame]).await;
-                    if nip_fi_assertion.is_some() {
+                    if fi {
                         cancel.cancel();
                     }
                     return;

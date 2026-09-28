@@ -407,8 +407,6 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
                 }
             });
 
-            // Stash NIP-OA owner on the auth context only after the shared
-            // backfill confirms the first-write-wins relationship.
             // B2: acquire a session effect permit after the last policy read
             // and before the first persistent write — NIP-OA materialization
             // (users + agent-owner rows) — and hold it through the auth commit.
@@ -420,8 +418,10 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
             // replaces the old "acquire write_lock → check cancel" fence with
             // a stronger bound: no AUTH commit can start after the gate's
             // deadline passes or after the expiry task's cancel.cancel() fires,
-            // and any AUTH commit that starts under a permit will complete before
-            // the gate's quiescence barrier allows teardown to proceed.
+            // and expiry's quiescence waits for this permit. The permit's
+            // lifetime is bounded by the caller (connection.rs), which races
+            // this whole handler against cancellation and drops it, permit
+            // included, when expiry cancels; that fence is load-bearing.
             //
             // Off-mode: the gate has no deadline, but an externally cancelled
             // AUTH still stops here, before materialization.
@@ -439,6 +439,8 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
                 Err(crate::nip_fi_gate::SessionExpired) => return,
             };
 
+            // Stash NIP-OA owner on the auth context only after the shared
+            // backfill confirms the first-write-wins relationship.
             if let Some(owner) = nip_oa_owner {
                 if crate::api::relay_members::materialize_nip_oa_owner(
                     &state,
