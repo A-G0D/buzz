@@ -4,6 +4,21 @@ use buzz_core_pkg::PresenceStatus;
 use serde_json::Value;
 use tauri::State;
 
+const USER_PROFILE_QUERY_BATCH_SIZE: usize = 500;
+
+fn user_profile_query_filters(pubkeys: &[String]) -> Vec<Value> {
+    pubkeys
+        .chunks(USER_PROFILE_QUERY_BATCH_SIZE)
+        .map(|authors| {
+            serde_json::json!({
+                "kinds": [0],
+                "authors": authors,
+                "limit": authors.len(),
+            })
+        })
+        .collect()
+}
+
 use crate::{
     app_state::AppState,
     events,
@@ -215,14 +230,14 @@ pub async fn get_users_batch(
             missing: Vec::new(),
         });
     }
-    let events = query_relay(
-        &state,
-        &[serde_json::json!({
-            "kinds": [0],
-            "authors": pubkeys,
-        })],
+    let filters = user_profile_query_filters(&pubkeys);
+    let pages = futures_util::future::try_join_all(
+        filters
+            .iter()
+            .map(|filter| query_relay(&state, std::slice::from_ref(filter))),
     )
     .await?;
+    let events = pages.into_iter().flatten().collect::<Vec<_>>();
 
     Ok(nostr_convert::users_batch_from_events(&events, &pubkeys))
 }
@@ -465,6 +480,22 @@ mod tests {
             serde_json::from_str::<Value>(&event.content).unwrap()["picture"],
             "https://example.com/avatar.png"
         );
+    }
+
+    #[test]
+    fn user_profile_queries_batch_below_the_relay_result_cap() {
+        let pubkeys = (0..1_001)
+            .map(|index| format!("{index:064x}"))
+            .collect::<Vec<_>>();
+
+        let filters = user_profile_query_filters(&pubkeys);
+
+        assert_eq!(filters.len(), 3);
+        assert_eq!(filters[0]["authors"].as_array().unwrap().len(), 500);
+        assert_eq!(filters[0]["limit"], serde_json::json!(500));
+        assert_eq!(filters[1]["authors"].as_array().unwrap().len(), 500);
+        assert_eq!(filters[2]["authors"].as_array().unwrap().len(), 1);
+        assert_eq!(filters[2]["limit"], serde_json::json!(1));
     }
 
     #[test]
