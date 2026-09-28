@@ -5030,6 +5030,102 @@ mod postgres_tests {
 
     #[tokio::test]
     #[ignore = "requires Postgres"]
+    async fn blocked_owner_submission_cannot_be_claimed() {
+        let (db, store) = store().await;
+        let (host, owner, _) = archived_owned_community(&db).await;
+        let operator = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let request_id = Uuid::new_v4();
+        store
+            .admit_owner_request(&host, &owner, operator, 1, request_id)
+            .await
+            .expect("admit owner request");
+        sqlx::query(
+            "UPDATE community_deletion_requests SET blocked_at = now(), \
+             blocked_reason = 'operator hold' WHERE id = $1",
+        )
+        .bind(request_id)
+        .execute(&db.pool)
+        .await
+        .expect("block owner submission before claim");
+
+        assert!(store
+            .claim_specific_owner_submission(
+                request_id,
+                "specific-preparer",
+                DEFAULT_LEASE_DURATION
+            )
+            .await
+            .expect("specific claim selection")
+            .is_none());
+        assert!(store
+            .claim_next_owner_submission("next-preparer", DEFAULT_LEASE_DURATION)
+            .await
+            .expect("next claim selection")
+            .is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn blocked_claimed_owner_submission_cannot_heartbeat_or_approve() {
+        let (db, store) = store().await;
+        let (host, owner, community) = archived_owned_community(&db).await;
+        let operator = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let request_id = Uuid::new_v4();
+        store
+            .admit_owner_request(&host, &owner, operator, 1, request_id)
+            .await
+            .expect("admit owner request");
+        let claim = store
+            .claim_specific_owner_submission(request_id, "preparer", DEFAULT_LEASE_DURATION)
+            .await
+            .expect("claim owner request")
+            .expect("owner request is preparable");
+        sqlx::query(
+            "UPDATE community_deletion_requests SET blocked_at = now(), \
+             blocked_reason = 'operator hold' WHERE id = $1",
+        )
+        .bind(request_id)
+        .execute(&db.pool)
+        .await
+        .expect("block owner submission while retaining lease");
+        let inventory = FrozenInventory {
+            schema: store
+                .inventory_schema(community)
+                .await
+                .expect("schema inventory"),
+            storage: empty_storage_manifest(community),
+        };
+
+        assert!(store
+            .heartbeat_owner_submission(&claim.lease, "drain", DEFAULT_LEASE_DURATION, false)
+            .await
+            .is_err());
+        assert!(store
+            .complete_owner_preparation(&claim.lease, &inventory)
+            .await
+            .is_err());
+        assert_eq!(
+            store
+                .get(request_id)
+                .await
+                .expect("load blocked request")
+                .stage,
+            DeletionStage::Submitted
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM community_deletion_approvals WHERE request_id = $1",
+            )
+            .bind(request_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("count automatic approvals"),
+            0
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
     async fn owner_preparation_atomically_approves_exact_inventory_and_converges() {
         let (db, store) = store().await;
         let (host, owner, community) = archived_owned_community(&db).await;
