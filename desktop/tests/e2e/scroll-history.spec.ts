@@ -2172,6 +2172,11 @@ test("thread summary badge survives a retained older-history prepend", async ({
 
   await page.getByTestId("channel-deep-history").click();
   await expect(page.getByTestId("chat-title")).toHaveText("deep-history");
+  await waitForMockChannelHeadReady(
+    page,
+    "deep-history",
+    "feedf00d-0000-4000-8000-000000000007",
+  );
   const timeline = page.getByTestId("message-timeline");
   const badgeSelector =
     '[data-testid="message-thread-summary"][data-thread-head-id="mock-deep-history-599"]';
