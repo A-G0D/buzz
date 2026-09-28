@@ -38,7 +38,6 @@ tests:
         podLabels:
           tags.datadoghq.com/service: buzz-deletion-drain
         podAnnotations:
-          sidecar.istio.io/inject: "false"
           example.com/operator-job: deletion-drain
         resources:
           requests:
@@ -96,6 +95,18 @@ tests:
       - equal:
           path: spec.jobTemplate.spec.template.metadata.labels["tags.datadoghq.com/service"]
           value: buzz-deletion-drain
+      - equal:
+          path: spec.jobTemplate.spec.template.metadata.labels["app.kubernetes.io/name"]
+          value: buzz
+      - equal:
+          path: spec.jobTemplate.spec.template.metadata.labels["app.kubernetes.io/instance"]
+          value: RELEASE-NAME
+      - equal:
+          path: spec.jobTemplate.spec.template.metadata.labels["app.kubernetes.io/component"]
+          value: deletion-drain
+      - equal:
+          path: spec.jobTemplate.spec.template.metadata.annotations["sidecar.istio.io/inject"]
+          value: "false"
       - equal:
           path: spec.jobTemplate.spec.template.metadata.annotations["example.com/operator-job"]
           value: deletion-drain
@@ -200,7 +211,43 @@ tests:
           content:
             name: RELAY_URL
 
-  - it: rejects chart-owned pod identity labels
+  - it: rejects the chart-owned name pod label with an explicit guard error
+    set:
+      relayUrl: wss://buzz.example.com
+      ownerPubkey: "0000000000000000000000000000000000000000000000000000000000000000"
+      externalPostgresql.url: postgres://u:p@h:5432/d
+      externalRedis.url: redis://h:6379
+      s3.endpoint: https://s3.example.com
+      s3.bucket: buzz-media-example
+      s3.accessKey: test
+      s3.secretKey: test
+      operatorJobs.deletionDrain:
+        enabled: true
+        podLabels:
+          app.kubernetes.io/name: relay
+    asserts:
+      - failedTemplate:
+          errorPattern: 'operatorJobs.deletionDrain.podLabels may not set chart-owned label "app.kubernetes.io/name"'
+
+  - it: rejects the chart-owned instance pod label with an explicit guard error
+    set:
+      relayUrl: wss://buzz.example.com
+      ownerPubkey: "0000000000000000000000000000000000000000000000000000000000000000"
+      externalPostgresql.url: postgres://u:p@h:5432/d
+      externalRedis.url: redis://h:6379
+      s3.endpoint: https://s3.example.com
+      s3.bucket: buzz-media-example
+      s3.accessKey: test
+      s3.secretKey: test
+      operatorJobs.deletionDrain:
+        enabled: true
+        podLabels:
+          app.kubernetes.io/instance: another-release
+    asserts:
+      - failedTemplate:
+          errorPattern: 'operatorJobs.deletionDrain.podLabels may not set chart-owned label "app.kubernetes.io/instance"'
+
+  - it: rejects the chart-owned component pod label with an explicit guard error
     set:
       relayUrl: wss://buzz.example.com
       ownerPubkey: "0000000000000000000000000000000000000000000000000000000000000000"
@@ -217,6 +264,36 @@ tests:
     asserts:
       - failedTemplate:
           errorPattern: 'operatorJobs.deletionDrain.podLabels may not set chart-owned label "app.kubernetes.io/component"'
+
+  - it: rejects existing-secret enablement without an explicit S3 endpoint
+    set:
+      relayUrl: wss://buzz.example.com
+      ownerPubkey: "0000000000000000000000000000000000000000000000000000000000000000"
+      secrets.existingSecret: buzz-operator-secrets
+      externalPostgresql.url: postgres://u:p@h:5432/d
+      externalRedis.url: redis://h:6379
+      s3.bucket: buzz-media-example
+      operatorJobs.deletionDrain.enabled: true
+    asserts:
+      - failedTemplate:
+          errorPattern: "s3.endpoint is required when operatorJobs.deletionDrain.enabled=true"
+
+  - it: rejects unknown deletion drain keys through the values schema
+    set:
+      relayUrl: wss://buzz.example.com
+      ownerPubkey: "0000000000000000000000000000000000000000000000000000000000000000"
+      externalPostgresql.url: postgres://u:p@h:5432/d
+      externalRedis.url: redis://h:6379
+      s3.endpoint: https://s3.example.com
+      s3.bucket: buzz-media-example
+      s3.accessKey: test
+      s3.secretKey: test
+      operatorJobs.deletionDrain:
+        enabled: true
+        arbitraryCommand: ["unsafe"]
+    asserts:
+      - failedTemplate:
+          errorPattern: "Additional property arbitraryCommand is not allowed"
 
   - it: rejects enablement without a Redis source
     set:
