@@ -125,8 +125,10 @@ checkpoints remain the execution authority.
 
 The pod receives only `DATABASE_URL`, `REDIS_URL`, and required S3
 configuration/credential variables. It does not receive the relay private key,
-git-hook secret, relay URL, service-account token, service links, or a generic
-environment registry. Schedule,
+git-hook secret, relay URL, service links, or a generic environment registry.
+The chart disables the ordinary Kubernetes API service-account token mount;
+platform workload-identity admission may still inject its own projected token
+and provider environment variables. Schedule,
 deadline, history, termination grace, resources, service account, pod labels,
 and pod annotations are independently configurable under
 `operatorJobs.deletionDrain`.
