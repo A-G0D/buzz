@@ -634,7 +634,7 @@ pub(crate) async fn handle_active_audio_connection(
         }
     }
 
-    if crate::api::relay_members::enforce_relay_membership(
+    let relay_refusal = match crate::api::relay_members::check_relay_membership(
         &state,
         tenant.community(),
         pubkey.as_bytes(),
@@ -642,27 +642,25 @@ pub(crate) async fn handle_active_audio_connection(
         Some(signed_auth_created_at),
     )
     .await
-    .is_err()
     {
-        warn!(channel_id = %channel_id, pubkey = %pubkey_hex, "audio: relay membership denied");
-        // Fix 4: when an FI assertion is present, use the uniform NIP-FI denial
-        // text so relay-membership status is not distinguishable.
-        // [FI-TRACE-DENIAL-ORACLE, NIP-FI §authorization_denied]
-        let deny_frame = if nip_fi_assertion.is_some() {
-            // Fix 4b: route through the canonical constructor when FI assertion
-            // is present — emits `{"type":"restricted",...}`, byte-exact denial.
-            // [FI-TRACE-DENIAL-ORACLE, NIP-FI §authorization_denied]
-            crate::nip_fi_session::denial_frame(
-                crate::nip_fi_session::NipFiWsRoute::Audio,
-                buzz_auth::DenialClass::AuthorizationDenied,
-            )
-        } else {
-            WsMessage::Text(
-                serde_json::json!({"type": "error", "message": "restricted: not a relay member"})
-                    .to_string()
-                    .into(),
-            )
-        };
+        Ok(crate::api::relay_members::MembershipDecision::Denied) => {
+            warn!(channel_id = %channel_id, pubkey = %pubkey_hex, "audio: relay membership denied");
+            Some(buzz_auth::DenialClass::AuthorizationDenied)
+        }
+        Ok(_) => None,
+        Err(e) => {
+            warn!(channel_id = %channel_id, pubkey = %pubkey_hex, error = %e,
+                "audio: relay membership lookup failed, denying (fail-closed)");
+            Some(buzz_auth::DenialClass::AuthorizationUnavailable)
+        }
+    };
+    if let Some(class) = relay_refusal {
+        // Off mode keeps one legacy frame for both outcomes.
+        let deny_frame = authorization_exit_frame(
+            nip_fi_assertion.is_some(),
+            class,
+            serde_json::json!({"type": "error", "message": "restricted: not a relay member"}),
+        );
         crate::connection::send_exit_frames_bounded(&mut ws_send, [deny_frame]).await;
         return;
     }
@@ -679,23 +677,13 @@ pub(crate) async fn handle_active_audio_connection(
     .await
     {
         Ok(admission) => admission,
-        Err(e) => {
-            warn!(channel_id = %channel_id, pubkey = %pubkey_hex, "audio membership denied: {e}");
-            let deny_frame = if nip_fi_assertion.is_some() {
-                // Fix 4b: route through the canonical constructor when FI assertion
-                // is present — emits `{"type":"restricted",...}`, byte-exact denial.
-                // [FI-TRACE-DENIAL-ORACLE, NIP-FI §authorization_denied]
-                crate::nip_fi_session::denial_frame(
-                    crate::nip_fi_session::NipFiWsRoute::Audio,
-                    buzz_auth::DenialClass::AuthorizationDenied,
-                )
-            } else {
-                WsMessage::Text(
-                    serde_json::json!({"type": "error", "message": "not a member"})
-                        .to_string()
-                        .into(),
-                )
-            };
+        Err(refusal) => {
+            warn!(channel_id = %channel_id, pubkey = %pubkey_hex, "audio membership denied: {refusal}");
+            let deny_frame = authorization_exit_frame(
+                nip_fi_assertion.is_some(),
+                refusal.denial_class(),
+                serde_json::json!({"type": "error", "message": "not a member"}),
+            );
             crate::connection::send_exit_frames_bounded(&mut ws_send, [deny_frame]).await;
             return;
         }
@@ -1571,22 +1559,11 @@ pub(crate) async fn handle_active_audio_connection(
                     mesh.owners.release(channel_id, generation);
                 }
             }
-            // Fix 4b: when an FI assertion is present, route through the canonical
-            // FI denial constructor so ParentMembershipLost is byte-identical to
-            // every other local-policy denial and the specific reason cannot be
-            // distinguished by the client. [FI-TRACE-DENIAL-ORACLE]
-            let deny_frame = if nip_fi_assertion.is_some() {
-                crate::nip_fi_session::denial_frame(
-                    crate::nip_fi_session::NipFiWsRoute::Audio,
-                    buzz_auth::DenialClass::AuthorizationDenied,
-                )
-            } else {
-                WsMessage::Text(
-                    serde_json::json!({"type": "error", "message": "error: not a member"})
-                        .to_string()
-                        .into(),
-                )
-            };
+            let deny_frame = authorization_exit_frame(
+                nip_fi_assertion.is_some(),
+                buzz_auth::DenialClass::AuthorizationDenied,
+                serde_json::json!({"type": "error", "message": "error: not a member"}),
+            );
             crate::connection::send_exit_frames_bounded(&mut ws_send, [deny_frame]).await;
             return;
         }
@@ -1608,15 +1585,13 @@ pub(crate) async fn handle_active_audio_connection(
                     mesh.owners.release(channel_id, generation);
                 }
             }
-            crate::connection::send_exit_frames_bounded(
-                &mut ws_send,
-                [WsMessage::Text(
-                    serde_json::json!({"type":"error","message":"huddle has ended"})
-                        .to_string()
-                        .into(),
-                )],
-            )
-            .await;
+            // The creator-signed link is the authority for the auto-add.
+            let deny_frame = authorization_exit_frame(
+                nip_fi_assertion.is_some(),
+                buzz_auth::DenialClass::AuthorizationDenied,
+                serde_json::json!({"type":"error","message":"huddle has ended"}),
+            );
+            crate::connection::send_exit_frames_bounded(&mut ws_send, [deny_frame]).await;
             return;
         }
         Err(JoinCommitError::Db(e)) => {
@@ -1636,15 +1611,12 @@ pub(crate) async fn handle_active_audio_connection(
                     mesh.owners.release(channel_id, generation);
                 }
             }
-            crate::connection::send_exit_frames_bounded(
-                &mut ws_send,
-                [WsMessage::Text(
-                    serde_json::json!({"type":"error","message":"error: join commit failed"})
-                        .to_string()
-                        .into(),
-                )],
-            )
-            .await;
+            let deny_frame = authorization_exit_frame(
+                nip_fi_assertion.is_some(),
+                buzz_auth::DenialClass::AuthorizationUnavailable,
+                serde_json::json!({"type":"error","message":"error: join commit failed"}),
+            );
+            crate::connection::send_exit_frames_bounded(&mut ws_send, [deny_frame]).await;
             return;
         }
     }
@@ -2500,6 +2472,46 @@ impl HuddleAdmissionGuard {
     }
 }
 
+/// Why [`check_membership_for_admission`] refused: the caller lacks the
+/// authority, or a dependency that decides it could not be read.
+#[derive(Debug)]
+enum AdmissionRefusal {
+    Denied(&'static str),
+    Dependency(buzz_db::DbError),
+}
+
+impl AdmissionRefusal {
+    fn denial_class(&self) -> buzz_auth::DenialClass {
+        match self {
+            Self::Denied(_) => buzz_auth::DenialClass::AuthorizationDenied,
+            Self::Dependency(_) => buzz_auth::DenialClass::AuthorizationUnavailable,
+        }
+    }
+}
+
+impl std::fmt::Display for AdmissionRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Denied(reason) => f.write_str(reason),
+            Self::Dependency(e) => write!(f, "db error: {e}"),
+        }
+    }
+}
+
+/// Exit frame for an authorization refusal: the canonical NIP-FI denial of
+/// `class` when the session carries an assertion, else the legacy Off-mode frame.
+fn authorization_exit_frame(
+    nip_fi: bool,
+    class: buzz_auth::DenialClass,
+    off_mode: serde_json::Value,
+) -> WsMessage {
+    if nip_fi {
+        crate::nip_fi_session::denial_frame(crate::nip_fi_session::NipFiWsRoute::Audio, class)
+    } else {
+        WsMessage::Text(off_mode.to_string().into())
+    }
+}
+
 /// Validate membership for audio admission — **no durable write**.
 ///
 /// Loads the channel, checks archival status, resolves the parent-channel
@@ -2515,7 +2527,7 @@ async fn check_membership_for_admission(
     channel_id: Uuid,
     pubkey_bytes: &[u8],
     parent_channel_id: Option<Uuid>,
-) -> Result<MembershipAdmission, String> {
+) -> Result<MembershipAdmission, AdmissionRefusal> {
     // Test hook: fires at the entry of the membership check so a test can arm
     // expiry between NIP-42 pairing and the first DB read. Proves that a
     // cancellation before membership check produces zero DB side effects.
@@ -2528,15 +2540,20 @@ async fn check_membership_for_admission(
         .db
         .get_channel(tenant.community(), channel_id)
         .await
-        .map_err(|e| format!("db error: {e}"))?;
+        .map_err(|e| match e {
+            buzz_db::DbError::ChannelNotFound(_) => AdmissionRefusal::Denied("channel not found"),
+            e => AdmissionRefusal::Dependency(e),
+        })?;
 
     if channel.archived_at.is_some() {
-        return Err("channel is archived".into());
+        return Err(AdmissionRefusal::Denied("channel is archived"));
     }
 
     // Lifecycle events for an ephemeral huddle belong in its parent channel.
     let lifecycle_parent_id = if channel.ttl_seconds.is_some() {
-        let parent_id = parent_channel_id.ok_or("ephemeral channel requires parent linkage")?;
+        let parent_id = parent_channel_id.ok_or(AdmissionRefusal::Denied(
+            "ephemeral channel requires parent linkage",
+        ))?;
         let linked = state
             .db
             .huddle_started_link_exists(
@@ -2546,9 +2563,11 @@ async fn check_membership_for_admission(
                 &channel.created_by,
             )
             .await
-            .map_err(|e| format!("db error: {e}"))?;
+            .map_err(AdmissionRefusal::Dependency)?;
         if !linked {
-            return Err("ephemeral channel is not linked to claimed parent".into());
+            return Err(AdmissionRefusal::Denied(
+                "ephemeral channel is not linked to claimed parent",
+            ));
         }
         parent_id
     } else {
@@ -2559,7 +2578,7 @@ async fn check_membership_for_admission(
     let is_member = state
         .is_member_cached(tenant.community(), channel_id, pubkey_bytes)
         .await
-        .map_err(|e| format!("db error: {e}"))?;
+        .map_err(AdmissionRefusal::Dependency)?;
 
     if is_member {
         return Ok(MembershipAdmission::Existing {
@@ -2578,7 +2597,7 @@ async fn check_membership_for_admission(
         let parent_member = state
             .is_member_cached(tenant.community(), lifecycle_parent_id, pubkey_bytes)
             .await
-            .map_err(|e| format!("db error: {e}"))?;
+            .map_err(AdmissionRefusal::Dependency)?;
 
         if parent_member {
             return Ok(MembershipAdmission::AutoAddRequired {
@@ -2588,7 +2607,7 @@ async fn check_membership_for_admission(
         }
     }
 
-    Err("not a member".into())
+    Err(AdmissionRefusal::Denied("not a member"))
 }
 
 /// Outcome returned by [`commit_participant_join`] on the `Ok` path.
@@ -3502,13 +3521,29 @@ mod tests {
     //   - Omit cancellation → cancellation assertion panics.
 
     async fn audio_test_state() -> std::sync::Arc<crate::state::AppState> {
+        audio_test_state_with(false, None).await
+    }
+
+    /// `audio_test_state` over the same unreachable database; an
+    /// `acquire_timeout` makes each DB read fail promptly instead of after
+    /// sqlx's default wait.
+    async fn audio_test_state_with(
+        require_relay_membership: bool,
+        acquire_timeout: Option<std::time::Duration>,
+    ) -> std::sync::Arc<crate::state::AppState> {
         use std::sync::Arc;
         // Fix 5: use Config::for_test() which holds NIP_FI_ENV_LOCK internally. [FI-TRACE-ENV-RACE]
         let mut config = crate::config::Config::for_test();
-        config.require_relay_membership = false;
+        config.require_relay_membership = require_relay_membership;
         config.database_url = "postgres://buzz:buzz_dev@127.0.0.1:1/buzz".to_string();
         config.redis_url = "redis://127.0.0.1:1".to_string();
-        let pool = sqlx::PgPool::connect_lazy(&config.database_url).expect("lazy pg pool");
+        let mut pool_options = sqlx::postgres::PgPoolOptions::new();
+        if let Some(timeout) = acquire_timeout {
+            pool_options = pool_options.acquire_timeout(timeout);
+        }
+        let pool = pool_options
+            .connect_lazy(&config.database_url)
+            .expect("lazy pg pool");
         let db = buzz_db::Db::from_pool(pool.clone());
         let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)
             .create_pool(Some(deadpool_redis::Runtime::Tokio1))
@@ -3724,15 +3759,18 @@ mod tests {
         let _ = server.await;
     }
 
-    /// Drive `handle_active_audio_connection` through a NIP-42 proof signed
-    /// over the wrong challenge; return every text frame received after the
-    /// challenge (until close) and whether the connection token was cancelled.
-    async fn run_audio_bad_nip42_proof(
+    /// Drive `handle_active_audio_connection` through one NIP-42 AUTH from
+    /// `key`, signed over the issued challenge or, when `sign_issued_challenge`
+    /// is false, over the wrong one. Returns every text frame received after
+    /// the challenge and whether the connection token was cancelled. Panics if
+    /// the handler neither closes nor ends the stream within the read budget.
+    async fn run_audio_auth(
+        state: std::sync::Arc<crate::state::AppState>,
         assertion: Option<buzz_auth::VerifiedAssertion>,
+        key: &nostr::Keys,
+        sign_issued_challenge: bool,
     ) -> (Vec<String>, bool) {
         use std::sync::Arc;
-        let key = nostr::Keys::generate();
-        let state = audio_test_state().await;
         let tenant = buzz_core::tenant::TenantContext::resolved(
             buzz_core::tenant::CommunityId::from_uuid(uuid::Uuid::nil()),
             "test.local".to_string(),
@@ -3768,13 +3806,27 @@ mod tests {
         let (mut client, _) = connect_async(format!("ws://{addr}/"))
             .await
             .expect("connect");
-        let _challenge = tokio::time::timeout(std::time::Duration::from_secs(2), client.next())
+        let challenge = match tokio::time::timeout(std::time::Duration::from_secs(2), client.next())
             .await
-            .expect("challenge timeout");
+            .expect("challenge timeout")
+        {
+            Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t))) => {
+                serde_json::from_str::<serde_json::Value>(&t).expect("challenge JSON")["challenge"]
+                    .as_str()
+                    .expect("challenge field")
+                    .to_string()
+            }
+            other => panic!("expected challenge text; got {other:?}"),
+        };
+        let signed_challenge = if sign_issued_challenge {
+            challenge.as_str()
+        } else {
+            "not-the-issued-challenge"
+        };
         let auth_event = nostr::EventBuilder::new(nostr::Kind::Authentication, "")
             .tag(nostr::Tag::parse(["relay", "ws://test.local"]).unwrap())
-            .tag(nostr::Tag::parse(["challenge", "not-the-issued-challenge"]).unwrap())
-            .sign_with_keys(&key)
+            .tag(nostr::Tag::parse(["challenge", signed_challenge]).unwrap())
+            .sign_with_keys(key)
             .unwrap();
         client
             .send(tokio_tungstenite::tungstenite::Message::Text(
@@ -3785,17 +3837,98 @@ mod tests {
             .await
             .expect("send auth");
         let mut frames = Vec::new();
-        while let Ok(Some(Ok(msg))) =
-            tokio::time::timeout(std::time::Duration::from_secs(3), client.next()).await
-        {
-            match msg {
-                tokio_tungstenite::tungstenite::Message::Text(t) => frames.push(t.to_string()),
-                tokio_tungstenite::tungstenite::Message::Close(_) => break,
-                _ => {}
+        loop {
+            let next = tokio::time::timeout(std::time::Duration::from_secs(5), client.next())
+                .await
+                .expect("handler must close the connection within the read budget");
+            match next {
+                Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t))) => {
+                    frames.push(t.to_string())
+                }
+                Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_)))
+                | Some(Err(_))
+                | None => break,
+                Some(Ok(_)) => {}
             }
         }
         server.abort();
         (frames, cancel_for_assert.is_cancelled())
+    }
+
+    async fn run_audio_bad_nip42_proof(
+        assertion: Option<buzz_auth::VerifiedAssertion>,
+    ) -> (Vec<String>, bool) {
+        let key = nostr::Keys::generate();
+        run_audio_auth(audio_test_state().await, assertion, &key, false).await
+    }
+
+    fn audio_denial(class: buzz_auth::DenialClass) -> String {
+        serde_json::json!({"type": "restricted", "message": class.nostr_text()}).to_string()
+    }
+
+    /// Authenticate a paired FI (or Off-mode) session against the unreachable
+    /// database, so the first dependency read after pairing fails.
+    async fn run_audio_auth_with_failing_db(
+        require_relay_membership: bool,
+        nip_fi: bool,
+    ) -> Vec<String> {
+        let key = nostr::Keys::generate();
+        let assertion = nip_fi.then(|| {
+            buzz_auth::VerifiedAssertion::for_test(
+                Some(key.public_key()),
+                vec![chrono::Utc::now() + chrono::Duration::hours(1)],
+            )
+        });
+        let state = audio_test_state_with(
+            require_relay_membership,
+            Some(std::time::Duration::from_millis(100)),
+        )
+        .await;
+        run_audio_auth(state, assertion, &key, true).await.0
+    }
+
+    /// A relay-membership lookup failure is an unreadable dependency, not a
+    /// policy denial. Mutation: collapse the `Err` arm back into
+    /// `AuthorizationDenied` → RED.
+    #[tokio::test]
+    async fn audio_relay_membership_lookup_failure_with_fi_emits_authorization_unavailable() {
+        assert_eq!(
+            run_audio_auth_with_failing_db(true, true).await,
+            vec![audio_denial(
+                buzz_auth::DenialClass::AuthorizationUnavailable
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn audio_relay_membership_lookup_failure_off_mode_keeps_legacy_frame() {
+        assert_eq!(
+            run_audio_auth_with_failing_db(true, false).await,
+            vec![
+                serde_json::json!({"type": "error", "message": "restricted: not a relay member"})
+                    .to_string()
+            ]
+        );
+    }
+
+    /// A channel-membership lookup failure is an unreadable dependency.
+    /// Mutation: map `AdmissionRefusal::Dependency` to `AuthorizationDenied` → RED.
+    #[tokio::test]
+    async fn audio_channel_membership_lookup_failure_with_fi_emits_authorization_unavailable() {
+        assert_eq!(
+            run_audio_auth_with_failing_db(false, true).await,
+            vec![audio_denial(
+                buzz_auth::DenialClass::AuthorizationUnavailable
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn audio_channel_membership_lookup_failure_off_mode_keeps_legacy_frame() {
+        assert_eq!(
+            run_audio_auth_with_failing_db(false, false).await,
+            vec![serde_json::json!({"type": "error", "message": "not a member"}).to_string()]
+        );
     }
 
     /// Under NIP-FI a failed NIP-42 proof is classified like the root route:
@@ -9762,14 +9895,19 @@ mod tests {
         //      returns false → `ParentMembershipLost`.
         //   6. The handler sends `{"type":"restricted",...}` via `ws_send`.
         //
-        // ## Mutation oracle
-        //
-        // Change the `ParentMembershipLost` FI branch to send the legacy
-        // `{"type":"error","message":"error: not a member"}` frame → the
-        // `assert_eq!` below panics.
-        #[tokio::test]
-        #[ignore = "requires Postgres — runs in postgres-ci nextest lane"]
-        async fn fix_4b_parent_membership_lost_with_fi_emits_restricted_wire_frame() {
+        // `run_auto_add_commit_race` drives that schedule and applies `race`
+        // at step 4, so each commit-time refusal is exercised through the
+        // production handler. It returns the first frame the client receives.
+        enum CommitRace {
+            /// Delete the parent membership → `ParentMembershipLost`.
+            ParentMembershipRevoked,
+            /// Delete the creator-signed huddle_started link → `HuddleLinkGone`.
+            HuddleLinkDeleted,
+            /// Terminate the join transaction's backend → `JoinCommitError::Db`.
+            TransactionBackendLost,
+        }
+
+        async fn run_auto_add_commit_race(race: CommitRace) -> String {
             use axum::extract::ws::WebSocketUpgrade;
             use axum::routing::get;
             use axum::Router;
@@ -9985,51 +10123,116 @@ mod tests {
                 .expect("F4b-pml: must reach membership_lock_hook within 10s")
                 .expect("arrived channel closed");
 
-            // While the handler is paused inside the transaction (before the lock
-            // is acquired), delete the parent membership row. The re-read inside
-            // the transaction will find no parent member → ParentMembershipLost.
-            sqlx::query(
-                "DELETE FROM channel_members \
-                 WHERE channel_id = $1 AND community_id = $2 AND pubkey = $3",
-            )
-            .bind(parent_channel_id)
-            .bind(community_uuid)
-            .bind(&joiner_bytes)
-            .execute(&pool_c)
-            .await
-            .expect("F4b-pml: delete parent membership");
+            // While the handler is paused inside the transaction (before the
+            // membership lock), change the fact the commit re-reads.
+            match race {
+                CommitRace::ParentMembershipRevoked => {
+                    sqlx::query(
+                        "DELETE FROM channel_members \
+                         WHERE channel_id = $1 AND community_id = $2 AND pubkey = $3",
+                    )
+                    .bind(parent_channel_id)
+                    .bind(community_uuid)
+                    .bind(&joiner_bytes)
+                    .execute(&pool_c)
+                    .await
+                    .expect("F4b-pml: delete parent membership");
+                }
+                CommitRace::HuddleLinkDeleted => {
+                    sqlx::query("DELETE FROM events WHERE community_id = $1 AND kind = 48100")
+                        .bind(community_uuid)
+                        .execute(&pool_c)
+                        .await
+                        .expect("F4b-pml: delete huddle_started link");
+                }
+                CommitRace::TransactionBackendLost => {
+                    // The join transaction holds `FOR NO KEY UPDATE` on the
+                    // child row; a waiter on that row names it as its blocker.
+                    let mut waiter = pool_c.begin().await.expect("waiter tx");
+                    let waiter_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                        .fetch_one(&mut *waiter)
+                        .await
+                        .expect("waiter pid");
+                    let wait = tokio::spawn(async move {
+                        let _ = sqlx::query("SELECT 1 FROM channels WHERE id = $1 FOR UPDATE")
+                            .bind(child_channel_id)
+                            .execute(&mut *waiter)
+                            .await;
+                        waiter
+                    });
+                    let blocker = loop {
+                        let blockers: Vec<i32> =
+                            sqlx::query_scalar("SELECT unnest(pg_blocking_pids($1))")
+                                .bind(waiter_pid)
+                                .fetch_all(&pool_c)
+                                .await
+                                .expect("blocking pids");
+                        if let [pid] = blockers[..] {
+                            break pid;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    };
+                    sqlx::query("SELECT pg_terminate_backend($1)")
+                        .bind(blocker)
+                        .execute(&pool_c)
+                        .await
+                        .expect("terminate join transaction backend");
+                    let _ = wait.await.expect("waiter").rollback().await;
+                }
+            }
 
             // Release the hook — the transaction proceeds, finds no parent member,
             // and the handler sends the FI denial frame.
             release.notify_one();
 
-            // Must receive the exact restricted frame.
             let frame = tokio::time::timeout(std::time::Duration::from_secs(5), client.next())
                 .await
-                .expect("restricted frame timeout")
+                .expect("commit refusal frame timeout")
                 .expect("frame present")
                 .expect("ws frame");
-
-            let expected = serde_json::json!({
-                "type": "restricted",
-                "message": buzz_auth::DenialClass::AuthorizationDenied.nostr_text()
-            })
-            .to_string();
-
-            match frame {
-                tokio_tungstenite::tungstenite::Message::Text(t) => {
-                    assert_eq!(
-                        t.as_str(),
-                        expected.as_str(),
-                        "F4b-pml: ParentMembershipLost with FI must produce exact restricted JSON\n\
-                         Mutation oracle: revert ParentMembershipLost FI branch to legacy error → panics"
-                    );
-                }
-                other => panic!("F4b-pml: expected Text(restricted JSON); got {other:?}"),
-            }
-
             server.abort();
             let _ = server.await;
+            match frame {
+                tokio_tungstenite::tungstenite::Message::Text(t) => t.to_string(),
+                other => panic!("F4b-pml: expected Text frame; got {other:?}"),
+            }
+        }
+
+        fn restricted(class: buzz_auth::DenialClass) -> String {
+            serde_json::json!({"type": "restricted", "message": class.nostr_text()}).to_string()
+        }
+
+        // Mutation: send the legacy `error: not a member` frame on the FI
+        // branch → RED.
+        #[tokio::test]
+        #[ignore = "requires Postgres — runs in postgres-ci nextest lane"]
+        async fn fix_4b_parent_membership_lost_with_fi_emits_restricted_wire_frame() {
+            assert_eq!(
+                run_auto_add_commit_race(CommitRace::ParentMembershipRevoked).await,
+                restricted(buzz_auth::DenialClass::AuthorizationDenied)
+            );
+        }
+
+        // The creator-signed link is the auto-add authority. Mutation: send
+        // the legacy `huddle has ended` frame on the FI branch → RED.
+        #[tokio::test]
+        #[ignore = "requires Postgres — runs in postgres-ci nextest lane"]
+        async fn huddle_link_gone_before_commit_with_fi_emits_authorization_denied() {
+            assert_eq!(
+                run_auto_add_commit_race(CommitRace::HuddleLinkDeleted).await,
+                restricted(buzz_auth::DenialClass::AuthorizationDenied)
+            );
+        }
+
+        // Mutation: send the legacy `error: join commit failed` frame, or
+        // `AuthorizationDenied`, on the FI branch → RED.
+        #[tokio::test]
+        #[ignore = "requires Postgres — runs in postgres-ci nextest lane"]
+        async fn join_commit_db_failure_with_fi_emits_authorization_unavailable() {
+            assert_eq!(
+                run_auto_add_commit_race(CommitRace::TransactionBackendLost).await,
+                restricted(buzz_auth::DenialClass::AuthorizationUnavailable)
+            );
         }
         // ── Cross-pod handler harness (shared by the confirm/bootstrap witnesses) ──
         //
