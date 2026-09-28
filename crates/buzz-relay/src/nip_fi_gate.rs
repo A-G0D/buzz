@@ -135,17 +135,17 @@ impl SessionAdmissionGate {
         // guard, expiry cannot transition until we release it. A cancelled token
         // or a past deadline means expiry has already been queued (or is guaranteed
         // to fire before any new socket I/O completes).
-        if self.cancel.is_cancelled() {
+        if self.is_expired_or_past_deadline() {
             return Err(SessionExpired);
-        }
-        if let Some(deadline) = self.deadline {
-            // Equality is expired per spec [FI-TRACE-LEASE-BOUND].
-            if Utc::now() >= deadline {
-                return Err(SessionExpired);
-            }
         }
 
         Ok(SessionEffectPermit { _guard: guard })
+    }
+
+    /// Whether the wall-clock deadline has been reached. Equality is expired
+    /// per spec [FI-TRACE-LEASE-BOUND]. Always `false` in off-mode.
+    pub(crate) fn deadline_passed(&self) -> bool {
+        self.deadline.is_some_and(|deadline| Utc::now() >= deadline)
     }
 
     /// Returns a future that resolves when the gate's cancellation token fires.
@@ -161,17 +161,8 @@ impl SessionAdmissionGate {
     /// This is a **defense-in-depth** check at dispatch time, not a substitute
     /// for acquiring a permit. Handler permits are authoritative; this check
     /// merely avoids spawning obviously-dead work.
-    #[allow(dead_code)] // used in nip_fi_gate unit tests and forthcoming B1/B2 witnesses
     pub(crate) fn is_expired_or_past_deadline(&self) -> bool {
-        if self.cancel.is_cancelled() {
-            return true;
-        }
-        if let Some(deadline) = self.deadline {
-            if Utc::now() >= deadline {
-                return true;
-            }
-        }
-        false
+        self.cancel.is_cancelled() || self.deadline_passed()
     }
 
     /// Expire the session.

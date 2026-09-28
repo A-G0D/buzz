@@ -190,31 +190,40 @@ pub(crate) fn spawn_nip_fi_expiry_task(
         } else {
             std::time::Duration::ZERO
         };
+        let terminal = || {
+            let _ = terminal_ctrl_tx.try_send(denial_frame(
+                route,
+                buzz_auth::DenialClass::AuthorizationDenied,
+            ));
+            metrics::counter!("buzz_nip_fi_lease_expirations_total").increment(1);
+            warn!(
+                route = ?route,
+                "NIP-FI session lease expired — closing connection"
+            );
+        };
+        // gate.expire() ordering (per contract [6d3b75a5]):
+        //   1. terminal() — queues denial frame before any lock is held.
+        //   2. cancel.cancel() — socket termination at the deadline.
+        //   3. write guard — quiescence barrier; blocks until all pre-expiry
+        //      effect permits are released, then records Expired.
+        // The task's await on gate.expire() completes only after the write
+        // guard is released, so connection teardown (which awaits this task
+        // handle before remove_connection) cannot start until pre-expiry
+        // effects have finished their bounded commits.
+        //
+        // This task is the single owner of the deadline denial. A handler whose
+        // `acquire_effect` saw the elapsed deadline cancels and awaits this
+        // task; the cancellation can win the select even though the deadline
+        // passed, so that arm still expires when the deadline is reached. Only
+        // one arm runs, so the frame is queued at most once, and cancellation
+        // before the deadline (disconnect, archival, shutdown) queues nothing.
         tokio::select! {
-            _ = tokio::time::sleep(remaining) => {
-                // gate.expire() ordering (per contract [6d3b75a5]):
-                //   1. terminal() — queues denial frame before any lock is held.
-                //   2. cancel.cancel() — socket termination at the deadline.
-                //   3. write guard — quiescence barrier; blocks until all pre-expiry
-                //      effect permits are released, then records Expired.
-                // The task's await on gate.expire() completes only after the write
-                // guard is released, so connection teardown (which awaits this task
-                // handle before remove_connection) cannot start until pre-expiry
-                // effects have finished their bounded commits.
-                gate.expire(|| {
-                    let _ = terminal_ctrl_tx.try_send(denial_frame(
-                        route,
-                        buzz_auth::DenialClass::AuthorizationDenied,
-                    ));
-                    metrics::counter!("buzz_nip_fi_lease_expirations_total").increment(1);
-                    warn!(
-                        route = ?route,
-                        "NIP-FI session lease expired — closing connection"
-                    );
-                })
-                .await;
+            _ = tokio::time::sleep(remaining) => gate.expire(terminal).await,
+            _ = gate.cancelled() => {
+                if gate.deadline_passed() {
+                    gate.expire(terminal).await;
+                }
             }
-            _ = gate.cancelled() => {}
         }
     })
 }
@@ -365,5 +374,98 @@ mod tests {
             }
             other => panic!("expected Text denial frame, got {other:?}"),
         }
+    }
+
+    // ── I3: the deadline denial has one owner, whatever wins the race ─────────
+    //
+    // A handler's `acquire_effect` can observe the elapsed deadline before the
+    // expiry worker's timer fires. The handler then cancels and awaits the
+    // worker; the worker must still queue exactly one denial. Paused Tokio time
+    // keeps the worker's timer pending while the wall-clock deadline elapses,
+    // so its cancellation arm deterministically runs first.
+    //
+    // Mutation: drop the `deadline_passed()` expiry from the cancellation arm →
+    // no frame is queued → `denial_frames` is empty → assertion fails.
+
+    fn denial_frames(rx: &mut mpsc::Receiver<WsMessage>) -> Vec<WsMessage> {
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    fn assert_one_audio_denial(frames: &[WsMessage]) {
+        assert_eq!(
+            frames,
+            [denial_frame(
+                NipFiWsRoute::Audio,
+                buzz_auth::DenialClass::AuthorizationDenied
+            )],
+            "exactly one canonical deadline denial must be queued"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn deadline_refused_permit_still_queues_one_denial_when_cancel_wins() {
+        let (terminal_tx, mut terminal_rx) = mpsc::channel::<WsMessage>(1);
+        let cancel = CancellationToken::new();
+        let deadline = Utc::now() + chrono::Duration::milliseconds(50);
+        let gate = crate::nip_fi_gate::SessionAdmissionGate::new(deadline, cancel.clone());
+        let worker = spawn_nip_fi_expiry_task(
+            deadline,
+            Arc::clone(&gate),
+            terminal_tx,
+            NipFiWsRoute::Audio,
+        );
+        tokio::task::yield_now().await; // worker is parked on its (paused) timer
+
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        assert!(
+            gate.acquire_effect().await.is_err(),
+            "the handler sees the deadline"
+        );
+        assert!(terminal_rx.try_recv().is_err(), "worker has not queued yet");
+        cancel.cancel();
+        worker.await.expect("expiry task");
+
+        assert_one_audio_denial(&denial_frames(&mut terminal_rx));
+    }
+
+    #[tokio::test]
+    async fn deadline_refused_permit_after_worker_expired_queues_no_duplicate() {
+        let (terminal_tx, mut terminal_rx) = mpsc::channel::<WsMessage>(1);
+        let cancel = CancellationToken::new();
+        let deadline = Utc::now() - chrono::Duration::milliseconds(1);
+        let gate = crate::nip_fi_gate::SessionAdmissionGate::new(deadline, cancel.clone());
+        let worker = spawn_nip_fi_expiry_task(
+            deadline,
+            Arc::clone(&gate),
+            terminal_tx,
+            NipFiWsRoute::Audio,
+        );
+        while !cancel.is_cancelled() {
+            tokio::task::yield_now().await; // worker's timer arm wins and expires
+        }
+
+        assert!(gate.acquire_effect().await.is_err());
+        cancel.cancel();
+        worker.await.expect("expiry task");
+
+        assert_one_audio_denial(&denial_frames(&mut terminal_rx));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_before_deadline_queues_no_denial() {
+        let (terminal_tx, mut terminal_rx) = mpsc::channel::<WsMessage>(1);
+        let cancel = CancellationToken::new();
+        let deadline = Utc::now() + chrono::Duration::hours(1);
+        let gate = crate::nip_fi_gate::SessionAdmissionGate::new(deadline, cancel.clone());
+        let worker = spawn_nip_fi_expiry_task(
+            deadline,
+            Arc::clone(&gate),
+            terminal_tx,
+            NipFiWsRoute::Audio,
+        );
+        cancel.cancel();
+        worker.await.expect("expiry task");
+
+        assert!(denial_frames(&mut terminal_rx).is_empty());
     }
 }
