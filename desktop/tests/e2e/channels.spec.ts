@@ -2522,20 +2522,31 @@ test("typing indicator shows avatars and maintains stable name order", async ({
 
   await page.getByTestId("channel-random").click();
   await expect(page.getByTestId("chat-title")).toHaveText("random");
+  const randomChannelId = await page
+    .getByTestId("channel-random")
+    .getAttribute("data-channel-id");
+  if (!randomChannelId) {
+    throw new Error("Random channel id missing.");
+  }
+  await invokeMockCommand(page, "add_channel_members", {
+    channelId: randomChannelId,
+    pubkeys: [TEST_IDENTITIES.outsider.pubkey],
+    role: "member",
+  });
   await waitForMockLiveSubscription(page, "random", KIND_TYPING_INDICATOR);
 
-  // Alice starts typing first
+  // Bob starts typing first
   await page.evaluate((pubkey) => {
     window.__BUZZ_E2E_EMIT_MOCK_TYPING__?.({
       channelName: "random",
       pubkey,
     });
-  }, TEST_IDENTITIES.alice.pubkey);
+  }, TEST_IDENTITIES.bob.pubkey);
 
   await expect(page.getByTestId("message-typing-indicator")).toBeVisible();
   await expect(
     page.getByTestId("message-typing-indicator-label"),
-  ).toContainText("alice is typing");
+  ).toContainText("bob is typing");
 
   // Verify avatar is rendered for the typing user
   const avatars = page
@@ -2543,32 +2554,20 @@ test("typing indicator shows avatars and maintains stable name order", async ({
     .locator("[data-testid='message-typing-avatar']");
   await expect(avatars).toHaveCount(1);
 
-  // Bob starts typing second
+  // Outsider starts typing second
   await page.evaluate((pubkey) => {
     window.__BUZZ_E2E_EMIT_MOCK_TYPING__?.({
       channelName: "random",
       pubkey,
     });
-  }, TEST_IDENTITIES.bob.pubkey);
+  }, TEST_IDENTITIES.outsider.pubkey);
 
   await expect(
     page.getByTestId("message-typing-indicator-label"),
-  ).toContainText("alice and bob are typing");
+  ).toContainText("bob and outsider are typing");
   await expect(avatars).toHaveCount(2);
 
-  // Alice re-broadcasts — order should stay "alice and bob", not flip
-  await page.evaluate((pubkey) => {
-    window.__BUZZ_E2E_EMIT_MOCK_TYPING__?.({
-      channelName: "random",
-      pubkey,
-    });
-  }, TEST_IDENTITIES.alice.pubkey);
-
-  await expect(
-    page.getByTestId("message-typing-indicator-label"),
-  ).toContainText("alice and bob are typing");
-
-  // Bob re-broadcasts — order should still stay "alice and bob"
+  // Bob re-broadcasts — order should stay "bob and outsider", not flip
   await page.evaluate((pubkey) => {
     window.__BUZZ_E2E_EMIT_MOCK_TYPING__?.({
       channelName: "random",
@@ -2578,7 +2577,19 @@ test("typing indicator shows avatars and maintains stable name order", async ({
 
   await expect(
     page.getByTestId("message-typing-indicator-label"),
-  ).toContainText("alice and bob are typing");
+  ).toContainText("bob and outsider are typing");
+
+  // Outsider re-broadcasts — order should still stay "bob and outsider"
+  await page.evaluate((pubkey) => {
+    window.__BUZZ_E2E_EMIT_MOCK_TYPING__?.({
+      channelName: "random",
+      pubkey,
+    });
+  }, TEST_IDENTITIES.outsider.pubkey);
+
+  await expect(
+    page.getByTestId("message-typing-indicator-label"),
+  ).toContainText("bob and outsider are typing");
 });
 
 test("sidebar shows unread indicator for newly active channels", async ({
