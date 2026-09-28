@@ -1,6 +1,8 @@
 //! Local certificate verification for protected agents and their CLI helpers.
 use std::path::Path;
+/// Optional launcher-owned certificate snapshot path.
 pub const ROOTS_ENV: &str = "BUZZ_SANDBOX_TLS_ROOTS";
+/// Use ordinary platform trust unless an explicit launcher snapshot is configured.
 pub fn http_builder() -> Result<reqwest::ClientBuilder, anyhow::Error> {
     let builder = reqwest::Client::builder();
     match std::env::var_os(ROOTS_ENV) {
@@ -8,6 +10,7 @@ pub fn http_builder() -> Result<reqwest::ClientBuilder, anyhow::Error> {
         Some(path) => builder_with_roots(builder, Path::new(&path)),
     }
 }
+/// Restrict verification to a nonempty DER certificate snapshot; invalid input fails closed.
 pub fn builder_with_roots(
     builder: reqwest::ClientBuilder,
     path: &Path,

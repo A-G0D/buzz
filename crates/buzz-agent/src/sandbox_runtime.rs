@@ -16,13 +16,19 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::{sync::Arc, time::Duration};
 
+/// Launcher-supplied JSON capability for a fixed loopback credential broker.
 pub const BROKER_ENV: &str = "BUZZ_SANDBOX_AUTH_BROKER";
+/// Path to the immutable certificate snapshot supplied by the launcher.
 pub const ROOTS_ENV: &str = "BUZZ_SANDBOX_TLS_ROOTS";
 
+/// Connection capability passed only to the protected agent, never its tools.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct BrokerConfig {
+    /// Loopback TCP port selected by the trusted launcher.
     pub port: u16,
+    /// Random bearer capability authenticating requests to the launcher.
     pub secret: String,
+    /// Exact configured model service URL; prevents cross-provider reuse.
     pub host: String,
 }
 #[derive(Serialize, Deserialize)]
