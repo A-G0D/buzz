@@ -23,6 +23,15 @@ against that direction. Scale validation to the change's risk and exercise the
 real workflow for user-visible or integration behavior when practical; green CI
 and runtime evidence answer different questions.
 
+### Execution discipline
+
+- Complete recoverable work before reporting an intention to do it. Do not
+  replace an executable next step with a promise to act later.
+- When a user asks for progress or a diagnosis, answer with the evidence found,
+  then resume the authorized task unless they explicitly ask to stop. Pause only
+  for a real high-level decision, an irreversible action, or a required external
+  dependency.
+
 ---
 
 ## Ecosystem
