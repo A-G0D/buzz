@@ -441,13 +441,34 @@ struct NostrIdentityChallenge {
     expires_at: String,
 }
 
-async fn authenticated_json(
+#[derive(Debug, Serialize)]
+pub(crate) struct AuthenticatedJsonResponse {
+    http_status: u16,
+    body: serde_json::Value,
+}
+
+fn authenticated_json_response_from_parts(
+    status: reqwest::StatusCode,
+    bytes: &[u8],
+) -> Result<AuthenticatedJsonResponse, String> {
+    let body: serde_json::Value = serde_json::from_slice(bytes)
+        .map_err(|error| format!("invalid Builderlab response: {error}"))?;
+    if !status.is_success() && body.get("error").is_none() {
+        return Err(format!("Builderlab request failed (HTTP {status})."));
+    }
+    Ok(AuthenticatedJsonResponse {
+        http_status: status.as_u16(),
+        body,
+    })
+}
+
+async fn authenticated_json_with_status(
     client: &reqwest::Client,
     session: &BuilderlabSession,
     method: reqwest::Method,
     path: &str,
     body: serde_json::Value,
-) -> Result<serde_json::Value, String> {
+) -> Result<AuthenticatedJsonResponse, String> {
     let credential = session
         .0
         .lock()
@@ -474,20 +495,25 @@ async fn authenticated_json(
         }
         bytes.extend_from_slice(&chunk);
     }
-    let value: serde_json::Value = serde_json::from_slice(&bytes)
-        .map_err(|error| format!("invalid Builderlab response: {error}"))?;
-    if !status.is_success() {
-        // Builderlab error responses carry a structured `{ error: { code,
-        // message, setup_needed, ... } }` body. Pass those through as `Ok` so the
-        // frontend's typed handling and friendly per-code messages apply, instead
-        // of surfacing a raw JSON blob. Only fall back to a plain string when the
-        // body isn't the expected shape.
-        if value.get("error").is_some() {
-            return Ok(value);
-        }
-        return Err(format!("Builderlab request failed (HTTP {status})."));
-    }
-    Ok(value)
+    // Builderlab error responses carry a structured `{ error: { code,
+    // message, setup_needed, ... } }` body. Preserve those as a typed result so
+    // the deletion classifier can bind the body to reqwest's actual status.
+    // Other callers continue to receive only the body through authenticated_json.
+    authenticated_json_response_from_parts(status, &bytes)
+}
+
+async fn authenticated_json(
+    client: &reqwest::Client,
+    session: &BuilderlabSession,
+    method: reqwest::Method,
+    path: &str,
+    body: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    Ok(
+        authenticated_json_with_status(client, session, method, path, body)
+            .await?
+            .body,
+    )
 }
 
 #[tauri::command]
@@ -689,8 +715,8 @@ pub(crate) async fn delete_builderlab_community(
     acknowledgement_version: i32,
     app_state: tauri::State<'_, crate::app_state::AppState>,
     session: tauri::State<'_, BuilderlabSession>,
-) -> Result<serde_json::Value, String> {
-    authenticated_json(
+) -> Result<AuthenticatedJsonResponse, String> {
+    authenticated_json_with_status(
         &app_state.http_client,
         &session,
         reqwest::Method::POST,
@@ -708,8 +734,8 @@ pub(crate) async fn get_builderlab_community_deletion_receipt(
     acknowledgement_version: i32,
     app_state: tauri::State<'_, crate::app_state::AppState>,
     session: tauri::State<'_, BuilderlabSession>,
-) -> Result<serde_json::Value, String> {
-    authenticated_json(
+) -> Result<AuthenticatedJsonResponse, String> {
+    authenticated_json_with_status(
         &app_state.http_client,
         &session,
         reqwest::Method::POST,
@@ -815,6 +841,18 @@ mod tests {
             assert_eq!(url.origin().ascii_serialization(), BUILDERLAB_ORIGIN);
             assert_eq!(url.path(), format!("/api/goose{path}"));
         }
+    }
+
+    #[test]
+    fn deletion_transport_uses_the_native_status_not_a_body_claim() {
+        let response = authenticated_json_response_from_parts(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            br#"{"http_status":202,"error":{"code":"relay_unavailable"}}"#,
+        )
+        .expect("structured response");
+
+        assert_eq!(response.http_status, 503);
+        assert_eq!(response.body["http_status"], 202);
     }
 
     #[test]

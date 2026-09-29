@@ -244,6 +244,11 @@ type E2eConfig = {
     builderlabLoginDelayMs?: number;
     /** Bound Builderlab Nostr identity. Null/omitted = not linked yet. */
     builderlabIdentity?: { npub?: string; pubkey_hex?: string } | null;
+    /** Ordered native identity results; the final result remains sticky. */
+    builderlabIdentityResponseSequence?: Array<
+      | { identity: { npub?: string; pubkey_hex?: string } }
+      | { error: { code: string; setup_needed?: boolean } }
+    >;
     /** Structured error returned when onboarding tries to bind the local identity. */
     builderlabBindError?: { code?: string; message?: string };
     /** Communities owned by the mocked Builderlab account. */
@@ -260,6 +265,10 @@ type E2eConfig = {
       code: string;
       message?: string;
     } | null>;
+    builderlabDeletionHttpStatusSequence?: number[];
+    builderlabDeletionBodyStatus?: number;
+    /** Hold deletion/receipt responses until the test explicitly releases them. */
+    builderlabDeferDeletion?: boolean;
     builderlabAuthSequence?: Array<{
       email?: string;
       name?: string;
@@ -1607,6 +1616,8 @@ declare global {
      *  `syncAgentsToActiveHuddleDelayMs`, letting it resolve without waiting
      *  out the delay. Returns the number of holds flushed. */
     __BUZZ_E2E_RELEASE_HUDDLE_AGENT_SYNCS__?: () => number;
+    /** Release every held hosted-community deletion response. */
+    __BUZZ_E2E_RELEASE_BUILDERLAB_DELETIONS__?: () => number;
     /** Hold the next channel read until released. */
     __BUZZ_E2E_DEFER_NEXT_CHANNELS_READ__?: () => void;
     /** Disarm the latch and release the held channel read, if any. */
@@ -1783,6 +1794,7 @@ let heldManagedAgentStartReleases: Array<() => void> = [];
 // must outlast the mid-send mutation a spec injects, then settle on demand
 // rather than on a timer, so the publish never races the injection.
 let heldHuddleAgentSyncReleases: Array<() => void> = [];
+let heldBuilderlabDeletionReleases: Array<() => void> = [];
 let cancelledMediaUploadIds = new Set<string>();
 let cancelledMediaFetchIds = new Set<string>();
 let mockMediaFetchControllers = new Map<string, AbortController>();
@@ -11816,6 +11828,12 @@ export function maybeInstallE2eTauriMocks() {
     for (const release of held) release();
     return held.length;
   };
+  heldBuilderlabDeletionReleases = [];
+  window.__BUZZ_E2E_RELEASE_BUILDERLAB_DELETIONS__ = () => {
+    const held = heldBuilderlabDeletionReleases.splice(0);
+    for (const release of held) release();
+    return held.length;
+  };
   deferNextChannelsRead = false;
   deferredChannelsReadResolve = null;
   window.__BUZZ_E2E_CHANNELS_READ_PENDING__ = 0;
@@ -12579,6 +12597,10 @@ export function maybeInstallE2eTauriMocks() {
         if (activeConfig?.mock) activeConfig.mock.builderlabAuth = null;
         return null;
       case "get_builderlab_nostr_identity":
+        if (activeConfig?.mock?.builderlabIdentityResponseSequence?.length) {
+          const sequence = activeConfig.mock.builderlabIdentityResponseSequence;
+          return sequence.length > 1 ? sequence.shift() : sequence[0];
+        }
         return activeConfig?.mock?.builderlabIdentity
           ? { identity: activeConfig.mock.builderlabIdentity }
           : { error: { code: "missing_mapping", setup_needed: true } };
@@ -12634,6 +12656,11 @@ export function maybeInstallE2eTauriMocks() {
       }
       case "delete_builderlab_community":
       case "get_builderlab_community_deletion_receipt": {
+        if (activeConfig?.mock?.builderlabDeferDeletion) {
+          await new Promise<void>((resolve) => {
+            heldBuilderlabDeletionReleases.push(resolve);
+          });
+        }
         const sequence = activeConfig?.mock?.builderlabDeletionErrorSequence;
         const deletionError = sequence?.length
           ? sequence.length > 1
@@ -12641,9 +12668,35 @@ export function maybeInstallE2eTauriMocks() {
             : sequence[0]
           : activeConfig?.mock?.builderlabDeletionError;
         if (deletionError) {
+          const statusSequence =
+            activeConfig?.mock?.builderlabDeletionHttpStatusSequence;
+          const configuredStatus = statusSequence?.length
+            ? statusSequence.length > 1
+              ? statusSequence.shift()
+              : statusSequence[0]
+            : undefined;
           return {
-            error: deletionError,
-            correlation_id: "mock-delete-correlation",
+            http_status:
+              configuredStatus ??
+              (deletionError.code === "not_owner"
+                ? 404
+                : deletionError.code === "deletion_aborted" ||
+                    deletionError.code === "must_archive" ||
+                    deletionError.code === "protected_target" ||
+                    deletionError.code === "deletion_conflict"
+                  ? 409
+                  : deletionError.code === "acceptance_unknown"
+                    ? 503
+                    : 400),
+            body: {
+              error: deletionError,
+              correlation_id: "mock-delete-correlation",
+              ...(activeConfig?.mock?.builderlabDeletionBodyStatus === undefined
+                ? {}
+                : {
+                    http_status: activeConfig.mock.builderlabDeletionBodyStatus,
+                  }),
+            },
           };
         }
         const input = payload as {
@@ -12653,11 +12706,14 @@ export function maybeInstallE2eTauriMocks() {
           acknowledgementVersion?: number;
         };
         return {
-          community_id: input.communityId,
-          host: input.host,
-          request_id: input.requestId,
-          acknowledgement_version: input.acknowledgementVersion,
-          status: "accepted",
+          http_status: 202,
+          body: {
+            community_id: input.communityId,
+            host: input.host,
+            request_id: input.requestId,
+            acknowledgement_version: input.acknowledgementVersion,
+            status: "accepted",
+          },
         };
       }
       case "mesh_installed_models":

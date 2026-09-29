@@ -72,6 +72,14 @@ async function openDeletionFixture(
     errorSequence?: Array<{ code: string; message?: string } | null>;
     capabilitySequence?: boolean[];
     communitiesSequence?: Array<typeof DELETION_COMMUNITIES>;
+    communities?: Array<(typeof DELETION_COMMUNITIES)[number]>;
+    httpStatusSequence?: number[];
+    bodyStatus?: number;
+    identityResponseSequence?: Array<
+      | { identity: { npub?: string; pubkey_hex?: string } }
+      | { error: { code: string; setup_needed?: boolean } }
+    >;
+    deferDeletion?: boolean;
   } = {},
 ) {
   await installMockBridge(page, {
@@ -83,13 +91,17 @@ async function openDeletionFixture(
     builderlabIdentity: {
       pubkey_hex: options.mismatch ? "f".repeat(64) : DEFAULT_MOCK_PUBKEY,
     },
-    builderlabCommunities: DELETION_COMMUNITIES,
+    builderlabCommunities: options.communities ?? DELETION_COMMUNITIES,
     builderlabCommunitiesSequence: options.communitiesSequence,
     builderlabQuota: { used: 2, limit: 5, canCreate: true },
     builderlabDeletionError: options.errorCode
       ? { code: options.errorCode, message: "mock deletion error" }
       : undefined,
     builderlabDeletionErrorSequence: options.errorSequence,
+    builderlabDeletionHttpStatusSequence: options.httpStatusSequence,
+    builderlabDeletionBodyStatus: options.bodyStatus,
+    builderlabIdentityResponseSequence: options.identityResponseSequence,
+    builderlabDeferDeletion: options.deferDeletion,
     builderlabAuthSequence: options.capabilitySequence?.map((capability) => ({
       email: "owner@example.com",
       expiresAt: "2099-01-01T00:00:00Z",
@@ -98,6 +110,31 @@ async function openDeletionFixture(
   });
   await page.goto("/");
   await openSettings(page, "hosted-communities");
+}
+
+async function startArchivedDeletion(page: Page) {
+  const exactHost = "Exact-Host.communities.buzz.xyz";
+  await page
+    .getByTestId("hosted-community-row")
+    .filter({ hasText: "Archived team" })
+    .getByRole("button", { name: "Delete", exact: true })
+    .click();
+  await page
+    .getByLabel(`Type the exact host to continue: ${exactHost}`)
+    .fill(exactHost);
+  await page.getByRole("button", { name: "Continue" }).click();
+  await page
+    .getByRole("button", { name: "Delete community permanently" })
+    .click();
+}
+
+async function storedDeletionRequestId(page: Page) {
+  return page.evaluate(() => {
+    const raw = window.localStorage.getItem(
+      "buzz:hosted-community-delete-pending:v1",
+    );
+    return raw ? JSON.parse(raw).request_id : null;
+  });
 }
 
 test("deletion is default-off and identity mismatch preserves the gate", async ({
@@ -218,6 +255,222 @@ test("ambiguous deletion keeps the same pending request and exposes receipt look
   await expect(
     page.getByText(/Correlation ID: mock-delete-correlation/),
   ).toBeVisible();
+  await expect(archived).toBeVisible();
+});
+
+test("transient identity loss hides but retains an ambiguous envelope and restores it for the same owner", async ({
+  page,
+}) => {
+  await openDeletionFixture(page, {
+    capability: true,
+    errorCode: "acceptance_unknown",
+    identityResponseSequence: [
+      { identity: { pubkey_hex: DEFAULT_MOCK_PUBKEY } },
+      { error: { code: "unauthorized" } },
+      { identity: { pubkey_hex: DEFAULT_MOCK_PUBKEY } },
+    ],
+  });
+  await startArchivedDeletion(page);
+  const requestId = await storedDeletionRequestId(page);
+  expect(requestId).not.toBeNull();
+
+  await page.getByRole("button", { name: "Refresh" }).click();
+  await expect(page.getByText(requestId, { exact: true })).toHaveCount(0);
+  await expect.poll(() => storedDeletionRequestId(page)).toBe(requestId);
+
+  await page.getByRole("button", { name: "Refresh" }).click();
+  await expect(page.getByText(requestId, { exact: true })).toBeVisible();
+  await expect.poll(() => storedDeletionRequestId(page)).toBe(requestId);
+});
+
+test("a valid different bound owner discards the prior owner's envelope", async ({
+  page,
+}) => {
+  await openDeletionFixture(page, {
+    capability: true,
+    errorCode: "acceptance_unknown",
+    identityResponseSequence: [
+      { identity: { pubkey_hex: DEFAULT_MOCK_PUBKEY } },
+      { identity: { pubkey_hex: OTHER_HEX } },
+    ],
+  });
+  await startArchivedDeletion(page);
+  const requestId = await storedDeletionRequestId(page);
+
+  await page.getByRole("button", { name: "Refresh" }).click();
+  await expect(page.getByText(requestId, { exact: true })).toHaveCount(0);
+  await expect.poll(() => storedDeletionRequestId(page)).toBeNull();
+});
+
+test("sign out hides but retains an ambiguous envelope for same-owner reauthentication", async ({
+  page,
+}) => {
+  await openDeletionFixture(page, {
+    capability: true,
+    errorCode: "acceptance_unknown",
+  });
+  await startArchivedDeletion(page);
+  const requestId = await storedDeletionRequestId(page);
+
+  await page.getByRole("button", { name: "Sign out" }).click();
+  await expect(page.getByText(requestId, { exact: true })).toHaveCount(0);
+  await expect.poll(() => storedDeletionRequestId(page)).toBe(requestId);
+
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await expect(page.getByText(requestId, { exact: true })).toBeVisible();
+  await expect.poll(() => storedDeletionRequestId(page)).toBe(requestId);
+});
+
+test("late A response cannot settle after a valid A-B-A owner transition", async ({
+  page,
+}) => {
+  await openDeletionFixture(page, {
+    capability: true,
+    deferDeletion: true,
+  });
+  await startArchivedDeletion(page);
+  await expect.poll(() => storedDeletionRequestId(page)).not.toBeNull();
+
+  await page.keyboard.press("Escape");
+  await expect(page.getByTestId("settings-view")).toHaveCount(0);
+  await page.evaluate((pubkey) => {
+    if (window.__BUZZ_E2E__?.mock) {
+      window.__BUZZ_E2E__.mock.builderlabIdentity = { pubkey_hex: pubkey };
+    }
+  }, OTHER_HEX);
+  await openSettings(page, "hosted-communities");
+  await expect.poll(() => storedDeletionRequestId(page)).toBeNull();
+  await expect(
+    page.getByText("This account is connected to a different Buzz identity"),
+  ).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(page.getByTestId("settings-view")).toHaveCount(0);
+  await page.evaluate((pubkey) => {
+    if (window.__BUZZ_E2E__?.mock) {
+      window.__BUZZ_E2E__.mock.builderlabIdentity = { pubkey_hex: pubkey };
+    }
+  }, DEFAULT_MOCK_PUBKEY);
+  await openSettings(page, "hosted-communities");
+  await expect(
+    page.getByText("This account is connected to a different Buzz identity"),
+  ).toHaveCount(0);
+  await expect
+    .poll(() =>
+      page.evaluate(() => window.__BUZZ_E2E_RELEASE_BUILDERLAB_DELETIONS__?.()),
+    )
+    .toBe(1);
+  await expect(page.getByText("Deletion started", { exact: true })).toHaveCount(
+    0,
+  );
+  await expect.poll(() => storedDeletionRequestId(page)).toBeNull();
+});
+
+test("one pending envelope blocks a second mounted deletion without overwriting or dispatching", async ({
+  page,
+}) => {
+  const secondArchived = {
+    id: "33333333-3333-4333-8333-333333333333",
+    name: "Second archived team",
+    normalized_host: "second.communities.buzz.xyz",
+    archived_at: "2026-09-28T00:00:00Z",
+  };
+  await openDeletionFixture(page, {
+    capability: true,
+    errorCode: "acceptance_unknown",
+    communities: [...DELETION_COMMUNITIES, secondArchived],
+  });
+  const first = page
+    .getByTestId("hosted-community-row")
+    .filter({ hasText: "Archived team" })
+    .filter({ hasNotText: "Second archived team" });
+  await first.getByRole("button", { name: "Delete", exact: true }).click();
+  await page
+    .getByLabel(
+      "Type the exact host to continue: Exact-Host.communities.buzz.xyz",
+    )
+    .fill("Exact-Host.communities.buzz.xyz");
+  await page.getByRole("button", { name: "Continue" }).click();
+  await page
+    .getByRole("button", { name: "Delete community permanently" })
+    .click();
+
+  const firstRequestId = await page.evaluate(() => {
+    const raw = window.localStorage.getItem(
+      "buzz:hosted-community-delete-pending:v1",
+    );
+    return raw ? JSON.parse(raw).request_id : null;
+  });
+  expect(firstRequestId).not.toBeNull();
+
+  const secondDelete = page
+    .getByTestId("hosted-community-row")
+    .filter({ hasText: "Second archived team" })
+    .getByRole("button", { name: "Delete", exact: true });
+  await secondDelete.evaluate((button: HTMLButtonElement) => button.click());
+  const secondHostInput = page.getByLabel(
+    "Type the exact host to continue: second.communities.buzz.xyz",
+  );
+  if (await secondHostInput.isVisible().catch(() => false)) {
+    await secondHostInput.fill("second.communities.buzz.xyz");
+    await page.getByRole("button", { name: "Continue" }).click();
+    await page
+      .getByRole("button", { name: "Delete community permanently" })
+      .click();
+  }
+
+  await expect(secondDelete).toBeDisabled();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          window.__BUZZ_E2E_COMMANDS__?.filter(
+            (command) => command === "delete_builderlab_community",
+          ).length ?? 0,
+      ),
+    )
+    .toBe(1);
+  await expect
+    .poll(() =>
+      page.evaluate(() => {
+        const raw = window.localStorage.getItem(
+          "buzz:hosted-community-delete-pending:v1",
+        );
+        return raw ? JSON.parse(raw).request_id : null;
+      }),
+    )
+    .toBe(firstRequestId);
+});
+
+test("native HTTP status wins over a contradictory body claim in the mounted flow", async ({
+  page,
+}) => {
+  await openDeletionFixture(page, {
+    capability: true,
+    errorCode: "not_owner",
+    httpStatusSequence: [503],
+    bodyStatus: 404,
+  });
+  const archived = page
+    .getByTestId("hosted-community-row")
+    .filter({ hasText: "Archived team" });
+  const exactHost = "Exact-Host.communities.buzz.xyz";
+  await archived.getByRole("button", { name: "Delete", exact: true }).click();
+  await page
+    .getByLabel(`Type the exact host to continue: ${exactHost}`)
+    .fill(exactHost);
+  await page.getByRole("button", { name: "Continue" }).click();
+  await page
+    .getByRole("button", { name: "Delete community permanently" })
+    .click();
+
+  const requestId = await page.evaluate(() => {
+    const raw = window.localStorage.getItem(
+      "buzz:hosted-community-delete-pending:v1",
+    );
+    return raw ? JSON.parse(raw).request_id : null;
+  });
+  expect(requestId).not.toBeNull();
+  await expect(page.getByText(requestId, { exact: true })).toBeVisible();
   await expect(archived).toBeVisible();
 });
 

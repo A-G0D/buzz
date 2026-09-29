@@ -107,7 +107,7 @@ export function hostedCommunityErrorMessage(
     deletion_aborted: "The deletion request was stopped by an operator.",
     acceptance_unknown:
       "Deletion acceptance is uncertain. Check deletion status; do not start a new request.",
-    unknown: "The deletion service returned an invalid response.",
+    unknown: "The hosted-community service returned an invalid response.",
   };
   const message = messages[error?.code ?? ""] ?? error?.message ?? fallback;
   return correlationId

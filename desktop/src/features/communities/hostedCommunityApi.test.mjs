@@ -14,6 +14,7 @@ import test from "node:test";
 import { npubEncode } from "nostr-tools/nip19";
 
 import {
+  hostedCommunityErrorMessage,
   normalizedBoundKeyHex,
   usableBoundIdentityNpub,
 } from "./hostedCommunityApi.ts";
@@ -95,4 +96,27 @@ test("the string normalizer rejects the same non-key values directly", () => {
   assert.equal(normalizedBoundKeyHex("f".repeat(63)), null);
   assert.equal(normalizedBoundKeyHex("f".repeat(65)), null);
   assert.equal(normalizedBoundKeyHex("  "), null);
+});
+
+test("shared unknown errors stay neutral on non-deletion surfaces when deletion is unavailable", () => {
+  for (const canDeleteBuzzCommunities of [undefined, false]) {
+    for (const fallback of [
+      "Could not create the community.",
+      "Could not archive the community.",
+      "Could not load communities.",
+      "Could not prepare hosted-community onboarding.",
+    ]) {
+      const message = hostedCommunityErrorMessage(
+        { code: "unknown" },
+        undefined,
+        fallback,
+      );
+      assert.equal(
+        message,
+        "The hosted-community service returned an invalid response.",
+        `capability=${String(canDeleteBuzzCommunities)} fallback=${fallback}`,
+      );
+      assert.doesNotMatch(message, /delet/i);
+    }
+  }
 });

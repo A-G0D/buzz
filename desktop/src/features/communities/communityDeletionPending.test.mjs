@@ -28,6 +28,10 @@ const envelope = {
   backend_origin: "https://app.builderlab.xyz",
 };
 
+function transport(http_status, body) {
+  return { http_status, body };
+}
+
 test("pending deletion round-trips exact host bytes and account binding", () => {
   const target = storage();
   assert.equal(persistPendingCommunityDeletion(envelope, target), true);
@@ -84,11 +88,23 @@ test("persistence failure is observable and clear is bounded to the deletion key
   assert.equal(target.getItem("unrelated"), "keep");
 });
 
+test("persistence boundary never overwrites an existing envelope", () => {
+  const target = storage();
+  assert.equal(persistPendingCommunityDeletion(envelope, target), true);
+  const second = {
+    ...envelope,
+    community_id: "33333333-3333-4333-8333-333333333333",
+    request_id: "44444444-4444-4444-8444-444444444444",
+  };
+  assert.equal(persistPendingCommunityDeletion(second, target), false);
+  assert.deepEqual(loadPendingCommunityDeletion(target), envelope);
+});
+
 test("ambiguous receipt and same-UUID resubmit misses retain the envelope", () => {
   for (const attempt of ["receipt", "resubmit"]) {
     assert.equal(
       deletionResponseDisposition(
-        { error: { code: "not_owner" } },
+        transport(404, { error: { code: "not_owner" } }),
         envelope,
         attempt,
       ),
@@ -97,7 +113,7 @@ test("ambiguous receipt and same-UUID resubmit misses retain the envelope", () =
   }
   assert.equal(
     deletionResponseDisposition(
-      { error: { code: "acceptance_unknown" } },
+      transport(503, { error: { code: "acceptance_unknown" } }),
       envelope,
       "initial",
     ),
@@ -114,7 +130,7 @@ test("only tuple-bound acceptance or abort terminates ambiguous recovery", () =>
   };
   assert.equal(
     deletionResponseDisposition(
-      { ...tuple, status: "accepted" },
+      transport(202, { ...tuple, status: "accepted" }),
       envelope,
       "receipt",
     ),
@@ -122,7 +138,7 @@ test("only tuple-bound acceptance or abort terminates ambiguous recovery", () =>
   );
   assert.equal(
     deletionResponseDisposition(
-      { ...tuple, error: { code: "deletion_aborted" } },
+      transport(409, { ...tuple, error: { code: "deletion_aborted" } }),
       envelope,
       "receipt",
     ),
@@ -130,11 +146,111 @@ test("only tuple-bound acceptance or abort terminates ambiguous recovery", () =>
   );
   assert.equal(
     deletionResponseDisposition(
-      {
+      transport(409, {
         ...tuple,
         request_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
         error: { code: "deletion_aborted" },
-      },
+      }),
+      envelope,
+      "receipt",
+    ),
+    "retain",
+  );
+});
+
+test("fresh admission clears only the established exact code and native-status pairs", () => {
+  const terminalPairs = [
+    ["missing_mapping", 400],
+    ["invalid_request", 400],
+    ["confirmation_mismatch", 400],
+    ["unsupported_acknowledgement_version", 400],
+    ["not_owner", 404],
+    ["must_archive", 409],
+    ["protected_target", 409],
+    ["deletion_conflict", 409],
+  ];
+  for (const [code, httpStatus] of terminalPairs) {
+    assert.equal(
+      deletionResponseDisposition(
+        transport(httpStatus, { error: { code } }),
+        envelope,
+        "initial",
+      ),
+      "clear",
+      `${code} requires HTTP ${httpStatus}`,
+    );
+    assert.equal(
+      deletionResponseDisposition(
+        transport(httpStatus + 1, { error: { code } }),
+        envelope,
+        "initial",
+      ),
+      "retain",
+      `${code} with the wrong native status is ambiguous`,
+    );
+  }
+
+  for (const code of [
+    "acceptance_unknown",
+    "unauthorized",
+    "relay_unavailable",
+    "unknown",
+    "future_code",
+  ]) {
+    assert.equal(
+      deletionResponseDisposition(
+        transport(400, { error: { code } }),
+        envelope,
+        "initial",
+      ),
+      "retain",
+      `${code} cannot clear the envelope`,
+    );
+  }
+});
+
+test("native status, never a body-claimed status, binds acceptance and abort", () => {
+  const tuple = {
+    request_id: envelope.request_id,
+    community_id: envelope.community_id,
+    host: envelope.host,
+    acknowledgement_version: envelope.acknowledgement_version,
+  };
+  assert.equal(
+    deletionResponseDisposition(
+      transport(202, { ...tuple, status: "accepted" }),
+      envelope,
+      "initial",
+    ),
+    "accept",
+  );
+  assert.equal(
+    deletionResponseDisposition(
+      transport(503, {
+        ...tuple,
+        status: "accepted",
+        http_status: 202,
+      }),
+      envelope,
+      "initial",
+    ),
+    "retain",
+  );
+  assert.equal(
+    deletionResponseDisposition(
+      transport(409, { ...tuple, error: { code: "deletion_aborted" } }),
+      envelope,
+      "receipt",
+    ),
+    "abort",
+  );
+  assert.equal(
+    deletionResponseDisposition(
+      transport(200, {
+        ...tuple,
+        error: { code: "deletion_aborted" },
+        http_status: 409,
+      }),
       envelope,
       "receipt",
     ),

@@ -28,13 +28,19 @@ export type PendingCommunityDeletion = CommunityDeletionRequest & {
 
 export type CommunityDeletionAttempt = "initial" | "receipt" | "resubmit";
 
-type CommunityDeletionResponseLike = {
+export type CommunityDeletionResponseLike = {
   request_id?: string;
   community_id?: string;
   host?: string;
   acknowledgement_version?: number;
   status?: string;
   error?: { code?: string };
+  correlation_id?: string;
+};
+
+export type CommunityDeletionTransport = {
+  http_status?: number;
+  body?: CommunityDeletionResponseLike;
 };
 
 export type CommunityDeletionDisposition =
@@ -100,6 +106,12 @@ export function persistPendingCommunityDeletion(
 ): boolean {
   if (!isPendingCommunityDeletion(envelope)) return false;
   try {
+    // This key is the one-envelope admission boundary. Never replace an
+    // existing valid envelope, even if another mounted view has stale React
+    // state. loadPendingCommunityDeletion removes malformed values first; a
+    // value that remains (or cannot be removed) fails closed.
+    if (loadPendingCommunityDeletion(storage) !== null) return false;
+    if (storage.getItem(PENDING_COMMUNITY_DELETION_KEY) !== null) return false;
     storage.setItem(PENDING_COMMUNITY_DELETION_KEY, JSON.stringify(envelope));
     return (
       storage.getItem(PENDING_COMMUNITY_DELETION_KEY) ===
@@ -160,18 +172,40 @@ function responseMatchesDeletionTuple(
  * UUID; only a tuple-bound acceptance or abort is terminal.
  */
 export function deletionResponseDisposition(
-  response: CommunityDeletionResponseLike,
+  transport: CommunityDeletionTransport,
   envelope: PendingCommunityDeletion,
   attempt: CommunityDeletionAttempt,
 ): CommunityDeletionDisposition {
+  const response = transport.body ?? {};
+  const httpStatus = transport.http_status;
   const tupleMatches = responseMatchesDeletionTuple(response, envelope);
-  if (response.error?.code === "deletion_aborted") {
-    return tupleMatches ? "abort" : "retain";
+  if (httpStatus === 202 && response.status === "accepted" && tupleMatches) {
+    return "accept";
   }
-  if (response.error) {
-    return attempt === "initial" && response.error.code !== "acceptance_unknown"
-      ? "clear"
-      : "retain";
+  if (
+    httpStatus === 409 &&
+    response.error?.code === "deletion_aborted" &&
+    tupleMatches
+  ) {
+    return "abort";
   }
-  return response.status === "accepted" && tupleMatches ? "accept" : "retain";
+  if (attempt !== "initial" || !response.error?.code) return "retain";
+
+  // This exact status/code map is the established cross-client contract. It
+  // narrows terminal fresh-admission failures but does not prove an intermediary
+  // could not synthesize a matching pair; the remaining trust is the native
+  // authenticated Builderlab boundary, never a status claimed by the body.
+  const terminalFreshAdmissionErrors: Readonly<Record<string, number>> = {
+    missing_mapping: 400,
+    invalid_request: 400,
+    confirmation_mismatch: 400,
+    unsupported_acknowledgement_version: 400,
+    not_owner: 404,
+    must_archive: 409,
+    protected_target: 409,
+    deletion_conflict: 409,
+  };
+  return terminalFreshAdmissionErrors[response.error.code] === httpStatus
+    ? "clear"
+    : "retain";
 }

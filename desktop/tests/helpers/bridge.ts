@@ -177,6 +177,11 @@ type MockBridgeOptions = {
   } | null;
   /** Bound Builderlab Nostr identity. Null/omitted = not linked yet. */
   builderlabIdentity?: { npub?: string; pubkey_hex?: string } | null;
+  /** Ordered native identity results; the final result remains sticky. */
+  builderlabIdentityResponseSequence?: Array<
+    | { identity: { npub?: string; pubkey_hex?: string } }
+    | { error: { code: string; setup_needed?: boolean } }
+  >;
   /** Communities owned by the mocked Builderlab account. */
   builderlabCommunities?: Array<{
     id?: string;
@@ -191,6 +196,10 @@ type MockBridgeOptions = {
     code: string;
     message?: string;
   } | null>;
+  builderlabDeletionHttpStatusSequence?: number[];
+  builderlabDeletionBodyStatus?: number;
+  /** Hold deletion/receipt responses until the test explicitly releases them. */
+  builderlabDeferDeletion?: boolean;
   builderlabAuthSequence?: Array<{
     email?: string;
     name?: string;

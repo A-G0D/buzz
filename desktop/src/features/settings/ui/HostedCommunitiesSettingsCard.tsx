@@ -21,7 +21,6 @@ import {
   type HostedCommunityAvailabilityResponse as AvailabilityResponse,
   type HostedCommunitiesResponse as CommunitiesResponse,
   type HostedCommunity,
-  type HostedCommunityDeletionResponse,
   type HostedCommunityMutationResponse as CommunityMutationResponse,
   type HostedIdentityResponse as IdentityResponse,
   type HostedNostrIdentity as NostrIdentity,
@@ -36,6 +35,7 @@ import {
   persistPendingCommunityDeletion,
   publicDeletionRequest,
   type CommunityDeletionAttempt,
+  type CommunityDeletionTransport,
   type PendingCommunityDeletion,
 } from "@/features/communities/communityDeletionPending";
 import { useCommunities } from "@/features/communities/useCommunities";
@@ -148,17 +148,24 @@ export function HostedCommunitiesSettingsCard() {
       );
       adoptAccountOwner(nextOwner);
       const storedDeletion = loadPendingCommunityDeletion();
-      if (
-        storedDeletion &&
-        (!nextOwner ||
-          !pendingCommunityDeletionMatchesAccount(
+      if (!nextOwner) {
+        // Missing/unauthorized identity is not proof of an account change.
+        // Fence the old generation and hide its controls, but retain the
+        // durable recovery envelope until a known owner can be compared.
+        setPendingDeletion(null);
+      } else if (storedDeletion) {
+        if (
+          pendingCommunityDeletionMatchesAccount(
             storedDeletion,
             nextOwner,
             BUILDERLAB_BACKEND_ORIGIN,
-          ))
-      ) {
-        clearPendingCommunityDeletion();
-        setPendingDeletion(null);
+          )
+        ) {
+          setPendingDeletion(storedDeletion);
+        } else {
+          clearPendingCommunityDeletion();
+          setPendingDeletion(null);
+        }
       }
       setIdentity(identityResponse.identity ?? null);
       const nextCommunities = (communitiesResponse.communities ?? []).filter(
@@ -234,7 +241,6 @@ export function HostedCommunitiesSettingsCard() {
       setQuota(null);
       setPendingDeletion(null);
       setStatusMessage(null);
-      clearPendingCommunityDeletion();
       setName("");
       setAvailability(null);
     });
@@ -273,7 +279,6 @@ export function HostedCommunitiesSettingsCard() {
       }
       adoptAccountOwner(null);
       setIdentity(null);
-      clearPendingCommunityDeletion();
       setPendingDeletion(null);
       setStatusMessage(null);
       await loadAccount();
@@ -331,7 +336,6 @@ export function HostedCommunitiesSettingsCard() {
         );
       }
       adoptAccountOwner(null);
-      clearPendingCommunityDeletion();
       setPendingDeletion(null);
       setStatusMessage(null);
       const bound = await invoke<IdentityResponse>(
@@ -416,7 +420,7 @@ export function HostedCommunitiesSettingsCard() {
     });
 
   const applyDeletionResponse = async (
-    response: HostedCommunityDeletionResponse,
+    transport: CommunityDeletionTransport,
     envelope: PendingCommunityDeletion,
     attempt: CommunityDeletionAttempt,
     generation: number,
@@ -431,8 +435,9 @@ export function HostedCommunitiesSettingsCard() {
     ) {
       return;
     }
+    const response = transport.body ?? {};
     const disposition = deletionResponseDisposition(
-      response,
+      transport,
       envelope,
       attempt,
     );
@@ -507,9 +512,9 @@ export function HostedCommunitiesSettingsCard() {
     generation: number,
   ) => {
     const request = publicDeletionRequest(envelope);
-    let response: HostedCommunityDeletionResponse;
+    let response: CommunityDeletionTransport;
     try {
-      response = await invoke<HostedCommunityDeletionResponse>(command, {
+      response = await invoke<CommunityDeletionTransport>(command, {
         communityId: request.community_id,
         host: request.host,
         requestId: request.request_id,
@@ -524,7 +529,10 @@ export function HostedCommunitiesSettingsCard() {
   };
 
   const startCommunityDeletion = (community: HostedCommunity) => {
+    const storedDeletion = loadPendingCommunityDeletion();
     if (
+      pendingDeletion !== null ||
+      storedDeletion !== null ||
       deleteInFlight.current !== null ||
       auth?.canDeleteBuzzCommunities !== true ||
       identityMismatch ||
@@ -597,7 +605,6 @@ export function HostedCommunitiesSettingsCard() {
           setIdentity(null);
           setCommunities([]);
           setQuota(null);
-          clearPendingCommunityDeletion();
           setPendingDeletion(null);
           return;
         }
@@ -619,7 +626,6 @@ export function HostedCommunitiesSettingsCard() {
           setIdentity(null);
           setCommunities([]);
           setQuota(null);
-          clearPendingCommunityDeletion();
           setPendingDeletion(null);
           return;
         }
@@ -1010,9 +1016,7 @@ export function HostedCommunitiesSettingsCard() {
                       busy={
                         busy || pendingDeletion?.community_id === community.id
                       }
-                      deletionPending={
-                        pendingDeletion?.community_id === community.id
-                      }
+                      deletionPending={pendingDeletion !== null}
                       canDelete={
                         deletionCapability &&
                         usableBoundIdentity &&
