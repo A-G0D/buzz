@@ -150,6 +150,23 @@ eligible for execution. Transient preparation failures use the existing retry
 schedule; permanent or exhausted failures block durably. Owner-facing
 admission has no cancellation endpoint.
 
+## Client compatibility and rollout order
+
+Owner-list responses now carry the authoritative quota trio: `quota_used`,
+`quota_limit`, and `can_create`. Quota-dependent clients fail closed when any
+member of that trio is absent: they disable new Create controls even when the
+separate community-deletion capability is absent or false. They do not derive
+capacity from the number of visible rows, because an in-progress deletion can
+hide a row while still reserving its owner's slot.
+
+Roll this contract out in dependency order: relay first, then KGoose, then
+Desktop and any other quota-dependent clients. This ordering is a compatibility
+requirement, not authorization to enable owner deletion or its drain job.
+During that rollout, keep the already-published migration 0052 channel-artifact
+surface and migration 0053 owner auto-approval surface byte-for-byte intact;
+do not rewrite their migration ledger entries or recreate a persistent
+database to introduce the quota projection.
+
 The chart has no existing PrometheusRule or provider-neutral CronJob alert
 integration. Operators must alert on failed/missed Jobs and long-running active
 Jobs in their deployment platform. Adding a chart-native alert abstraction is

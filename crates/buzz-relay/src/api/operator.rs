@@ -492,6 +492,13 @@ pub async fn delete_community(
     })?;
     let normalized_host = normalize_candidate_host(&request.host)
         .map_err(|msg| deletion_api_error(StatusCode::BAD_REQUEST, "invalid_request", &msg))?;
+    if normalized_host != request.host {
+        return Err(deletion_api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "host must use its exact canonical authority spelling",
+        ));
+    }
     let deployment_host = buzz_core::tenant::relay_url_authority(&state.config.relay_url);
     if normalized_host == deployment_host {
         return Err(deletion_api_error(
@@ -1217,6 +1224,69 @@ mod postgres_tests {
             request.mediating_operator_pubkey.as_deref(),
             Some(operator.public_key().to_hex().as_str())
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn owner_delete_admission_requires_exact_canonical_host_without_mutation() {
+        let operator = Keys::generate();
+        let owner = Keys::generate();
+        let Some(state) = operator_test_state(std::slice::from_ref(&operator)).await else {
+            return;
+        };
+        let host = format!("community-{}.example", Uuid::new_v4().simple());
+        assert_eq!(
+            provision_community(Arc::clone(&state), &operator, &host, &owner)
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        archive_for_owner_deletion(&state, &host, &owner).await;
+
+        for (label, repaired) in [
+            ("whitespace", format!(" {host}")),
+            ("case", host.to_uppercase()),
+            ("url", format!("https://{host}")),
+        ] {
+            let request_id = Uuid::new_v4();
+            let response = signed_operator_request(
+                Arc::clone(&state),
+                &operator,
+                "POST",
+                "/operator/communities/delete",
+                Some(owner_delete_body(&repaired, &owner, request_id)),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{label}");
+            assert_eq!(read_json(response).await["code"], "invalid_request");
+            assert_no_persisted_request(&state, request_id, label).await;
+        }
+
+        let request_id = Uuid::new_v4();
+        let body = owner_delete_body(&host, &owner, request_id);
+        let accepted = signed_operator_request(
+            Arc::clone(&state),
+            &operator,
+            "POST",
+            "/operator/communities/delete",
+            Some(body.clone()),
+        )
+        .await;
+        assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+        assert_eq!(read_json(accepted).await["host"], host);
+
+        let receipt = signed_operator_request(
+            Arc::clone(&state),
+            &operator,
+            "POST",
+            "/operator/communities/delete/receipt",
+            Some(body),
+        )
+        .await;
+        assert_eq!(receipt.status(), StatusCode::OK);
+        let receipt = read_json(receipt).await;
+        assert_eq!(receipt["host"], host);
+        assert_eq!(receipt["request_id"], request_id.to_string());
     }
 
     #[tokio::test]
