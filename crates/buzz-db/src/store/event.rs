@@ -32,6 +32,12 @@ pub use crate::reminder::{
 /// the advertised ceiling and the enforced one cannot drift.
 pub const DEFAULT_MAX_PAGE_LIMIT: i64 = 1_000;
 
+/// NIP-AR revision and removal kinds, whose stable identity is a `d` tag.
+pub const ARTIFACT_KINDS: [i32; 2] = [
+    buzz_core::kind::KIND_ARTIFACT as i32,
+    buzz_core::kind::KIND_ARTIFACT_REMOVAL as i32,
+];
+
 /// Optional filters for [`query_events`].
 #[derive(Debug, Clone)]
 pub struct EventQuery {
@@ -78,6 +84,11 @@ pub struct EventQuery {
     /// Restrict results to events with an `e` tag referencing any of these event IDs (hex).
     /// Uses JSONB containment (`tags @> ...`) against the `tags` column.
     pub e_tags: Option<Vec<String>>,
+    /// Restrict artifact rows ([`ARTIFACT_KINDS`]) to those with a `d` tag
+    /// matching any of these values, via JSONB containment. Their `d_tag`
+    /// column is NULL (not NIP-33), so this lets identity lookups match before
+    /// SQL `LIMIT`. Rows of other kinds are left to the caller's post-filter.
+    pub d_tag_values: Option<Vec<String>>,
     /// Restrict results to events with an exact custom tag pair.
     /// Uses JSONB containment against `tags` before SQL `LIMIT`.
     pub custom_tag: Option<(String, String)>,
@@ -139,6 +150,7 @@ impl EventQuery {
             authors: None,
             ids: None,
             e_tags: None,
+            d_tag_values: None,
             custom_tag: None,
             channel_ids: None,
             channel_ids_include_global: true,
@@ -622,6 +634,12 @@ fn build_query_events_sql(q: &EventQuery) -> QueryBuilder<sqlx::Postgres> {
 
     // Use unqualified column names when no join, qualified when joined.
     let col_prefix = if q.p_tag_hex.is_some() { "e." } else { "" };
+    // Generic reads return only current artifact revisions, including delete
+    // tombstones; explicit revision IDs also read earlier revisions.
+    if q.ids.is_none() {
+        let table = if q.p_tag_hex.is_some() { "e" } else { "events" };
+        qb.push(format!(" AND NOT ({table}.kind = 45010 AND NOT EXISTS (SELECT 1 FROM artifact_heads ah WHERE ah.community_id={table}.community_id AND ah.event_id={table}.id))"));
+    }
 
     if let Some(ch) = q.channel_id {
         qb.push(format!(" AND {col_prefix}channel_id = "))
@@ -703,6 +721,10 @@ fn build_query_events_sql(q: &EventQuery) -> QueryBuilder<sqlx::Postgres> {
         if !e_tags.is_empty() {
             push_e_tag_filter(&mut qb, col_prefix, e_tags);
         }
+    }
+
+    if let Some(ref values) = q.d_tag_values {
+        push_artifact_d_tag_predicate(&mut qb, col_prefix, values);
     }
 
     if let Some((ref name, ref value)) = q.custom_tag {
@@ -835,6 +857,27 @@ fn push_e_tag_filter(qb: &mut QueryBuilder<sqlx::Postgres>, col_prefix: &str, e_
         .push("::jsonb[])");
 }
 
+/// Match `#d` on artifact rows before `LIMIT` while leaving other kinds to the
+/// caller's post-filter: `(kind NOT IN (artifact kinds) OR tags @> [["d", v]] ...)`.
+fn push_artifact_d_tag_predicate(
+    qb: &mut QueryBuilder<sqlx::Postgres>,
+    col_prefix: &str,
+    values: &[String],
+) {
+    if values.is_empty() {
+        return;
+    }
+    let [revision, removal] = ARTIFACT_KINDS;
+    qb.push(format!(
+        " AND ({col_prefix}kind NOT IN ({revision}, {removal})"
+    ));
+    for value in values {
+        qb.push(format!(" OR {col_prefix}tags @> "));
+        qb.push_bind(serde_json::json!([["d", value]]));
+    }
+    qb.push(")");
+}
+
 pub(crate) fn row_to_stored_event(row: sqlx::postgres::PgRow) -> Result<Option<StoredEvent>> {
     let id_bytes: Vec<u8> = row.try_get("id")?;
     let pubkey_bytes: Vec<u8> = row.try_get("pubkey")?;
@@ -929,6 +972,12 @@ pub(crate) async fn count_events_on(conn: &mut sqlx::PgConnection, q: &EventQuer
     };
 
     let col_prefix = if q.p_tag_hex.is_some() { "e." } else { "" };
+    // Generic reads return only current artifact revisions, including delete
+    // tombstones; explicit revision IDs also read earlier revisions.
+    if q.ids.is_none() {
+        let table = if q.p_tag_hex.is_some() { "e" } else { "events" };
+        qb.push(format!(" AND NOT ({table}.kind = 45010 AND NOT EXISTS (SELECT 1 FROM artifact_heads ah WHERE ah.community_id={table}.community_id AND ah.event_id={table}.id))"));
+    }
 
     if let Some(ch) = q.channel_id {
         qb.push(format!(" AND {col_prefix}channel_id = "))
@@ -1000,6 +1049,10 @@ pub(crate) async fn count_events_on(conn: &mut sqlx::PgConnection, q: &EventQuer
         if !e_tags.is_empty() {
             push_e_tag_filter(&mut qb, col_prefix, e_tags);
         }
+    }
+
+    if let Some(ref values) = q.d_tag_values {
+        push_artifact_d_tag_predicate(&mut qb, col_prefix, values);
     }
 
     if let Some(s) = q.since {
@@ -1161,6 +1214,13 @@ pub(crate) async fn soft_delete_event_and_update_thread_in_tx(
     .bind(event_id)
     .fetch_optional(&mut *tx)
     .await?;
+
+    // Relay-signed move removals are the source channel's only replay record.
+    if target.is_some_and(|(kind, _)| kind == 45011) {
+        return Err(DbError::InvalidData(
+            "artifact removal markers cannot be deleted".into(),
+        ));
+    }
 
     if let Some((kind, Some(channel_id))) = target {
         if kind == KIND_CANVAS as i32 {
@@ -1785,7 +1845,12 @@ pub async fn insert_channel_head_checked(
     let received_at = Utc::now();
     let incoming_id = event.id.as_bytes();
 
-    let mut tx = pool.begin().await?;
+    let connection = crate::observability::acquire_writer(
+        pool,
+        crate::observability::WriterOperation::EventWrite,
+    )
+    .await?;
+    let mut tx = sqlx::Transaction::begin(connection, None).await?;
 
     // Serialize check+insert per (community, kind, channel).
     let lock_key = event_replacement_lock_key(
