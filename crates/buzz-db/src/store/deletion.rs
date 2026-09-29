@@ -5349,12 +5349,28 @@ mod postgres_tests {
     async fn owner_preparation_atomically_approves_exact_inventory_and_converges() {
         let (db, store) = store().await;
         let (host, owner, community) = archived_owned_community(&db).await;
+        assert_eq!(
+            db.list_communities_owned_by(&owner)
+                .await
+                .expect("initial owner quota")
+                .quota_used,
+            1
+        );
         let operator = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         let request_id = Uuid::new_v4();
         store
             .admit_owner_request(&host, &owner, operator, 1, request_id)
             .await
             .expect("admit owner request");
+        let pending_quota = db
+            .list_communities_owned_by(&owner)
+            .await
+            .expect("pending owner quota");
+        assert!(pending_quota.communities.is_empty());
+        assert_eq!(
+            pending_quota.quota_used, 1,
+            "membership and incomplete request must deduplicate"
+        );
         let claim = store
             .claim_specific_owner_submission(request_id, "preparer", DEFAULT_LEASE_DURATION)
             .await
@@ -5419,6 +5435,73 @@ mod postgres_tests {
             .complete_owner_preparation(&claim.lease, &changed)
             .await
             .is_err());
+
+        store.begin_quiescing(&claim.lease).await.expect("quiesce");
+        let generation = store.fence(&claim.lease).await.expect("fence");
+        let token = LeaseToken {
+            fence_generation: Some(generation),
+            ..claim.lease
+        };
+        store
+            .freeze_destructive_storage_manifest(&token, &inventory.storage)
+            .await
+            .expect("freeze destructive storage");
+        store.mark_drained(&token).await.expect("drain");
+        store
+            .mark_bindings_removed(&token, serde_json::json!({"keys": 0}))
+            .await
+            .expect("bindings");
+        store.purge_postgres(&token).await.expect("purge postgres");
+        assert_eq!(
+            db.list_communities_owned_by(&owner)
+                .await
+                .expect("quota after membership purge")
+                .quota_used,
+            1,
+            "the incomplete owner request must reserve the slot after membership purge"
+        );
+        store
+            .mark_cache_purged(&token, serde_json::json!({"keys": 0}))
+            .await
+            .expect("cache");
+        store
+            .verify_postgres_logically_deleted(&token)
+            .await
+            .expect("logical postgres verify");
+        store
+            .mark_logically_verified(&token, serde_json::json!({"all": true}))
+            .await
+            .expect("mark verified");
+        assert_eq!(
+            db.list_communities_owned_by(&owner)
+                .await
+                .expect("quota before logical completion")
+                .quota_used,
+            1
+        );
+        store
+            .mark_retention_pending(&token, serde_json::json!({"shared_cas": "retained"}))
+            .await
+            .expect("production terminal transition");
+        assert_eq!(
+            db.list_communities_owned_by(&owner)
+                .await
+                .expect("quota after logical completion")
+                .quota_used,
+            0,
+            "the production logical-completion transition releases the slot"
+        );
+        assert!(db
+            .lookup_community_by_host_for_management(&host)
+            .await
+            .expect("permanent tombstone lookup")
+            .is_some());
+        assert_eq!(
+            db.create_community_with_owner(&host, &owner)
+                .await
+                .expect("recreate tombstoned host"),
+            CreateCommunityWithOwnerResult::HostExists
+        );
     }
 
     #[tokio::test]
