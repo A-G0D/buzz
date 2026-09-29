@@ -184,6 +184,37 @@ with a TypeScript lookup table or an id comparison in a component.
    import boundary. Do not silently strip them: rejection keeps the reviewed
    string identical to the executed string. New sharing paths must reuse the
    same validation before they persist or activate a definition.
+   **Execution archetypes are instance-local snapshots.** The create flow may
+   select only an ID returned by the Rust archetype catalog. Rust stores its
+   versioned snapshot on the managed instance, composes its prompt addendum at
+   effective-config resolution, and passes it through the existing ACP prompt
+   transport. Never add this selection to `CreatePersonaInput`, persona hashes,
+   or relay publications. Presets may set only supported prompt guidance and
+   Buzz-enforced run defaults; they cannot choose an unverified model, alter
+   provider credentials, change access policy, or grant tools. Unknown IDs are
+   errors, never fallback aliases. Focused critic archetypes are review
+   protocols, not a technical read-only sandbox or an independent multi-agent
+   round. Any “run critics” orchestration must separately enforce selected
+   tool/permission limits, isolate passes, and preserve disagreement; never
+   describe prompt guidance as an access boundary. Desktop critic rounds bind
+   one explicitly selected, launch-resolved Local route profile to each role
+   and persist that identity with the reviewer result. A route profile or
+   provider label does not prove distinct model weights or independent output.
+   Update both the canonical catalog and this rule when adding or changing
+   presets. Project creation may
+   pass a selected archetype to its initial managed agents; when it does, create profile-bound
+   instances rather than reusing a differently configured instance. This
+   snapshots each agent's starting style. A separate project default is
+   persisted only in local storage scoped to relay, owner, and home-channel ID;
+   new channel-agent batches resolve it against the Rust catalog and create
+   profile-bound instances. Never publish the default or snapshot with project
+   metadata. Clearing the project default affects future creates only; existing
+   instances retain their saved profile. Project creation may also select a
+   route only from the Rust-backed saved route catalog. Persist that default
+   locally under the same project scope and pin the exact profile ID to eligible
+   initial Buzz Agent instances; a missing or unavailable route must not silently
+   fall back to the configured provider/model. Other runtimes and provider-backed
+   agents ignore the route, and existing instances keep their current route.
 13. **Profile runtime sections render only reported agent data.** Missing
    runtime, model, status, command, MCP, advanced, or diagnostics values stay
    absent in every build mode. Do not fill profile or agent-panel gaps with
@@ -330,6 +361,16 @@ with a TypeScript lookup table or an id comparison in a component.
     for resets; owner replay of a redacted head preserves only a nonportable
     local override. That local path is not synchronized through catalog heads.
 
+20. **DeepSeek is a distinct Buzz Agent API provider.** Keep its provider ID
+    `deepseek` exact through prompt-profile matching; do not canonicalize it to
+    `openai`. Desktop configuration uses `DEEPSEEK_API_KEY`, optional
+    `DEEPSEEK_MODEL`, and optional `DEEPSEEK_BASE_URL`. Discovery queries the
+    configured base URL's dynamic `/models` endpoint (defaulting to
+    `https://api.deepseek.com/models`) and preserves provider model IDs. Keep
+    the provider option, typed credential, readiness requirement, model
+    fallback, and prompt-profile model mapping synchronized when changing this
+    support.
+
 ## Channel-only runtime controls
 
 Desktop observer controls identify a channel, not a thread session. The harness
@@ -424,6 +465,136 @@ this is not permission to fetch the removed source. It is not learned from profi
 uses the fixed agent signer, origin-scoped Blossom auth, no redirects, byte caps,
 and hash/descriptor verification; ordinary public external avatars remain
 unauthenticated passthrough. No image-reader proxy or tenant isolation exception.
+
+## Local prompt-profile application
+
+## Local API route profile context fit
+
+The routing library's model-tier presets are draft-only and local. Selecting a
+preset fills provider/model and policy fields; it does not save, test a
+provider, add credentials, or send prompt data. Hosted presets must keep the
+explicit `allow-hosted` policy and disclose provider egress. The local
+OpenAI-compatible preset deliberately leaves the model ID blank so the operator
+must copy the exact ID from that loopback server's `/v1/models` response before
+saving. Do not describe a preset as a live connection or a measured speed
+result. Refresh hosted IDs against official provider catalogs, and keep current
+pricing operator-editable rather than silently baking it into these drafts.
+
+Buzz Agent API route profiles preserve the legacy ordered-candidate behavior
+unless `strict_context_fit` is enabled. In strict mode, every candidate must
+have an operator-declared `context_capacity_tokens`; Buzz does not verify that
+value against provider metadata. The preflight compares each candidate's
+capacity with a conservative UTF-8 upper-bound estimate that includes its
+resolved system prompt, current session history, incoming text prompt, tool
+definitions, framing allowance, and configured output-token reserve. It is not
+exact provider tokenization or guaranteed provider context-window accounting.
+Unknown prompt blocks, multimodal history, or opaque provider replay metadata
+abstain before the first provider call. The pinned candidate is checked again
+before every later tool-round request; if the bound no longer fits, that turn
+stops without trying another provider. Safety refusals remain terminal.
+
+The run brief may show the estimate and declared capacity. Keep both labels
+explicit, and never describe the operator-entered capacity as provider-verified.
+
+## Local route throughput evidence
+
+The routing-profile library reads measured throughput from the device-local run
+journal for the launch-resolved route-profile hash. Keep rows separate by that
+profile, candidate, keyed provider endpoint, reasoning effort, and coarse
+input-size bucket. Only samples from the last seven days count; show speed as
+unknown until five matching samples exist. Label it effective output tokens per
+second because it includes provider and network wait, not model decode speed.
+
+Routing keeps the saved preference order unless an operator enables a speed
+policy. A minimum speed floor excludes candidates with a known lower rate;
+unknown speed abstains unless preference-order warm-up is explicitly enabled.
+Fastest-measured mode ranks candidates with five fresh matching samples by
+effective speed. When fastest-measured and warm-up are both enabled, unknown
+candidates run first in saved preference order until they have enough samples;
+then measured candidates rank by speed. Warm-up never admits a known rate below
+the configured floor. If fastest-measured is off, warm-up only makes unknown
+candidates eligible and saved preference order remains unchanged. Speed is a
+latency observation, not a measure of answer quality.
+
+## Local task-fit eligibility evidence
+
+`task_fit_policy` is an opt-in hard candidate gate, not a ranker. It names a
+task class and supported taxonomy/evaluation-policy versions, sets a minimum
+distinct-task count and 95% Wilson lower bound, and limits report age. It may
+also require an observed exact model ID. The gate qualifies only a validated
+local report with a current Buzz identity-signed route attestation bound to the
+report hash and exact route profile ID/version/hash and candidate ID. The
+report's task class, versions, provider, and model must match that policy and
+candidate. A generic local report-review attestation records that its signer
+reviewed a report; it does not supply the route binding and cannot qualify a
+candidate by itself.
+
+When strict task-fit is enabled, missing, invalid, mismatched, stale,
+under-sampled, or below-threshold evidence cannot qualify a candidate. If no
+candidate passes, routing abstains before its first provider request. The
+Desktop task-class metadata is an operator-selected label, not a model-verified
+classification. These gates do not authenticate the benchmark producer,
+inputs, endpoint, or results, and do not establish a quality gain. Describe
+them as a local, operator-configured eligibility policy over unverified
+benchmark evidence.
+
+## Global managed-agent memory reserve
+
+The device-local resource policy may set `minAvailableMemoryBytes`. Before
+starting a managed local agent, Buzz reads current available system RAM and
+blocks that start when the reading falls below the configured reserve. The
+reserve is disabled by default and is checked only at start time; it does not
+stop existing agents, estimate a child process's memory, monitor GPU memory,
+or guarantee that other applications will not consume RAM immediately after
+the check. Buzz serializes its own final memory check and process creation so
+parallel restore workers do not all pass on the same sample. The settings view
+presents available and total system RAM as a separate point-in-time snapshot.
+
+## Local prompt-profile application
+
+Prompt profiles live in the device-local Buzz nest. At launch, a local agent
+using the catalogued `buzz-agent` runtime may receive an exact API profile, and
+a local DSH ACP agent may receive the exact `acp_harness` target `dsh` profile.
+Buzz matches the effective `BUZZ_AGENT_PROVIDER` and model from the layered
+spawn environment; a model-specific profile wins over that provider's
+provider-wide profile. A Buzz Agent API provider/model key is unique, so edit
+the existing profile instead of creating a second one for the same target.
+Buzz appends the matched profile text after the saved agent instructions and
+marks the process as needing restart when that effective prompt changes.
+
+The ACP run journal records the selected profile ID, version, content hash,
+and effective system-prompt hash. It never stores prompt text. For DSH ACP,
+compose the profile after saved agent instructions and write a versioned overlay
+only inside Buzz's workspace. Launch with `dsh --profile acp` and append
+`--patch` only for the matched DSH profile. The overlay replaces the effective
+`system-prompt` row config for that Buzz-launched process while leaving DSH's
+saved profile files untouched. Disclose that it sets `includeHarnessIdentity`,
+`includeRuntimeContext`, and `personaPrefix`, while the prior `personaSuffix`,
+`toolOrder`, and unknown custom fields in that row are not preserved or
+verified. Preserve other rows. Do not claim DSH accepts ACP `systemPrompt`.
+Keep the profile ID, version, prompt hash, and overlay path visible in preview.
+CLI harness, consumer-app, remote-agent, unsupported-provider, and unresolved
+provider/model profiles remain local artifacts and are not auto-applied.
+
+## Local status summarizer model
+
+`BUZZ_AGENT_SUMMARY_MODEL` is an optional per-agent advanced environment
+setting. When present on the catalogued local `buzz-agent` runtime, it exposes
+the in-process `summarize_status_evidence` tool; when absent, no extra summary
+request can be made. The tool uses the agent's selected provider, API key, and
+endpoint, with this model ID as the summary override. `BUZZ_AGENT_SUMMARY_MAX_OUTPUT_TOKENS`
+sets its bounded output budget (1–4096 tokens; blank inherits the runtime's
+1200-token default). The global defaults editor exposes both settings as
+structured controls only when the Rust runtime catalog declares them. The
+summary model choices use the same provider's discovered model list, and a
+saved value remains editable when it is no longer in that list. Without settled
+runtime metadata, existing values stay visible in the generic environment
+editor. The evidence is sent to that configured
+provider only when the tool is called. The call runs inside the parent agent,
+so provider credentials are not added to the child MCP environment. The tool
+accepts only one or more structured `thread_brief` pages for the same root,
+and it keeps task completion and worker liveness unknown unless the evidence
+proves them.
 
 ## Keep this file true
 

@@ -74,17 +74,20 @@ impl SharedState {
 
 fn build_bootstrap(cwd: &Path, shell_hint: &str) -> String {
     let stack = detect_stack(cwd);
-    let buzz_hint =
-        if std::env::var("BUZZ_RELAY_URL").is_ok() && std::env::var("BUZZ_PRIVATE_KEY").is_ok() {
-            "\nBuzz relay configured. Run `buzz --help` to see available commands.\n"
-        } else {
-            ""
-        };
+    let buzz_hint = if std::env::var("BUZZ_RELAY_URL").is_ok()
+        && std::env::var("BUZZ_PRIVATE_KEY").is_ok()
+    {
+        "\nBuzz relay configured. Run `buzz --help` for CLI commands, use `thread_brief` for source-linked thread status, `coordinator_run_status` to refresh one run by ID, or `coordinator_run_guide` to post requested guidance to a verified run's thread.\n"
+    } else {
+        ""
+    };
     format!(
         "Working directory: {}\n\
          Detected stack: {}\n\
          Shell: {shell_hint} (set BUZZ_SHELL to override) — write command strings in that shell's syntax.\n\
          Pass `workdir` per call rather than `cd`.\n\
+         For nested local guidance, call `instruction_map` to read the workspace `AGENTS.md` or Buzz nest index, then request only the relevant linked Markdown maps. It reports candidate skill paths but never loads their bodies automatically.\n\
+         For an explicit request such as “run critics on this”, load the relevant `CRITICS.md`, freeze the same reviewed snapshot for each pass, and use `run_critics` only when the configured local model endpoint's data boundary is appropriate. If it returns a round ID, query `critic_run_status` to retrieve its saved findings.\n\
          {buzz_hint}",
         cwd.display(),
         stack,
@@ -668,12 +671,12 @@ fn scan_path_for_command(
 }
 
 #[cfg(unix)]
-fn set_process_group(cmd: &mut Command) {
+pub(super) fn set_process_group(cmd: &mut Command) {
     cmd.process_group(0);
 }
 
 #[cfg(not(unix))]
-fn set_process_group(_cmd: &mut Command) {}
+pub(super) fn set_process_group(_cmd: &mut Command) {}
 
 /// Kill primitive covering the spawned bash AND every descendant it forks,
 /// mirroring the same guarantee across platforms.
@@ -688,17 +691,17 @@ fn set_process_group(_cmd: &mut Command) {}
 /// Held for the whole `run`; `Drop` is the last-resort reaper if an explicit
 /// kill was skipped or failed.
 #[cfg(unix)]
-struct KillGroup(Option<i32>);
+pub(super) struct KillGroup(Option<i32>);
 
 #[cfg(unix)]
 impl KillGroup {
-    fn new(_child: &tokio::process::Child, pid: Option<u32>) -> Self {
+    pub(super) fn new(_child: &tokio::process::Child, pid: Option<u32>) -> Self {
         Self(pid.map(|p| p as i32))
     }
 
     /// Immediate SIGKILL of the process group. Sync; safe to call from Drop.
     /// No grace period — used when the parent task is being torn down.
-    fn kill_immediate(&self) {
+    pub(super) fn kill_immediate(&self) {
         use nix::sys::signal::{killpg, Signal};
         use nix::unistd::Pid;
         if let Some(pid) = self.0 {
@@ -707,7 +710,7 @@ impl KillGroup {
     }
 
     /// Graceful SIGTERM → 200ms async sleep → SIGKILL. Async; never blocks the runtime.
-    async fn kill_graceful(&self) {
+    pub(super) async fn kill_graceful(&self) {
         use nix::sys::signal::{killpg, Signal};
         use nix::unistd::Pid;
         if let Some(pid) = self.0 {
@@ -719,7 +722,7 @@ impl KillGroup {
     }
 
     /// Disarm the Drop-time kill once the child has been reaped explicitly.
-    fn disarm(&mut self) {
+    pub(super) fn disarm(&mut self) {
         self.0 = None;
     }
 }
@@ -732,7 +735,7 @@ impl Drop for KillGroup {
 }
 
 #[cfg(windows)]
-struct KillGroup {
+pub(super) struct KillGroup {
     job: windows_sys::Win32::Foundation::HANDLE,
 }
 
@@ -752,7 +755,7 @@ unsafe impl Sync for KillGroup {}
 #[cfg(windows)]
 #[allow(unsafe_code)]
 impl KillGroup {
-    fn new(child: &tokio::process::Child, _pid: Option<u32>) -> Self {
+    pub(super) fn new(child: &tokio::process::Child, _pid: Option<u32>) -> Self {
         use std::mem::{size_of, zeroed};
         use windows_sys::Win32::Foundation::HANDLE;
         use windows_sys::Win32::System::JobObjects::{
@@ -790,11 +793,11 @@ impl KillGroup {
         Self { job }
     }
 
-    fn kill_immediate(&self) {
+    pub(super) fn kill_immediate(&self) {
         self.terminate();
     }
 
-    async fn kill_graceful(&self) {
+    pub(super) async fn kill_graceful(&self) {
         // A Job Object has no SIGTERM analogue; termination is atomic, so the
         // graceful path is the same single terminate as the immediate path.
         self.terminate();
@@ -815,7 +818,7 @@ impl KillGroup {
     /// No-op on Windows: the job is terminated explicitly, and closing the
     /// handle on Drop with no live processes left is harmless. Kept for a
     /// uniform call shape with the Unix guard.
-    fn disarm(&mut self) {}
+    pub(super) fn disarm(&mut self) {}
 }
 
 #[cfg(windows)]
@@ -840,16 +843,16 @@ impl Drop for KillGroup {
 // primitive is wired up, so timeouts rely on the cross-platform start_kill in
 // `run`. Keeps the crate compiling everywhere.
 #[cfg(not(any(unix, windows)))]
-struct KillGroup;
+pub(super) struct KillGroup;
 
 #[cfg(not(any(unix, windows)))]
 impl KillGroup {
-    fn new(_child: &tokio::process::Child, _pid: Option<u32>) -> Self {
+    pub(super) fn new(_child: &tokio::process::Child, _pid: Option<u32>) -> Self {
         Self
     }
-    fn kill_immediate(&self) {}
-    async fn kill_graceful(&self) {}
-    fn disarm(&mut self) {}
+    pub(super) fn kill_immediate(&self) {}
+    pub(super) async fn kill_graceful(&self) {}
+    pub(super) fn disarm(&mut self) {}
 }
 
 #[derive(Default)]

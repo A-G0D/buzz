@@ -52,6 +52,7 @@ import {
   addReaction,
   deleteMessage,
   editMessage,
+  invokeTauri,
   removeReaction,
   sendChannelMessage,
 } from "@/shared/api/tauri";
@@ -79,6 +80,75 @@ import {
   KIND_STREAM_MESSAGE,
   KIND_SYSTEM_MESSAGE,
 } from "@/shared/constants/kinds";
+
+function goalRunInputFromSentMessage(input: {
+  channelId: string;
+  content: string;
+  eventId: string;
+  rootEventId: string | null;
+}) {
+  const goal = input.content.trim();
+  return {
+    channelId: input.channelId,
+    sessionScope: input.rootEventId ? "thread" : "conversation",
+    sourceEventId: input.eventId,
+    threadRootEventId: input.rootEventId,
+    goal,
+    maxParallel: 3,
+    // The root worker must submit a bounded plan before Buzz creates any
+    // implementation task. The resulting graph is validated natively.
+    tasks: [
+      {
+        title: "Plan the work",
+        instructions: `Turn this goal into a scoped execution plan: ${goal}`,
+        acceptanceCriteria:
+          "A bounded task plan, risks, and concrete success checks are recorded.",
+        dependsOn: [],
+      },
+    ],
+  };
+}
+
+type CreatedGoalRun = {
+  goalRunId: string;
+  tasks: Array<{
+    taskId: string;
+    generation: number;
+    title: string;
+    instructions: string;
+    acceptanceCriteria: string;
+  }>;
+};
+
+function goalTaskAssignmentPrompt(input: {
+  goalRunId: string;
+  task: CreatedGoalRun["tasks"][number];
+}) {
+  const plannerContract =
+    input.task.title === "Plan the work"
+      ? [
+          "Before your evidence report, post one separate message containing exactly [BUZZ_GOAL_PLAN] followed by JSON.",
+          `{"goal_run_id":"${input.goalRunId}","planner_task_id":"${input.task.taskId}","generation":${input.task.generation},"tasks":[{"title":"...","instructions":"...","acceptanceCriteria":"...","dependsOn":[]}]}`,
+          "Use 1–5 distinct tasks. dependsOn uses zero-based indexes within tasks. Do not use a code fence.",
+        ]
+      : [];
+  return [
+    `Goal task assignment · run ${input.goalRunId}`,
+    `Task: ${input.task.title}`,
+    `Scope: ${input.task.instructions}`,
+    `Acceptance: ${input.task.acceptanceCriteria}`,
+    "Work only on this task. Post artifact or validation references, blockers, and a concise handoff in this thread. Do not mark the task complete from narrative alone.",
+    "When finished or blocked, post this exact report header followed by concise fields:",
+    "[BUZZ_GOAL_REPORT]",
+    `goal_run_id: ${input.goalRunId}`,
+    `task_id: ${input.task.taskId}`,
+    `generation: ${input.task.generation}`,
+    "state: needs_evidence | blocked",
+    "evidence: <artifact path, URL, command result, or message ID>",
+    "blocker: <only when blocked>",
+    ...plannerContract,
+  ].join("\n");
+}
 
 type MessageQueryContext = {
   optimisticId: string;
@@ -113,6 +183,7 @@ export function createOptimisticMessage(
   mediaTags: string[][] = [],
   sentFromThreadRootId: string | null = null,
   sentFromThreadRootExcerpt: string | null = null,
+  taskClass: string | null = null,
 ): RelayEvent {
   const localKey = `optimistic-${crypto.randomUUID()}`;
   const tags: string[][] = [];
@@ -145,6 +216,15 @@ export function createOptimisticMessage(
     tags.push(
       buildSentFromThreadTag(sentFromThreadRootId, sentFromThreadRootExcerpt),
     );
+  }
+  if (taskClass) {
+    tags.push([
+      "buzz:task-class",
+      "1",
+      "operator-defined-v1",
+      "desktop_ui",
+      taskClass,
+    ]);
   }
 
   return {
@@ -493,6 +573,7 @@ export function useSendMessageMutation(
       sentFromThreadRootId?: string | null;
       sentFromThreadRootExcerpt?: string | null;
       transport?: "auto" | "http";
+      taskClass?: string | null;
     },
     MessageQueryContext | undefined
   >({
@@ -507,6 +588,7 @@ export function useSendMessageMutation(
       sentFromThreadRootId,
       sentFromThreadRootExcerpt,
       transport = "auto",
+      taskClass,
     }) => {
       // Prefer a channel captured by the caller at compose time. Otherwise,
       // resolve a captured id from the shared channel cache so navigation
@@ -571,7 +653,8 @@ export function useSendMessageMutation(
         parentEventId ||
         imetaTags.length > 0 ||
         emojiTags.length > 0 ||
-        linkPreviewTags.length > 0
+        linkPreviewTags.length > 0 ||
+        taskClass != null
       ) {
         const cachedMessages =
           queryClient.getQueryData<RelayEvent[]>(
@@ -602,7 +685,74 @@ export function useSendMessageMutation(
           undefined,
           undefined,
           suppliedRootEventId,
+          taskClass,
         );
+
+        if (taskClass === "goal") {
+          try {
+            const run = await invokeTauri<CreatedGoalRun>(
+              "create_goal_run_from_message",
+              {
+                input: goalRunInputFromSentMessage({
+                  channelId: effectiveChannel.id,
+                  content,
+                  eventId: result.eventId,
+                  rootEventId: result.rootEventId,
+                }),
+              },
+            );
+            const firstTask = run.tasks[0];
+            const coordinator = await invokeTauri<string | null>(
+              "select_goal_coordinator",
+              {
+                candidatePubkeys: recipientPubkeys,
+                channelId: effectiveChannel.id,
+              },
+            );
+            if (firstTask && coordinator) {
+              const assignment = await sendChannelMessage(
+                effectiveChannel.id,
+                goalTaskAssignmentPrompt({
+                  goalRunId: run.goalRunId,
+                  task: firstTask,
+                }),
+                result.eventId,
+                undefined,
+                [coordinator],
+                undefined,
+                undefined,
+                undefined,
+                undefined,
+                undefined,
+                undefined,
+                undefined,
+                result.eventId,
+                "goal_task",
+              );
+              await invokeTauri("bind_goal_task_assignment", {
+                goalRunId: run.goalRunId,
+                taskId: firstTask.taskId,
+                generation: firstTask.generation,
+                sourceEventId: assignment.eventId,
+                assignedAgentPubkey: coordinator,
+              });
+              await invokeTauri("start_goal_task", {
+                goalRunId: run.goalRunId,
+                taskId: firstTask.taskId,
+                generation: firstTask.generation,
+              });
+            }
+            window.dispatchEvent(new Event("buzz:goal-run-created"));
+          } catch (error) {
+            // The message is already accepted. Keep that result visible and
+            // state the local controller failure instead of faking a run.
+            toast.error(
+              `Goal message was sent, but its local run could not start: ${
+                error instanceof Error ? error.message : "Unknown error"
+              }`,
+            );
+          }
+        }
 
         // Build tags matching relay-emitted shape: h, author p, mention ps, reply es, imeta, emoji.
         // For replies, buildReplyTags already includes ["p", author] and ["h", channel].
@@ -640,6 +790,17 @@ export function useSendMessageMutation(
             ...emojiTags,
             ...mentionTags,
             ...linkPreviewTags,
+            ...(taskClass
+              ? [
+                  [
+                    "buzz:task-class",
+                    "1",
+                    "operator-defined-v1",
+                    "desktop_ui",
+                    taskClass,
+                  ],
+                ]
+              : []),
             ...(sentFromThreadTag ? [sentFromThreadTag] : []),
           ],
           content: content.trim(),
@@ -663,6 +824,7 @@ export function useSendMessageMutation(
       mediaTags,
       sentFromThreadRootId,
       sentFromThreadRootExcerpt,
+      taskClass,
     }) => {
       // Mirror mutationFn's target resolution so the optimistic message lands
       // in the cache for the same channel as the real send. A caller-supplied
@@ -706,6 +868,7 @@ export function useSendMessageMutation(
         mediaTags ?? [],
         sentFromThreadRootId ?? null,
         sentFromThreadRootExcerpt ?? null,
+        taskClass ?? null,
       );
 
       const nextWindow = mergeLiveChannelWindowEvent(

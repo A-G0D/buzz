@@ -72,6 +72,7 @@ fn non_blank(v: Option<&str>) -> Option<&str> {
 }
 
 fn resolve_linked(
+    record: &ManagedAgentRecord,
     definition: &AgentDefinition,
     global: &GlobalAgentConfig,
 ) -> EffectiveAgentConfig {
@@ -98,7 +99,10 @@ fn resolve_linked(
     };
 
     let system_prompt = ResolvedField {
-        value: non_blank(Some(definition.system_prompt.as_str())).map(str::to_owned),
+        value: super::execution_profile::compose_system_prompt(
+            non_blank(Some(definition.system_prompt.as_str())),
+            record.execution_profile.as_ref(),
+        ),
         source: ConfigSource::Definition,
     };
 
@@ -212,7 +216,10 @@ fn resolve_definition_less(
     };
 
     let system_prompt = ResolvedField {
-        value: non_blank(record.system_prompt.as_deref()).map(str::to_owned),
+        value: super::execution_profile::compose_system_prompt(
+            non_blank(record.system_prompt.as_deref()),
+            record.execution_profile.as_ref(),
+        ),
         source: ConfigSource::InstanceLegacy,
     };
 
@@ -251,7 +258,7 @@ pub fn resolve_effective_config(
 ) -> EffectiveConfigResult {
     match &record.persona_id {
         Some(pid) => match definitions.iter().find(|d| d.id == *pid) {
-            Some(def) => EffectiveConfigResult::Resolved(resolve_linked(def, global)),
+            Some(def) => EffectiveConfigResult::Resolved(resolve_linked(record, def, global)),
             None => EffectiveConfigResult::OrphanedInstance {
                 record_pubkey: record.pubkey.clone(),
                 missing_persona_id: pid.clone(),

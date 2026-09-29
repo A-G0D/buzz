@@ -20,12 +20,21 @@ export VITE_PORT="$BUZZ_VITE_PORT"
 export VITE_HMR_PORT="$BUZZ_HMR_PORT"
 export BUZZ_RELAY_URL="${BUZZ_RELAY_URL:-ws://localhost:3000}"
 
-DEV_URL="http://localhost:${BUZZ_VITE_PORT}"
+VITE_HOST_ARGS=""
+if [[ -z "${TAURI_DEV_HOST:-}" ]]; then
+    # Pin the native WebView and Vite to the same loopback family. On macOS,
+    # Vite's implicit localhost bind may expose only ::1 while WKWebView picks
+    # 127.0.0.1, leaving a blank window.
+    DEV_URL="http://[::1]:${BUZZ_VITE_PORT}"
+    VITE_HOST_ARGS="--host ::1"
+else
+    DEV_URL="http://localhost:${BUZZ_VITE_PORT}"
+fi
 if [[ "${BUZZ_RESET_WEBVIEW_STATE:-0}" == "1" ]]; then
     DEV_URL="${DEV_URL}?resetDevState=1"
 fi
 
-BUZZ_TAURI_CONFIG="{\"build\":{\"devUrl\":\"${DEV_URL}\",\"beforeDevCommand\":\"exec ./node_modules/.bin/vite --port ${BUZZ_VITE_PORT} --strictPort\"},\"identifier\":\"xyz.block.buzz.app.dev\",\"productName\":\"Buzz Dev\"}"
+BUZZ_TAURI_CONFIG="{\"build\":{\"devUrl\":\"${DEV_URL}\",\"beforeDevCommand\":\"exec ./node_modules/.bin/vite ${VITE_HOST_ARGS} --port ${BUZZ_VITE_PORT} --strictPort\"},\"identifier\":\"xyz.block.buzz.app.dev\",\"productName\":\"Buzz Dev\"}"
 unset VITE_DEV_BRANCH
 
 # In worktrees, extract a label from the branch name and derive a unique app

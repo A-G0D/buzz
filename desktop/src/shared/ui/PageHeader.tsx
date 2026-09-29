@@ -5,6 +5,7 @@ import { cn } from "@/shared/lib/cn";
 type HeaderProps = {
   /** Optional trailing content (buttons, menus) aligned to the header's end. */
   action?: ReactNode;
+  actionClassName?: string;
   className?: string;
   /** Muted supporting line rendered beneath the title. */
   description?: ReactNode;
@@ -19,6 +20,7 @@ type HeaderProps = {
  */
 export function PageHeader({
   action,
+  actionClassName,
   className,
   description,
   title,
@@ -43,7 +45,7 @@ export function PageHeader({
         )}
       >
         <div className="min-w-0 space-y-1">{copy}</div>
-        <div className="shrink-0">{action}</div>
+        <div className={cn("shrink-0", actionClassName)}>{action}</div>
       </div>
     );
   }

@@ -133,6 +133,12 @@ fn is_reserved_recognises_full_list() {
     assert!(!is_reserved_env_key("GOOSE_MODE"));
     assert!(!is_reserved_env_key("ANTHROPIC_API_KEY"));
     assert!(!is_reserved_env_key("BUZZ_ACP_MODEL")); // behavior knob
+    assert!(is_reserved_env_key("BUZZ_ACP_PROVIDER"));
+    assert!(is_reserved_env_key("BUZZ_ACP_EXECUTION_PROFILE_ID"));
+    assert!(is_reserved_env_key("BUZZ_ACP_EXECUTION_PROFILE_VERSION"));
+    assert!(is_reserved_env_key("BUZZ_ACP_PROMPT_PROFILE_ID"));
+    assert!(is_reserved_env_key("BUZZ_ACP_PROMPT_PROFILE_VERSION"));
+    assert!(is_reserved_env_key("BUZZ_ACP_PROMPT_PROFILE_HASH"));
 }
 
 #[test]
@@ -203,6 +209,14 @@ fn reserved_keys_include_relay_url() {
     let agent = map(&[("BUZZ_RELAY_URL", "ws://attacker.example")]);
     let merged = merged_user_env(&BTreeMap::new(), &agent);
     assert!(merged.is_empty());
+}
+
+#[test]
+fn reserved_keys_include_workspace_owner_public_key() {
+    assert!(is_reserved_env_key("BUZZ_WORKSPACE_OWNER_PUBKEY"));
+    assert!(is_reserved_env_key("buzz_workspace_owner_pubkey"));
+    let agent = map(&[("BUZZ_WORKSPACE_OWNER_PUBKEY", "imposter")]);
+    assert!(merged_user_env(&BTreeMap::new(), &agent).is_empty());
 }
 
 // ── validate_user_env_keys ─────────────────────────────────────────

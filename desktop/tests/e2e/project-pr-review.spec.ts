@@ -3538,6 +3538,9 @@ test("project task can be created with a category from the tasks header", async 
   await page
     .getByTestId("create-issue-body")
     .fill("The project workflow needs a clear repair path.");
+  await page
+    .getByTestId("create-issue-acceptance-criteria")
+    .fill("Running the task reproduces the bug; retry clears the error.");
   await page.getByTestId("create-issue-submit").click();
   await expect(page.getByText("Task created.")).toBeVisible();
 
@@ -3549,6 +3552,9 @@ test("project task can be created with a category from the tasks header", async 
     "Document the broken workflow",
   ]);
   expect(createdEvent?.tags).toContainEqual(["t", "change-request"]);
+  expect(createdEvent?.content).toContain(
+    "The project workflow needs a clear repair path.\n\nAcceptance criteria:\nRunning the task reproduces the bug; retry clears the error.",
+  );
 });
 
 test("narrow layouts keep section context reachable through a sheet", async ({

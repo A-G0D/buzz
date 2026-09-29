@@ -29,6 +29,7 @@ use crate::util::create_symlink;
 /// or a symlink to a user-configured `repos_dir`. Creating it here
 /// unconditionally would race a future symlink re-point.
 const NEST_DIRS: &[&str] = &[
+    "AGENT_GUIDES",
     "GUIDES",
     "RESEARCH",
     "PLANS",
@@ -45,14 +46,27 @@ pub(crate) const AGENTS_MD: &str = include_str!("nest_agents.md");
 /// Written to ~/.buzz/.agents/skills/buzz-cli/SKILL.md on first init.
 const BUZZ_CLI_SKILL_MD: &str = include_str!("nest_skill.md");
 
+/// Seed-only task maps: created once, then left user-editable.
+const AGENT_INSTRUCTION_MAPS: &[(&str, &str)] = &[
+    ("AGENTS.md", include_str!("nest_guides/AGENTS.md")),
+    ("CODING.md", include_str!("nest_guides/CODING.md")),
+    ("WRITING.md", include_str!("nest_guides/WRITING.md")),
+    ("RESEARCH.md", include_str!("nest_guides/RESEARCH.md")),
+    (
+        "ORCHESTRATION.md",
+        include_str!("nest_guides/ORCHESTRATION.md"),
+    ),
+    ("CRITICS.md", include_str!("nest_guides/CRITICS.md")),
+];
+
 /// Template content version for AGENTS.md static content (above managed markers).
 /// Bump this when changing `nest_agents.md` to trigger refresh on existing installs.
 /// Version 1 is implicitly "before this mechanism existed" (no version file).
-const NEST_AGENTS_VERSION: u32 = 5;
+const NEST_AGENTS_VERSION: u32 = 8;
 
 /// Template content version for SKILL.md.
 /// Bump this when changing `nest_skill.md` to trigger refresh on existing installs.
-const NEST_SKILL_VERSION: u32 = 5;
+const NEST_SKILL_VERSION: u32 = 6;
 
 const BEGIN_MARKER: &str = "<!-- BEGIN BUZZ MANAGED";
 const END_MARKER: &str = "<!-- END BUZZ MANAGED -->";
@@ -181,6 +195,8 @@ pub fn ensure_nest_at(root: &Path) -> Result<(), String> {
         }
     }
 
+    ensure_agent_instruction_maps(root)?;
+
     // Write buzz-cli skill to the harness-agnostic .agents path.
     // The first-init write uses the new canonical path; migration from
     // the old .claude path is handled in refresh_skill_md_if_stale.
@@ -275,6 +291,28 @@ pub fn ensure_nest_at(root: &Path) -> Result<(), String> {
         }
     }
 
+    Ok(())
+}
+
+/// Seed the nested task maps without overwriting local edits or imported files.
+fn ensure_agent_instruction_maps(root: &Path) -> Result<(), String> {
+    let directory = root.join("AGENT_GUIDES");
+    for (name, contents) in AGENT_INSTRUCTION_MAPS {
+        let path = directory.join(name);
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                use std::io::Write;
+                file.write_all(contents.as_bytes())
+                    .map_err(|error| format!("write {}: {error}", path.display()))?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(format!("create {}: {error}", path.display())),
+        }
+    }
     Ok(())
 }
 

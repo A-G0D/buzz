@@ -21,7 +21,11 @@ use tauri::Manager;
 enum SpawnOutcome {
     /// Boxed: the spawned process carries its full spawn-config snapshot, so an
     /// inline variant would make every `Skipped`/`Failed` outcome pay for it.
-    Spawned(super::ManagedAgentRuntimeKey, Box<ManagedAgentProcess>),
+    Spawned(
+        super::ManagedAgentRuntimeKey,
+        Box<ManagedAgentProcess>,
+        super::ManagedAgentStartReservation,
+    ),
     Skipped,
     Failed(String),
 }
@@ -316,39 +320,65 @@ pub async fn restore_managed_agents_on_launch(
                                 // tracked a live child for this exact pair during
                                 // the Phase A window, leave it alone. Mirrors the
                                 // live-child guard in `start_pair`.
-                                let already_live = app
-                                    .state::<AppState>()
-                                    .managed_agent_processes
-                                    .lock()
-                                    .ok()
-                                    .and_then(|mut runtimes| {
-                                        runtimes.get_mut(&key).map(|runtime| {
-                                            runtime.child.try_wait().ok().flatten().is_none()
-                                        })
-                                    })
-                                    .unwrap_or(false);
+                                let state = app.state::<AppState>();
+                                let mut runtimes = match state.managed_agent_processes.lock() {
+                                    Ok(runtimes) => runtimes,
+                                    Err(error) => {
+                                        return (
+                                            record.pubkey.clone(),
+                                            SpawnOutcome::Failed(error.to_string()),
+                                        );
+                                    }
+                                };
+                                let already_live = match runtimes.get_mut(&key) {
+                                    Some(runtime) => match runtime.child.try_wait() {
+                                        Ok(None) => true,
+                                        Ok(Some(_)) => false,
+                                        Err(error) => {
+                                            return (
+                                                record.pubkey.clone(),
+                                                SpawnOutcome::Failed(format!(
+                                                    "failed to inspect existing runtime: {error}"
+                                                )),
+                                            );
+                                        }
+                                    },
+                                    None => false,
+                                };
                                 if already_live {
                                     SpawnOutcome::Skipped
                                 } else {
-                                    match super::terminate_untracked_pair_runtime(app, &key)
-                                        .and_then(|()| {
-                                            // F1: restore spawns lazy, matching
-                                            // reconcile and manual start. Eager on
-                                            // restore buys nothing — a crashed
-                                            // mid-turn session is not resumed by an
-                                            // eager child — and silently reintroduces
-                                            // N idle brains on every launch.
-                                            spawn_agent_child(
-                                                app,
-                                                record,
-                                                &key.relay_url,
-                                                true,
-                                                owner_hex_ref,
-                                                None,
-                                            )
-                                        }) {
-                                        Ok(process) => {
-                                            SpawnOutcome::Spawned(key, Box::new(process))
+                                    match super::reserve_managed_agent_start(
+                                        app,
+                                        &mut runtimes,
+                                        &key,
+                                    ) {
+                                        Ok(reservation) => {
+                                            drop(runtimes);
+                                            match super::terminate_untracked_pair_runtime(app, &key)
+                                                .and_then(|()| {
+                                                    // F1: restore spawns lazy, matching
+                                                    // reconcile and manual start. Eager on
+                                                    // restore buys nothing — a crashed
+                                                    // mid-turn session is not resumed by an
+                                                    // eager child — and silently reintroduces
+                                                    // N idle brains on every launch.
+                                                    spawn_agent_child(
+                                                        app,
+                                                        record,
+                                                        &key.relay_url,
+                                                        true,
+                                                        owner_hex_ref,
+                                                        None,
+                                                    )
+                                                }) {
+                                                Ok(process) => SpawnOutcome::Spawned(
+                                                    key,
+                                                    Box::new(process),
+                                                    reservation,
+                                                ),
+                                                Err(error) => SpawnOutcome::Failed(error),
+                                            }
                                         }
                                         Err(error) => SpawnOutcome::Failed(error),
                                     }
@@ -387,7 +417,7 @@ pub async fn restore_managed_agents_on_launch(
             // Skipped means a concurrent reconcile already owns a live child for
             // this pair; leave its runtime and record state untouched.
             SpawnOutcome::Skipped => continue,
-            SpawnOutcome::Spawned(key, mut process) => {
+            SpawnOutcome::Spawned(key, mut process, _start_reservation) => {
                 let Ok(record) = find_managed_agent_mut(&mut records, &pubkey) else {
                     continue;
                 };
@@ -397,6 +427,7 @@ pub async fn restore_managed_agents_on_launch(
                     pid: process.child.id(),
                     desktop_instance_id: super::current_instance_id(app),
                     started_at: now.clone(),
+                    start_nonce: Some(process.start_nonce.clone()),
                 };
                 if let Err(error) = super::write_agent_runtime_receipt(app, &receipt) {
                     let _ = super::terminate_process(process.child.id());

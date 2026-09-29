@@ -404,6 +404,7 @@ fn snapshot_under(policy: AcpSessionPolicy) -> SpawnConfigSnapshot {
         &Default::default(),
         false,
     )
+    .expect("prospective prompt profile resolution succeeds")
 }
 
 /// Restart-badge entries for a stamped→current session-policy transition,

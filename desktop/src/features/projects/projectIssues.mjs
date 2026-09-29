@@ -192,6 +192,7 @@ export function eventToProjectIssue(
   const comments = commentsForIssue(issueCommentEvents);
   const assignmentState = assignmentStateForIssue(issue, issueCommentEvents);
   const labels = getAllTags(issue, "t");
+  const parentIssueTag = getTag(issue, "parent");
   const title =
     getTag(issue, "subject") || issue.content.split("\n")[0] || "Untitled task";
 
@@ -203,6 +204,10 @@ export function eventToProjectIssue(
     author: issue.pubkey,
     createdAt: issue.created_at,
     repoAddress: getTag(issue, "a") ?? null,
+    parentIssueId:
+      parentIssueTag && /^[a-fA-F0-9]{64}$/.test(parentIssueTag)
+        ? parentIssueTag.toLowerCase()
+        : null,
     channelId: getTag(issue, "h") ?? null,
     originAgentName: getTag(issue, "buzz-origin-agent") ?? null,
     labels,
@@ -232,6 +237,53 @@ export function projectIssueEventsToIssues(
     .sort((left, right) => right.updatedAt - left.updatedAt);
 }
 
+/**
+ * Build Buzz's optional issue-parent extension without hiding malformed,
+ * missing, cross-repository, nested-parent, or cyclic references. Only an
+ * `epic` root can own direct child tasks; invalid references stay top-level.
+ */
+export function projectIssueHierarchy(issues) {
+  const issuesById = new Map(issues.map((issue) => [issue.id, issue]));
+  const childrenByParentId = new Map();
+  const parentByChildId = new Map();
+  const invalidParentByIssueId = new Map();
+
+  for (const issue of issues) {
+    const parentId = issue.parentIssueId;
+    if (!parentId) continue;
+    if (parentId === issue.id) {
+      invalidParentByIssueId.set(issue.id, "self");
+      continue;
+    }
+    const parent = issuesById.get(parentId);
+    if (!parent) {
+      invalidParentByIssueId.set(issue.id, "missing");
+      continue;
+    }
+    if (parent.repoAddress !== issue.repoAddress) {
+      invalidParentByIssueId.set(issue.id, "different-repository");
+      continue;
+    }
+    if (parent.category !== "epic" || parent.parentIssueId) {
+      invalidParentByIssueId.set(issue.id, "not-root-epic");
+      continue;
+    }
+    parentByChildId.set(issue.id, parent.id);
+    const children = childrenByParentId.get(parent.id) ?? [];
+    children.push(issue);
+    childrenByParentId.set(parent.id, children);
+  }
+
+  for (const children of childrenByParentId.values()) {
+    children.sort(
+      (left, right) =>
+        left.createdAt - right.createdAt || left.id.localeCompare(right.id),
+    );
+  }
+
+  return { childrenByParentId, invalidParentByIssueId, parentByChildId };
+}
+
 /** Keep consecutive comments ordered across whole-second Nostr timestamps. */
 export function nextProjectIssueCommentCreatedAt(issue, now, author) {
   const normalizedAuthor = author.toLowerCase();
@@ -243,7 +295,21 @@ export function nextProjectIssueCommentCreatedAt(issue, now, author) {
   );
 }
 
+export function projectIssueContentWithAcceptanceCriteria(
+  description,
+  acceptanceCriteria,
+) {
+  const criteria = acceptanceCriteria.trim();
+  return [
+    description.trim(),
+    criteria ? `Acceptance criteria:\n${criteria}` : "",
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+}
+
 export function buildGitIssueTags({
+  parentIssueId,
   repoAddress,
   repoOwner,
   title,
@@ -268,6 +334,13 @@ export function buildGitIssueTags({
     ["p", repoOwner.toLowerCase()],
     ["subject", subject],
   ];
+
+  if (parentIssueId !== undefined && parentIssueId !== null) {
+    if (!/^[a-fA-F0-9]{64}$/.test(parentIssueId)) {
+      throw new Error("Parent task ID must be 64 hex characters.");
+    }
+    tags.push(["parent", parentIssueId.toLowerCase()]);
+  }
 
   for (const label of labels) {
     const trimmed = label.trim();

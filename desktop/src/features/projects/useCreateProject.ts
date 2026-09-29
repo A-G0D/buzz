@@ -37,7 +37,31 @@ export function useCreateProjectMutation() {
   return useMutation({
     mutationFn: (input: CreateProjectInput) =>
       createProject(input, resumeRef.current),
-    onSuccess: async ({ channel, project }, input) => {
+    onSuccess: async (
+      {
+        channel,
+        project,
+        agentProfileDefaultSaveFailed,
+        agentRouteProfileDefaultSaveFailed,
+        agentResourceDefaultSaveFailed,
+      },
+      input,
+    ) => {
+      if (agentProfileDefaultSaveFailed) {
+        toast.warning(
+          "Project created, but its agent default could not be saved on this device.",
+        );
+      }
+      if (agentRouteProfileDefaultSaveFailed) {
+        toast.warning(
+          "Project created, but its route profile default could not be saved on this device.",
+        );
+      }
+      if (agentResourceDefaultSaveFailed) {
+        toast.warning(
+          "Project created, but its agent limits could not be saved on this device.",
+        );
+      }
       markProjectDataAuthoritative(project, "local-write");
       addProjectToSidebar(
         project.projectAddress,

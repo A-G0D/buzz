@@ -19,6 +19,7 @@ import type {
   ProjectRepoSnapshot,
   Repository,
 } from "@/features/projects/hooks";
+import type { ProjectIssuePlanChatHandoff } from "@/features/projects/lib/projectIssuePlan";
 import {
   gitContributorPubkeysFromCommits,
   type ProjectContributorActivityCounts,
@@ -117,6 +118,7 @@ export function WorkspaceTabs({
   onSelectedCommitHashChange,
   onFilesContextChange,
   onSelectedIssueIdChange,
+  onUseApprovedIssuePlan,
   onSelectedPullRequestIdChange,
   onSelectedTabChange,
   onBack,
@@ -170,6 +172,7 @@ export function WorkspaceTabs({
     path: string;
   }) => void;
   onSelectedIssueIdChange: (id: string | null) => void;
+  onUseApprovedIssuePlan?: (handoff: ProjectIssuePlanChatHandoff) => boolean;
   onSelectedPullRequestIdChange: (id: string | null) => void;
   /** Reports the active tab so the screen breadcrumb can mirror it. */
   onSelectedTabChange?: (tab: string) => void;
@@ -563,6 +566,7 @@ export function WorkspaceTabs({
         >
           <ProjectIssuesPanel
             onSelectedIssueIdChange={onSelectedIssueIdChange}
+            onUseApprovedIssuePlan={onUseApprovedIssuePlan}
             profiles={profiles}
             project={project}
             selectedIssueId={selectedIssueId}

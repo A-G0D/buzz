@@ -408,7 +408,14 @@ pub(crate) fn valid_agent_runtime_receipt_with(
     else {
         return false;
     };
+    let valid_start_nonce = receipt.start_nonce.as_deref().map_or(true, |nonce| {
+        nonce.len() == 32
+            && nonce
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    });
     canonical == receipt.key
+        && valid_start_nonce
         && path.file_name().and_then(|name| name.to_str())
             == Some(&format!("{}.json", receipt.key.runtime_id()))
         && receipt.desktop_instance_id == instance_id

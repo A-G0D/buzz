@@ -16,6 +16,7 @@ import type {
 } from "@/features/home/lib/inbox";
 import { getProjectInboxReference } from "@/features/home/lib/projectInbox";
 import { ProjectInboxDetail } from "@/features/home/ui/ProjectInboxDetail";
+import { ThreadBriefDisclosure } from "@/features/home/ui/ThreadBriefDisclosure";
 import { ChannelMembersBar } from "@/features/channels/ui/ChannelMembersBar";
 import { useCommunities } from "@/features/communities/useCommunities";
 import { formatInboxTypeLabel } from "@/features/home/lib/inbox";
@@ -690,6 +691,14 @@ function InboxMessageDetailPane({
                 </div>
               </TooltipProvider>
             </div>
+            {isThreadContext && contextChannelId && contextThreadRootId ? (
+              <div className="-mx-2 mt-1">
+                <ThreadBriefDisclosure
+                  channelId={contextChannelId}
+                  rootEventId={contextThreadRootId}
+                />
+              </div>
+            ) : null}
           </div>
         </TopChromeInsetHeader>
 

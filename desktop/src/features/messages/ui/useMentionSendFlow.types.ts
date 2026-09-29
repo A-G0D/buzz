@@ -41,6 +41,7 @@ export type UseMentionSendFlowOptions = {
         threadHeadId: string | null;
       } | null,
       forceRest?: boolean,
+      taskClass?: string | null,
     ) => Promise<void>
   >;
   richText: Pick<UseRichTextEditorResult, "clearContent" | "setContent">;

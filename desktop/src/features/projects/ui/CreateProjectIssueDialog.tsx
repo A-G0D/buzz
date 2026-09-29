@@ -63,7 +63,7 @@ export function CreateProjectIssueDialog({
 
   return (
     <CreateProjectWorkItemDialog
-      bodyPlaceholder="Add context, expected behavior, or reproduction steps"
+      bodyPlaceholder="Add context or reproduction steps"
       description={
         repository
           ? `Create a task in ${repository.name}`

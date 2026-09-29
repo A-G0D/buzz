@@ -443,6 +443,32 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_ACP_MODEL")]
     pub model: Option<String>,
 
+    /// Configured provider identifier from the managed agent profile. This is
+    /// provenance only; the harness's provider environment remains authoritative.
+    #[arg(long, env = "BUZZ_ACP_PROVIDER")]
+    pub provider: Option<String>,
+
+    /// Versioned execution profile selected for this managed agent. Provenance only.
+    #[arg(long, env = "BUZZ_ACP_EXECUTION_PROFILE_ID")]
+    pub execution_profile_id: Option<String>,
+    #[arg(long, env = "BUZZ_ACP_EXECUTION_PROFILE_VERSION")]
+    pub execution_profile_version: Option<u32>,
+    /// Exact local Buzz target prompt-profile identity and content hash.
+    #[arg(long, env = "BUZZ_ACP_PROMPT_PROFILE_ID")]
+    pub prompt_profile_id: Option<String>,
+    #[arg(long, env = "BUZZ_ACP_PROMPT_PROFILE_VERSION")]
+    pub prompt_profile_version: Option<u32>,
+    #[arg(long, env = "BUZZ_ACP_PROMPT_PROFILE_HASH")]
+    pub prompt_profile_hash: Option<String>,
+    /// Versioned route profile selected for this managed agent. Provenance only.
+    #[arg(long, env = "BUZZ_ACP_ROUTE_PROFILE_ID")]
+    pub route_profile_id: Option<String>,
+    #[arg(long, env = "BUZZ_ACP_ROUTE_PROFILE_VERSION")]
+    pub route_profile_version: Option<u32>,
+    /// Fingerprint of the launch-resolved route document and target prompts.
+    #[arg(long, env = "BUZZ_ACP_ROUTE_PROFILE_HASH")]
+    pub route_profile_hash: Option<String>,
+
     /// Persisted effort level value (e.g. "high", "medium", "low") to apply via
     /// `session/set_config_option` at the first session creation. The configId is
     /// resolved from the adapter's advertised `thought_level` capability — not
@@ -544,6 +570,8 @@ pub struct Config {
     pub agent_command: String,
     pub agent_args: Vec<String>,
     pub mcp_command: String,
+    /// Buzz Agent's tool-free, one-prompt critic execution mode.
+    pub review_only: bool,
     pub idle_timeout_secs: u64,
     pub max_turn_duration_secs: u64,
     pub agents: u32,
@@ -579,6 +607,20 @@ pub struct Config {
     pub memory_enabled: bool,
     /// Desired LLM model ID. Applied after every `session_new_full()`.
     pub model: Option<String>,
+    /// Provider identity from the managed profile, retained for local
+    /// run-journal provenance. The adapter environment remains authoritative.
+    pub provider: Option<String>,
+    /// Versioned execution profile identity, retained for local run provenance.
+    pub execution_profile_id: Option<String>,
+    pub execution_profile_version: Option<u32>,
+    /// Versioned target prompt-profile identity, retained for local run provenance.
+    pub prompt_profile_id: Option<String>,
+    pub prompt_profile_version: Option<u32>,
+    pub prompt_profile_hash: Option<String>,
+    /// Versioned provider-routing profile identity, retained for run provenance.
+    pub route_profile_id: Option<String>,
+    pub route_profile_version: Option<u32>,
+    pub route_profile_hash: Option<String>,
     /// Persisted effort level value (e.g. "high", "medium", "low"). Held as a
     /// per-worker spawn-scoped value and applied at the first session creation
     /// by pairing with the adapter's advertised `thought_level` configId.
@@ -739,6 +781,72 @@ fn validate_allowlist(entries: &[String]) -> Result<HashSet<String>, ConfigError
     Ok(validated)
 }
 
+fn validate_prompt_profile_identity(
+    id: Option<&str>,
+    version: Option<u32>,
+    hash: Option<&str>,
+) -> Result<(), ConfigError> {
+    if id.is_none() && version.is_none() && hash.is_none() {
+        return Ok(());
+    }
+    let valid_id = id.is_some_and(|id| {
+        !id.is_empty()
+            && id.len() <= 64
+            && id.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
+            && id
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+            && !id.ends_with('-')
+            && !id.contains("--")
+    });
+    let valid_hash = hash.is_some_and(|hash| {
+        hash.len() == 64
+            && hash
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    });
+    if !valid_id || !version.is_some_and(|version| version > 0) || !valid_hash {
+        return Err(ConfigError::ConfigFile(
+            "prompt profile provenance requires a valid id, positive version, and lowercase SHA-256 hash"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_route_profile_identity(
+    id: Option<&str>,
+    version: Option<u32>,
+    hash: Option<&str>,
+) -> Result<(), ConfigError> {
+    if id.is_none() && version.is_none() && hash.is_none() {
+        return Ok(());
+    }
+    let valid_id = id.is_some_and(|id| {
+        !id.is_empty()
+            && id.len() <= 64
+            && id.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
+            && id
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+            && !id.ends_with('-')
+            && !id.contains("--")
+    });
+    let valid_hash = hash.is_some_and(|hash| {
+        hash.len() == 64
+            && hash
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    });
+    if !valid_id || !version.is_some_and(|version| version > 0) || !valid_hash {
+        return Err(ConfigError::ConfigFile(
+            "route profile provenance requires a valid id, positive version, and lowercase SHA-256 hash"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Validate the `--multiple-event-handling` / `--dedup` combination.
 ///
 /// Every mid-turn cancel mode (`Steer`, `Interrupt`, `OwnerInterrupt`) requires
@@ -791,6 +899,7 @@ pub(crate) fn normalize_agent_command_identity(command: &str) -> String {
 fn default_agent_args(command: &str) -> Option<Vec<String>> {
     match normalize_agent_command_identity(command).as_str() {
         "goose" => Some(vec!["acp".to_string()]),
+        "dsh" => Some(vec!["--profile".to_string(), "acp".to_string()]),
         "codex" | "codex-acp" | "claude-agent-acp" | "claude-code-acp" | "claude-code"
         | "claudecode" | "buzz-agent" => Some(Vec::new()),
         _ => None,
@@ -884,6 +993,18 @@ pub fn normalize_agent_args(command: &str, agent_args: Vec<String>) -> Vec<Strin
         return default_args;
     }
 
+    if normalize_agent_command_identity(command) == "dsh" {
+        // An explicit profile intentionally replaces the ACP default; other
+        // DSH flags are additive and must retain the default ACP profile.
+        let has_explicit_profile = normalized.windows(2).any(|pair| pair[0] == "--profile");
+        if has_explicit_profile {
+            return normalized;
+        }
+        let mut args = default_args;
+        args.extend(normalized);
+        return args;
+    }
+
     // Older callers relied on the Goose-specific default even for runtimes like
     // Codex and Claude. Treat that legacy fallback as "no args" for zero-arg
     // providers so desktop- and env-based launches behave the same way.
@@ -918,13 +1039,28 @@ pub fn propagate_legacy_env_vars() {
     }
 }
 
+fn parse_review_only_value(value: Result<String, std::env::VarError>) -> Result<bool, ConfigError> {
+    match value {
+        Ok(value) if value == "1" => Ok(true),
+        Ok(_) => Err(ConfigError::ConfigFile(
+            "BUZZ_AGENT_REVIEW_ONLY accepts only the value '1'".into(),
+        )),
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        Err(std::env::VarError::NotUnicode(_)) => Err(ConfigError::ConfigFile(
+            "BUZZ_AGENT_REVIEW_ONLY must be UTF-8".into(),
+        )),
+    }
+}
+
 impl Config {
     pub fn from_cli() -> Result<Self, ConfigError> {
         // Legacy env-var propagation is intentionally NOT done here.
         // Call `propagate_legacy_env_vars()` before the tokio runtime starts
         // (in the sync `fn main()` wrapper) — see Rust 2024 edition safety.
         let args = CliArgs::parse();
-        Self::from_args(args)
+        let mut config = Self::from_args(args)?;
+        config.review_only = parse_review_only_value(std::env::var("BUZZ_AGENT_REVIEW_ONLY"))?;
+        Ok(config)
     }
 
     /// Build a `Config` from already-parsed `CliArgs`. Separated from `from_cli()` so
@@ -1137,6 +1273,25 @@ impl Config {
         // instructions arrive independently so they can be layered at runtime.
         let mut persona_env_vars = Vec::new();
         let model = args.model;
+        let provider = args.provider;
+        let execution_profile_id = args.execution_profile_id;
+        let execution_profile_version = args.execution_profile_version;
+        let prompt_profile_id = args.prompt_profile_id;
+        let prompt_profile_version = args.prompt_profile_version;
+        let prompt_profile_hash = args.prompt_profile_hash;
+        validate_prompt_profile_identity(
+            prompt_profile_id.as_deref(),
+            prompt_profile_version,
+            prompt_profile_hash.as_deref(),
+        )?;
+        let route_profile_id = args.route_profile_id;
+        let route_profile_version = args.route_profile_version;
+        let route_profile_hash = args.route_profile_hash;
+        validate_route_profile_identity(
+            route_profile_id.as_deref(),
+            route_profile_version,
+            route_profile_hash.as_deref(),
+        )?;
 
         // Inject CODEX_CONFIG so the @agentclientprotocol/codex-acp adapter (1.x)
         // opens the Seatbelt network sandbox for buzz-cli (an MCP subprocess). No-op
@@ -1157,6 +1312,7 @@ impl Config {
             agent_command,
             agent_args,
             mcp_command: args.mcp_command,
+            review_only: false,
             idle_timeout_secs,
             max_turn_duration_secs,
             agents: args.agents,
@@ -1186,6 +1342,15 @@ impl Config {
             typing_enabled: !args.no_typing,
             memory_enabled: args.memory && !args.no_memory,
             model,
+            provider,
+            execution_profile_id,
+            execution_profile_version,
+            prompt_profile_id,
+            prompt_profile_version,
+            prompt_profile_hash,
+            route_profile_id,
+            route_profile_version,
+            route_profile_hash,
             effort_level: args.effort_level,
             session_title: args
                 .session_title
@@ -1533,6 +1698,45 @@ mod tests {
     use crate::filter::{ChannelScope, SubscriptionRule};
     use clap::{Parser, ValueEnum};
 
+    #[test]
+    fn review_only_environment_switch_is_strict_and_opt_in() {
+        assert!(!parse_review_only_value(Err(std::env::VarError::NotPresent)).unwrap());
+        assert!(parse_review_only_value(Ok("1".into())).unwrap());
+        assert!(parse_review_only_value(Ok("true".into())).is_err());
+        assert!(parse_review_only_value(Ok("0".into())).is_err());
+    }
+
+    #[test]
+    fn route_profile_provenance_requires_valid_id_version_and_hash() {
+        let valid_hash = "a".repeat(64);
+        let uppercase_hash = "A".repeat(64);
+        assert!(validate_route_profile_identity(None, None, None).is_ok());
+        assert!(validate_route_profile_identity(
+            Some("local-first"),
+            Some(2),
+            Some(valid_hash.as_str()),
+        )
+        .is_ok());
+        assert!(validate_route_profile_identity(
+            Some("../routes"),
+            Some(2),
+            Some(valid_hash.as_str()),
+        )
+        .is_err());
+        assert!(validate_route_profile_identity(
+            Some("local-first"),
+            Some(0),
+            Some(valid_hash.as_str()),
+        )
+        .is_err());
+        assert!(validate_route_profile_identity(
+            Some("local-first"),
+            Some(2),
+            Some(uppercase_hash.as_str()),
+        )
+        .is_err());
+    }
+
     /// Build a minimal Config for testing without CLI parsing.
     fn test_config(mode: SubscribeMode) -> Config {
         Config {
@@ -1541,6 +1745,7 @@ mod tests {
             agent_command: "goose".into(),
             agent_args: vec!["acp".into()],
             mcp_command: "".into(),
+            review_only: false,
             idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
             max_turn_duration_secs: DEFAULT_MAX_TURN_DURATION_SECS,
             agents: 1,
@@ -1565,6 +1770,15 @@ mod tests {
             typing_enabled: true,
             memory_enabled: true,
             model: None,
+            provider: None,
+            execution_profile_id: None,
+            execution_profile_version: None,
+            prompt_profile_id: None,
+            prompt_profile_version: None,
+            prompt_profile_hash: None,
+            route_profile_id: None,
+            route_profile_version: None,
+            route_profile_hash: None,
             effort_level: None,
             session_title: None,
             permission_mode: PermissionMode::BypassPermissions,
@@ -1647,6 +1861,38 @@ mod tests {
     fn normalizes_goose_args_to_acp() {
         assert_eq!(normalize_agent_args("goose", Vec::new()), vec!["acp"]);
         assert_eq!(normalize_agent_args("goose", vec!["".into()]), vec!["acp"]);
+    }
+
+    #[test]
+    fn normalizes_dsh_args_to_acp_profile_and_preserves_additive_flags() {
+        assert_eq!(
+            normalize_agent_args("dsh", Vec::new()),
+            vec!["--profile", "acp"]
+        );
+        assert_eq!(
+            normalize_agent_args("/usr/local/bin/DSH.EXE", Vec::new()),
+            vec!["--profile", "acp"]
+        );
+        assert_eq!(
+            normalize_agent_args(r"C:\Users\test\AppData\Roaming\npm\dsh.cmd", Vec::new()),
+            vec!["--profile", "acp"]
+        );
+        assert_eq!(
+            normalize_agent_args("dsh", vec!["--profile".into(), "custom".into()]),
+            vec!["--profile", "custom"]
+        );
+        assert_eq!(
+            normalize_agent_args("dsh", vec!["--verbose".into(), "--color".into()]),
+            vec!["--profile", "acp", "--verbose", "--color"]
+        );
+        // A caller-specified profile is an intentional replacement for ACP.
+        assert_eq!(
+            normalize_agent_args(
+                "dsh",
+                vec!["--profile".into(), "sdk-minimal".into(), "--verbose".into()]
+            ),
+            vec!["--profile", "sdk-minimal", "--verbose"]
+        );
     }
 
     #[test]
@@ -3017,6 +3263,33 @@ channels = "ALL"
             result.is_ok(),
             "from_args should accept any mode when allowed list is unset: {result:?}"
         );
+    }
+
+    #[test]
+    fn provider_profile_label_flows_into_runtime_config() {
+        let args = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            TEST_PRIVATE_KEY,
+            "--provider",
+            "anthropic",
+            "--model",
+            "claude-opus",
+            "--execution-profile-id",
+            "critic_security",
+            "--execution-profile-version",
+            "1",
+        ])
+        .expect("clap should parse profile identifiers");
+        let config = Config::from_args(args).expect("default ACP settings are valid");
+
+        assert_eq!(config.provider.as_deref(), Some("anthropic"));
+        assert_eq!(config.model.as_deref(), Some("claude-opus"));
+        assert_eq!(
+            config.execution_profile_id.as_deref(),
+            Some("critic_security")
+        );
+        assert_eq!(config.execution_profile_version, Some(1));
     }
 
     // --- max_turn_duration ceiling gate ---

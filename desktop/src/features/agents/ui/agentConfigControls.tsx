@@ -344,6 +344,7 @@ export function AgentModelField({
   id = "agent-model",
   isCustomModelEditing,
   isRequired,
+  label = "Model",
   model,
   modelDiscoveryLoading,
   modelDiscoveryStatus,
@@ -378,6 +379,8 @@ export function AgentModelField({
   id?: string;
   isCustomModelEditing: boolean;
   isRequired: boolean;
+  /** Visible field name when this picker selects a specialized model. */
+  label?: string;
   model: string;
   modelDiscoveryLoading: boolean;
   modelDiscoveryStatus: PersonaModelDiscoveryStatus | null;
@@ -575,7 +578,7 @@ export function AgentModelField({
         htmlFor={id}
         isRequired={isRequired}
       >
-        Model
+        {label}
       </RequiredFieldLabel>
       {!useCustomSelect && useChevronIcon ? (
         <div className="relative">

@@ -28,6 +28,8 @@ import { Button } from "@/shared/ui/button";
 import { ProjectChannelManagement } from "./ProjectChannelManagement";
 import { ProjectRepositoryManagement } from "./ProjectRepositoryManagement";
 import { SECTION_ACTION_VISIBILITY_CLASS } from "@/features/sidebar/ui/sidebarSectionStyles";
+import { ProjectAgentRunActivity } from "./ProjectAgentRunActivity";
+import { ProjectAgentProfileDefault } from "./ProjectAgentProfileDefault";
 
 const PROJECT_HOME_SIDEBAR_ROW_CLASS =
   "h-8 w-full justify-start gap-2 rounded-md px-2 py-1.5 text-left text-sm font-normal text-sidebar-foreground/80 transition-[background-color,color] hover:bg-sidebar-accent hover:text-sidebar-accent-foreground disabled:pointer-events-none disabled:opacity-50";
@@ -185,11 +187,13 @@ export function ProjectHomeContextPanel({
   identityPubkey,
   onAddRepository,
   onOpenChannel,
+  onOpenThread,
   onOpenRepository,
   onOpenWorkspace,
   onRepositoryChange,
   project,
   projects,
+  relayUrl,
 }: {
   activeWorkspaceTab?: ProjectHomeWorkspaceSheetTab | null;
   channel: Channel | null;
@@ -197,11 +201,13 @@ export function ProjectHomeContextPanel({
   identityPubkey?: string;
   onAddRepository?: () => void;
   onOpenChannel?: (channelId: string) => void;
+  onOpenThread: (channelId: string, rootEventId: string) => void;
   onOpenRepository: (repositoryId: string) => void;
   onOpenWorkspace: (repositoryId: string, tab?: EntityLinkTab) => void;
   onRepositoryChange: (repositoryId: string) => void;
   project: Project;
   projects: Project[];
+  relayUrl: string;
 }) {
   const firstRepository = project.repositories[0] ?? null;
   const addRepositoryTitle = firstRepository
@@ -321,6 +327,24 @@ export function ProjectHomeContextPanel({
           People
         </ContextNavButton>
       </ContextSection>
+      {!project.legacy && project.projectChannelId ? (
+        <>
+          <ProjectAgentProfileDefault
+            channelId={project.projectChannelId}
+            identityPubkey={identityPubkey}
+            key={`${project.projectAddress}:${project.projectChannelId}:${identityPubkey ?? ""}:${relayUrl}`}
+            relayUrl={relayUrl}
+          />
+          <ProjectAgentRunActivity
+            identityPubkey={identityPubkey}
+            key={`${project.projectAddress}:${project.projectChannelId}`}
+            homeChannelId={project.projectChannelId}
+            onOpenThread={onOpenThread}
+            projectCoordinate={project.projectAddress}
+            relayUrl={relayUrl}
+          />
+        </>
+      ) : null}
       <ContextSection
         collapsible
         headerAction={

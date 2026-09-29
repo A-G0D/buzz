@@ -7,11 +7,22 @@
 //!   - concurrent prompt rejection
 
 use std::collections::VecDeque;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
+use buzz_agent::route_preview::{
+    RouteProfileCandidate, RouteProfileDataPolicy, RouteProfileDocument, RouteProfileLocation,
+};
+use buzz_agent::task_fit_evidence::{
+    validate_task_fit_report, TaskFitEligibilityPolicy, TaskFitEvidenceBinding,
+    TaskFitRouteAttestationPayload, TASK_FIT_REVIEW_PUBLIC_KEY_ENV,
+};
+use nostr::{EventBuilder, Keys, Kind};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
@@ -50,7 +61,8 @@ async fn spawn_fake_llm(responses: Vec<Value>) -> String {
                 let body_s = serde_json::to_string(&body).unwrap();
                 let resp = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body_s.len(), body_s,
+                    body_s.len(),
+                    body_s,
                 );
                 let _ = sock.write_all(resp.as_bytes()).await;
                 let _ = sock.shutdown().await;
@@ -213,8 +225,77 @@ struct Harness {
     next_id: i64,
 }
 
+struct TaskFitEnv {
+    nest_dir: PathBuf,
+    reviewer_public_key: String,
+    profile_id: String,
+    profile_version: u32,
+    profile_hash: String,
+}
+
 impl Harness {
     async fn spawn(base_url: &str) -> Self {
+        Self::spawn_with_route(base_url, None).await
+    }
+
+    async fn spawn_routed(
+        openai_base_url: &str,
+        deepseek_base_url: &str,
+        route_profile: Value,
+    ) -> Self {
+        Self::spawn_with_route(
+            openai_base_url,
+            Some((deepseek_base_url.to_owned(), route_profile)),
+        )
+        .await
+    }
+
+    async fn spawn_routed_with_task_fit(
+        openai_base_url: &str,
+        deepseek_base_url: &str,
+        route_profile: Value,
+        task_fit: TaskFitEnv,
+    ) -> Self {
+        Self::spawn_with_route_and_task_fit(
+            openai_base_url,
+            Some((deepseek_base_url.to_owned(), route_profile)),
+            Some(task_fit),
+        )
+        .await
+    }
+
+    async fn spawn_with_route(base_url: &str, route: Option<(String, Value)>) -> Self {
+        Self::spawn_with_route_and_task_fit(base_url, route, None).await
+    }
+
+    async fn spawn_with_route_and_task_fit(
+        base_url: &str,
+        route: Option<(String, Value)>,
+        task_fit: Option<TaskFitEnv>,
+    ) -> Self {
+        Self::spawn_with_options(base_url, route, task_fit, false).await
+    }
+
+    async fn spawn_review_only(base_url: &str) -> Self {
+        Self::spawn_with_options(base_url, None, None, true).await
+    }
+
+    async fn spawn_with_options(
+        base_url: &str,
+        route: Option<(String, Value)>,
+        task_fit: Option<TaskFitEnv>,
+        review_only: bool,
+    ) -> Self {
+        Self::spawn_with_options_and_barrier(base_url, route, task_fit, review_only, None).await
+    }
+
+    async fn spawn_with_options_and_barrier(
+        base_url: &str,
+        route: Option<(String, Value)>,
+        task_fit: Option<TaskFitEnv>,
+        review_only: bool,
+        barrier_dir: Option<&Path>,
+    ) -> Self {
         let bin = env!("CARGO_BIN_EXE_buzz-agent");
         let mut cmd = tokio::process::Command::new(bin);
         cmd.env("BUZZ_AGENT_PROVIDER", "openai")
@@ -224,10 +305,39 @@ impl Harness {
             .env("BUZZ_AGENT_LLM_TIMEOUT_SECS", "5")
             .env("BUZZ_AGENT_TOOL_TIMEOUT_SECS", "5")
             .env("BUZZ_AGENT_MAX_ROUNDS", "4")
+            .env_remove("BUZZ_AGENT_REVIEW_ONLY")
+            .env_remove("BUZZ_NEST_DIR")
+            .env_remove(TASK_FIT_REVIEW_PUBLIC_KEY_ENV)
+            .env_remove("BUZZ_ACP_ROUTE_PROFILE_ID")
+            .env_remove("BUZZ_ACP_ROUTE_PROFILE_VERSION")
+            .env_remove("BUZZ_ACP_ROUTE_PROFILE_HASH")
+            .env_remove("BUZZ_AGENT_TEST_ROUTE_PREFLIGHT_BARRIER_DIR")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .kill_on_drop(true);
+        if review_only {
+            cmd.env("BUZZ_AGENT_REVIEW_ONLY", "1");
+        }
+        if let Some((deepseek_base_url, route_profile)) = route {
+            cmd.env("DEEPSEEK_API_KEY", "local-test-key")
+                .env("DEEPSEEK_MODEL", "deepseek-chat")
+                .env("DEEPSEEK_BASE_URL", deepseek_base_url)
+                .env("BUZZ_AGENT_ROUTE_PROFILE_JSON", route_profile.to_string());
+        }
+        if let Some(task_fit) = task_fit {
+            cmd.env("BUZZ_NEST_DIR", task_fit.nest_dir)
+                .env(TASK_FIT_REVIEW_PUBLIC_KEY_ENV, task_fit.reviewer_public_key)
+                .env("BUZZ_ACP_ROUTE_PROFILE_ID", task_fit.profile_id)
+                .env(
+                    "BUZZ_ACP_ROUTE_PROFILE_VERSION",
+                    task_fit.profile_version.to_string(),
+                )
+                .env("BUZZ_ACP_ROUTE_PROFILE_HASH", task_fit.profile_hash);
+        }
+        if let Some(barrier_dir) = barrier_dir {
+            cmd.env("BUZZ_AGENT_TEST_ROUTE_PREFLIGHT_BARRIER_DIR", barrier_dir);
+        }
         let mut child = cmd.spawn().expect("spawn buzz-agent");
         let stdin = child.stdin.take().unwrap();
         let stdout = BufReader::new(child.stdout.take().unwrap());
@@ -279,6 +389,35 @@ impl Harness {
         let _ = tokio::time::timeout(Duration::from_secs(2), self.child.wait()).await;
         let _ = self.child.start_kill();
     }
+}
+
+async fn wait_for_route_preflight_snapshot(directory: &Path, request_id: i64) {
+    let ready = directory.join(format!("{request_id}.ready"));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !ready.exists() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("prompt reached route-preflight snapshot barrier");
+}
+
+fn release_route_preflight_snapshot(directory: &Path, request_id: i64) {
+    fs::write(directory.join(format!("{request_id}.release")), b"release")
+        .expect("release route-preflight snapshot barrier");
+}
+
+async fn wait_for_captured_request_count(captures: &Arc<Mutex<Vec<Value>>>, expected: usize) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if captures.lock().await.len() >= expected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("fake provider captured expected request count");
 }
 
 fn openai_text(content: &str) -> Value {
@@ -342,6 +481,955 @@ async fn text_only_end_turn() {
         .await;
     let v = h.recv_until(|v| v["id"] == json!(p_id)).await;
     assert_eq!(v["result"]["stopReason"], "end_turn");
+    h.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_only_session_rejects_tools_model_changes_and_reuse() {
+    let (url, requests) = spawn_capturing_fake_llm(vec![openai_text(
+        "{\"findings\":[],\"summary\":\"No issues found in the supplied snapshot.\"}",
+    )])
+    .await;
+    let mut h = Harness::spawn_review_only(&url).await;
+    h.send(
+        "initialize",
+        json!({"protocolVersion":2,"clientCapabilities":{}}),
+    )
+    .await;
+    let init = h.recv().await;
+    assert_eq!(init["result"]["protocolVersion"], 2);
+
+    let rejected_id = h
+        .send(
+            "session/new",
+            json!({
+                "cwd":"/tmp",
+                "mcpServers":[{"name":"inert","command":"/usr/bin/env","args":[]}]
+            }),
+        )
+        .await;
+    let rejected = h.recv_until(|v| v["id"] == json!(rejected_id)).await;
+    assert!(rejected["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("review-only sessions cannot start MCP tools"));
+
+    h.send("session/new", json!({"cwd":"/tmp","mcpServers":[]}))
+        .await;
+    let created = h.recv().await;
+    let sid = created["result"]["sessionId"].as_str().unwrap().to_owned();
+
+    let set_model_id = h
+        .send(
+            "session/set_model",
+            json!({"sessionId":sid,"modelId":"different-model"}),
+        )
+        .await;
+    let set_model = h.recv_until(|v| v["id"] == json!(set_model_id)).await;
+    assert!(set_model["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("model identity is pinned at launch"));
+
+    let first_prompt_id = h
+        .send(
+            "session/prompt",
+            json!({
+                "sessionId":sid,
+                "prompt":[{"type":"text","text":"Review this frozen input and return the requested JSON."}]
+            }),
+        )
+        .await;
+    let first_prompt = h.recv_until(|v| v["id"] == json!(first_prompt_id)).await;
+    assert_eq!(first_prompt["result"]["stopReason"], "end_turn");
+
+    let second_prompt_id = h
+        .send(
+            "session/prompt",
+            json!({"sessionId":sid,"prompt":[{"type":"text","text":"Change the task."}]}),
+        )
+        .await;
+    let second_prompt = h.recv_until(|v| v["id"] == json!(second_prompt_id)).await;
+    assert!(second_prompt["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("review-only session accepts one prompt"));
+
+    let captured = requests.lock().await;
+    assert_eq!(
+        captured.len(),
+        1,
+        "only the first prompt may call the model"
+    );
+    assert!(captured[0].get("tools").is_none());
+    assert!(captured[0].get("functions").is_none());
+    drop(captured);
+    h.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_only_rejects_hosted_route_profiles_before_any_request() {
+    let (url, requests) = spawn_capturing_fake_llm(vec![openai_text("must not be called")]).await;
+    let route_profile = json!({
+        "version": 1,
+        "data_policy": "allow-hosted",
+        "preference_order": ["openai"],
+        "candidates": [{
+            "id": "openai",
+            "provider": "openai",
+            "model": "fixture-model-r1",
+            "data_location": "hosted"
+        }]
+    });
+    let mut h =
+        Harness::spawn_with_options(&url, Some((url.clone(), route_profile)), None, true).await;
+    let status = tokio::time::timeout(Duration::from_secs(3), h.child.wait())
+        .await
+        .expect("review-only process rejects a hosted candidate promptly")
+        .expect("child exit status");
+    assert!(!status.success());
+    assert!(requests.lock().await.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_only_rejects_non_loopback_default_endpoint_at_startup() {
+    let mut h = Harness::spawn_with_options("https://api.openai.com", None, None, true).await;
+    let status = tokio::time::timeout(Duration::from_secs(3), h.child.wait())
+        .await
+        .expect("review-only process rejects a hosted default endpoint promptly")
+        .expect("child exit status");
+    assert!(!status.success());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn acp_route_profile_env_dispatches_only_to_selected_provider() {
+    let (openai_url, openai_requests) =
+        spawn_capturing_fake_llm(vec![openai_text("wrong provider")]).await;
+    let (deepseek_url, deepseek_requests) =
+        spawn_capturing_fake_llm(vec![openai_text("selected provider")]).await;
+    let route_profile = json!({
+        "version": 1,
+        "data_policy": "allow-hosted",
+        "preference_order": ["deepseek", "openai"],
+        "candidates": [
+            {
+                "id": "openai",
+                "provider": "openai",
+                "model": "gpt-route-model",
+                "data_location": "hosted",
+                "prompt_addendum": "OpenAI-only prompt."
+            },
+            {
+                "id": "deepseek",
+                "provider": "deepseek",
+                "model": "deepseek-chat",
+                "data_location": "hosted",
+                "prompt_addendum": "DeepSeek-only prompt."
+            }
+        ]
+    });
+
+    let mut h = Harness::spawn_routed(&openai_url, &deepseek_url, route_profile).await;
+    let sid = init_session(&mut h).await;
+    let prompt_id = h
+        .send(
+            "session/prompt",
+            json!({
+                "sessionId": sid,
+                "prompt": [{ "type": "text", "text": "route this locally" }],
+            }),
+        )
+        .await;
+    let reply = h
+        .recv_until(|message| message["id"] == json!(prompt_id))
+        .await;
+
+    assert_eq!(reply["result"]["stopReason"], "end_turn");
+    assert_eq!(openai_requests.lock().await.len(), 0);
+    let deepseek_requests = deepseek_requests.lock().await;
+    assert_eq!(deepseek_requests.len(), 1);
+    assert_eq!(deepseek_requests[0]["model"], "deepseek-chat");
+    let system_prompt = deepseek_requests[0]["messages"][0]["content"]
+        .as_str()
+        .expect("system prompt is text");
+    assert!(system_prompt.contains("DeepSeek-only prompt."));
+    assert!(!system_prompt.contains("OpenAI-only prompt."));
+    drop(deepseek_requests);
+    h.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manual_model_override_passes_profile_selection_before_provider_request() {
+    let (url, requests) = spawn_capturing_fake_llm(vec![openai_text("override passed")]).await;
+    let route_profile = json!({
+        "version": 1,
+        "data_policy": "allow-hosted",
+        "preference_order": ["selected", "other"],
+        "candidates": [
+            {
+                "id": "selected",
+                "provider": "openai",
+                "model": "selected-model",
+                "data_location": "hosted",
+                "prompt_addendum": "Selected profile candidate."
+            },
+            {
+                "id": "other",
+                "provider": "openai",
+                "model": "other-model",
+                "data_location": "hosted",
+                "prompt_addendum": "Other profile candidate."
+            }
+        ]
+    });
+    let mut h = Harness::spawn_with_route(&url, Some((url.clone(), route_profile))).await;
+    let sid = init_session(&mut h).await;
+    let set_model_id = h
+        .send(
+            "session/set_model",
+            json!({"sessionId": sid, "modelId": "selected-model"}),
+        )
+        .await;
+    h.recv_until(|message| message["id"] == json!(set_model_id))
+        .await;
+    let prompt_id = h
+        .send(
+            "session/prompt",
+            json!({
+                "sessionId": sid,
+                "prompt": [{ "type": "text", "text": "use the selected profile route" }],
+            }),
+        )
+        .await;
+    let reply = h
+        .recv_until(|message| message["id"] == json!(prompt_id))
+        .await;
+    assert_eq!(reply["result"]["stopReason"], "end_turn");
+    let requests = requests.lock().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["model"], "selected-model");
+    let system_prompt = requests[0]["messages"][0]["content"]
+        .as_str()
+        .expect("system prompt is text");
+    assert!(system_prompt.contains("Selected profile candidate."));
+    assert!(!system_prompt.contains("Other profile candidate."));
+    drop(requests);
+    h.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manual_model_override_rejects_ambiguous_profile_matches() {
+    let (url, requests) = spawn_capturing_fake_llm(vec![openai_text("must not be called")]).await;
+    let route_profile = json!({
+        "version": 1,
+        "candidates": [
+            {
+                "id": "first",
+                "provider": "openai",
+                "model": "shared-model",
+                "data_location": "local"
+            },
+            {
+                "id": "second",
+                "provider": "openai",
+                "model": "shared-model",
+                "data_location": "local"
+            }
+        ]
+    });
+    let mut h = Harness::spawn_with_route(&url, Some((url.clone(), route_profile))).await;
+    let sid = init_session(&mut h).await;
+    let set_model_id = h
+        .send(
+            "session/set_model",
+            json!({"sessionId": sid, "modelId": "shared-model"}),
+        )
+        .await;
+    h.recv_until(|message| message["id"] == json!(set_model_id))
+        .await;
+    let prompt_id = h
+        .send(
+            "session/prompt",
+            json!({
+                "sessionId": sid,
+                "prompt": [{ "type": "text", "text": "reject the ambiguous override" }],
+            }),
+        )
+        .await;
+    let reply = h
+        .recv_until(|message| message["id"] == json!(prompt_id))
+        .await;
+    assert!(reply["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("matches multiple active route profile candidates"));
+    assert!(requests.lock().await.is_empty());
+    h.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manual_model_override_rejects_context_overflow_before_provider_request() {
+    let (url, requests) = spawn_capturing_fake_llm(vec![openai_text("must not be called")]).await;
+    let route_profile = json!({
+        "version": 1,
+        "preference_order": ["small-context"],
+        "strict_context_fit": true,
+        "candidates": [{
+            "id": "small-context",
+            "provider": "openai",
+            "model": "small-context-model",
+            "data_location": "local",
+            "context_capacity_tokens": 1
+        }]
+    });
+    let mut h = Harness::spawn_with_route(&url, Some((url.clone(), route_profile))).await;
+    let sid = init_session(&mut h).await;
+    let unlisted_model_id = h
+        .send(
+            "session/set_model",
+            json!({"sessionId": sid, "modelId": "not-in-profile"}),
+        )
+        .await;
+    h.recv_until(|message| message["id"] == json!(unlisted_model_id))
+        .await;
+    let unlisted_prompt_id = h
+        .send(
+            "session/prompt",
+            json!({
+                "sessionId": sid,
+                "prompt": [{ "type": "text", "text": "reject unlisted override" }],
+            }),
+        )
+        .await;
+    let unlisted_reply = h
+        .recv_until(|message| message["id"] == json!(unlisted_prompt_id))
+        .await;
+    assert!(unlisted_reply["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("not listed in the active route profile"));
+    assert!(requests.lock().await.is_empty());
+
+    let set_model_id = h
+        .send(
+            "session/set_model",
+            json!({"sessionId": sid, "modelId": "small-context-model"}),
+        )
+        .await;
+    h.recv_until(|message| message["id"] == json!(set_model_id))
+        .await;
+    let prompt_id = h
+        .send(
+            "session/prompt",
+            json!({
+                "sessionId": sid,
+                "prompt": [{ "type": "text", "text": "this request cannot fit" }],
+            }),
+        )
+        .await;
+    let reply = h
+        .recv_until(|message| message["id"] == json!(prompt_id))
+        .await;
+    assert!(reply["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("no eligible route"));
+    assert!(requests.lock().await.is_empty());
+    h.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manual_model_override_rejects_hosted_candidate_under_local_only_policy() {
+    let (url, requests) = spawn_capturing_fake_llm(vec![openai_text("must not be called")]).await;
+    let route_profile = json!({
+        "version": 1,
+        "data_policy": "local-only",
+        "preference_order": ["hosted"],
+        "candidates": [{
+            "id": "hosted",
+            "provider": "openai",
+            "model": "hosted-model",
+            "data_location": "hosted"
+        }]
+    });
+    let mut h = Harness::spawn_with_route(&url, Some((url.clone(), route_profile))).await;
+    let sid = init_session(&mut h).await;
+    let set_model_id = h
+        .send(
+            "session/set_model",
+            json!({"sessionId": sid, "modelId": "hosted-model"}),
+        )
+        .await;
+    h.recv_until(|message| message["id"] == json!(set_model_id))
+        .await;
+    let prompt_id = h
+        .send(
+            "session/prompt",
+            json!({
+                "sessionId": sid,
+                "prompt": [{ "type": "text", "text": "stay within local-only policy" }],
+            }),
+        )
+        .await;
+    let reply = h
+        .recv_until(|message| message["id"] == json!(prompt_id))
+        .await;
+    assert!(reply["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("no eligible route"));
+    assert!(requests.lock().await.is_empty());
+    h.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_model_override_without_route_profile_remains_supported() {
+    let (url, requests) = spawn_capturing_fake_llm(vec![openai_text("override worked")]).await;
+    let mut h = Harness::spawn(&url).await;
+    let sid = init_session(&mut h).await;
+    let set_model_id = h
+        .send(
+            "session/set_model",
+            json!({"sessionId": sid, "modelId": "legacy-override-model"}),
+        )
+        .await;
+    let set_model = h
+        .recv_until(|message| message["id"] == json!(set_model_id))
+        .await;
+    assert_eq!(set_model["result"]["modelId"], "legacy-override-model");
+
+    let prompt_id = h
+        .send(
+            "session/prompt",
+            json!({
+                "sessionId": sid,
+                "prompt": [{ "type": "text", "text": "use the legacy override" }],
+            }),
+        )
+        .await;
+    let reply = h
+        .recv_until(|message| message["id"] == json!(prompt_id))
+        .await;
+    assert_eq!(reply["result"]["stopReason"], "end_turn");
+    let requests = requests.lock().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["model"], "legacy-override-model");
+    drop(requests);
+    h.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_only_route_abstention_keeps_prompt_capacity_retryable() {
+    let (url, requests) = spawn_capturing_fake_llm(vec![openai_text("retry succeeded")]).await;
+    let route_profile = json!({
+        "version": 1,
+        "data_policy": "local-only",
+        "strict_context_fit": true,
+        "preference_order": ["local"],
+        "candidates": [{
+            "id": "local",
+            "provider": "openai",
+            "model": "fake-model",
+            "data_location": "local",
+            "context_capacity_tokens": 70_000
+        }]
+    });
+    let mut h =
+        Harness::spawn_with_options(&url, Some((url.clone(), route_profile)), None, true).await;
+    let sid = init_session(&mut h).await;
+
+    let rejected_id = h
+        .send(
+            "session/prompt",
+            json!({
+                "sessionId": sid,
+                "prompt": [{ "type": "text", "text": "x".repeat(8_000) }],
+            }),
+        )
+        .await;
+    let rejected = h
+        .recv_until(|message| message["id"] == json!(rejected_id))
+        .await;
+    assert!(rejected["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("no eligible route"));
+    assert!(requests.lock().await.is_empty());
+
+    let retry_id = h
+        .send(
+            "session/prompt",
+            json!({
+                "sessionId": sid,
+                "prompt": [{ "type": "text", "text": "retry after the abstention" }],
+            }),
+        )
+        .await;
+    let retry = h
+        .recv_until(|message| message["id"] == json!(retry_id))
+        .await;
+    assert_eq!(retry["result"]["stopReason"], "end_turn");
+    assert_eq!(requests.lock().await.len(), 1);
+    h.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn route_preflight_set_model_change_rejects_stale_attempt() {
+    let (url, requests) =
+        spawn_capturing_fake_llm(vec![openai_text("current model succeeded")]).await;
+    let barrier = tempfile::tempdir().expect("barrier directory");
+    let route_profile = json!({
+        "version": 1,
+        "data_policy": "local-only",
+        "preference_order": ["first", "second"],
+        "candidates": [
+            {
+                "id": "first",
+                "provider": "openai",
+                "model": "first-model",
+                "data_location": "local"
+            },
+            {
+                "id": "second",
+                "provider": "openai",
+                "model": "second-model",
+                "data_location": "local"
+            }
+        ]
+    });
+    let mut h = Harness::spawn_with_options_and_barrier(
+        &url,
+        Some((url.clone(), route_profile)),
+        None,
+        false,
+        Some(barrier.path()),
+    )
+    .await;
+    let sid = init_session(&mut h).await;
+
+    let stale_prompt_id = h
+        .send(
+            "session/prompt",
+            json!({
+                "sessionId": sid,
+                "prompt": [{ "type": "text", "text": "preflight before model change" }],
+            }),
+        )
+        .await;
+    wait_for_route_preflight_snapshot(barrier.path(), stale_prompt_id).await;
+
+    let set_model_id = h
+        .send(
+            "session/set_model",
+            json!({ "sessionId": sid, "modelId": "second-model" }),
+        )
+        .await;
+    let set_model = h
+        .recv_until(|message| message["id"] == json!(set_model_id))
+        .await;
+    assert_eq!(set_model["result"]["modelId"], "second-model");
+    release_route_preflight_snapshot(barrier.path(), stale_prompt_id);
+
+    let stale_reply = h
+        .recv_until(|message| message["id"] == json!(stale_prompt_id))
+        .await;
+    assert!(stale_reply["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("session changed during route preflight; retry prompt"));
+    assert!(
+        requests.lock().await.is_empty(),
+        "stale preflight must not call provider"
+    );
+
+    let retry_id = h
+        .send(
+            "session/prompt",
+            json!({
+                "sessionId": sid,
+                "prompt": [{ "type": "text", "text": "retry against current model" }],
+            }),
+        )
+        .await;
+    wait_for_route_preflight_snapshot(barrier.path(), retry_id).await;
+    release_route_preflight_snapshot(barrier.path(), retry_id);
+    let retry = h
+        .recv_until(|message| message["id"] == json!(retry_id))
+        .await;
+    assert_eq!(retry["result"]["stopReason"], "end_turn");
+    let captured = requests.lock().await;
+    assert_eq!(captured.len(), 1);
+    assert_eq!(captured[0]["model"], "second-model");
+    drop(captured);
+    h.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn route_preflight_cancel_invalidates_snapshot_and_keeps_review_capacity() {
+    let (url, requests) = spawn_capturing_fake_llm(vec![openai_text("retry succeeded")]).await;
+    let barrier = tempfile::tempdir().expect("barrier directory");
+    let route_profile = json!({
+        "version": 1,
+        "data_policy": "local-only",
+        "preference_order": ["local"],
+        "candidates": [{
+            "id": "local",
+            "provider": "openai",
+            "model": "fake-model",
+            "data_location": "local"
+        }]
+    });
+    let mut h = Harness::spawn_with_options_and_barrier(
+        &url,
+        Some((url.clone(), route_profile)),
+        None,
+        true,
+        Some(barrier.path()),
+    )
+    .await;
+    let sid = init_session(&mut h).await;
+
+    let cancelled_prompt_id = h
+        .send(
+            "session/prompt",
+            json!({
+                "sessionId": sid,
+                "prompt": [{ "type": "text", "text": "cancel during route preflight" }],
+            }),
+        )
+        .await;
+    wait_for_route_preflight_snapshot(barrier.path(), cancelled_prompt_id).await;
+
+    let cancel_id = h.send("session/cancel", json!({ "sessionId": sid })).await;
+    let cancel_ack = h
+        .recv_until(|message| message["id"] == json!(cancel_id))
+        .await;
+    assert_eq!(cancel_ack.get("result"), Some(&Value::Null));
+    release_route_preflight_snapshot(barrier.path(), cancelled_prompt_id);
+
+    let cancelled = h
+        .recv_until(|message| message["id"] == json!(cancelled_prompt_id))
+        .await;
+    assert!(cancelled["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("session changed during route preflight; retry prompt"));
+    assert!(requests.lock().await.is_empty());
+
+    let retry_id = h
+        .send(
+            "session/prompt",
+            json!({
+                "sessionId": sid,
+                "prompt": [{ "type": "text", "text": "retry after preflight cancel" }],
+            }),
+        )
+        .await;
+    wait_for_route_preflight_snapshot(barrier.path(), retry_id).await;
+    release_route_preflight_snapshot(barrier.path(), retry_id);
+    let retry = h
+        .recv_until(|message| message["id"] == json!(retry_id))
+        .await;
+    assert_eq!(retry["result"]["stopReason"], "end_turn");
+    assert_eq!(requests.lock().await.len(), 1);
+    h.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_preflight_snapshots_reserve_review_only_capacity_once() {
+    use tokio::sync::oneshot;
+
+    let (gate_tx, gate_rx) = oneshot::channel::<()>();
+    let gate = Arc::new(Mutex::new(Some(gate_rx)));
+    let captures = Arc::new(Mutex::new(Vec::new()));
+    let (url, _) = spawn_gated_capturing_fake_llm(
+        vec![CannedResponse {
+            status: 200,
+            body: openai_text("one prompt admitted"),
+        }],
+        captures.clone(),
+        gate,
+    )
+    .await;
+    let barrier = tempfile::tempdir().expect("barrier directory");
+    let route_profile = json!({
+        "version": 1,
+        "data_policy": "local-only",
+        "preference_order": ["local"],
+        "candidates": [{
+            "id": "local",
+            "provider": "openai",
+            "model": "fake-model",
+            "data_location": "local"
+        }]
+    });
+    let mut h = Harness::spawn_with_options_and_barrier(
+        &url,
+        Some((url.clone(), route_profile)),
+        None,
+        true,
+        Some(barrier.path()),
+    )
+    .await;
+    let sid = init_session(&mut h).await;
+    let first_id = h
+        .send(
+            "session/prompt",
+            json!({
+                "sessionId": sid,
+                "prompt": [{ "type": "text", "text": "first candidate" }],
+            }),
+        )
+        .await;
+    wait_for_route_preflight_snapshot(barrier.path(), first_id).await;
+    let second_id = h
+        .send(
+            "session/prompt",
+            json!({
+                "sessionId": sid,
+                "prompt": [{ "type": "text", "text": "second candidate" }],
+            }),
+        )
+        .await;
+    wait_for_route_preflight_snapshot(barrier.path(), second_id).await;
+
+    // Both requests have captured the same idle, unused session revision.
+    // Releasing both proves only one can win the atomic admission step.
+    release_route_preflight_snapshot(barrier.path(), first_id);
+    release_route_preflight_snapshot(barrier.path(), second_id);
+    let losing_reply = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let message = h.recv().await;
+            if (message["id"] == json!(first_id) || message["id"] == json!(second_id))
+                && message.get("error").is_some()
+            {
+                break message;
+            }
+        }
+    })
+    .await
+    .expect("one preflight loses atomic session admission");
+    assert!(losing_reply["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("prompt already in flight"));
+    let winner_id = if losing_reply["id"] == json!(first_id) {
+        second_id
+    } else {
+        first_id
+    };
+    wait_for_captured_request_count(&captures, 1).await;
+    assert_eq!(captures.lock().await.len(), 1);
+    gate_tx.send(()).expect("release admitted fake response");
+    let winner_reply = h
+        .recv_until(|message| message["id"] == json!(winner_id))
+        .await;
+    assert_eq!(winner_reply["result"]["stopReason"], "end_turn");
+
+    let third_id = h
+        .send(
+            "session/prompt",
+            json!({
+                "sessionId": sid,
+                "prompt": [{ "type": "text", "text": "review-only reuse must fail" }],
+            }),
+        )
+        .await;
+    let third_reply = h
+        .recv_until(|message| message["id"] == json!(third_id))
+        .await;
+    assert!(third_reply["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("review-only session accepts one prompt"));
+    assert_eq!(captures.lock().await.len(), 1);
+    h.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn acp_task_fit_gate_uses_only_current_identity_route_attestations() {
+    let (openai_url, openai_requests) =
+        spawn_capturing_fake_llm(vec![openai_text("qualified model")]).await;
+    let (deepseek_url, deepseek_requests) =
+        spawn_capturing_fake_llm(vec![openai_text("unreviewed model")]).await;
+    let reviewer = Keys::generate();
+    let route_profile = RouteProfileDocument {
+        version: 1,
+        data_policy: RouteProfileDataPolicy::AllowHosted,
+        preference_order: vec!["deepseek".into(), "openai".into()],
+        strict_context_fit: false,
+        max_turn_cost_microusd: None,
+        prefer_fastest_measured: false,
+        min_effective_output_tokens_per_second_milli: None,
+        allow_preference_order_warmup: false,
+        task_fit_policy: Some(TaskFitEligibilityPolicy {
+            task_class: "coding".into(),
+            task_class_taxonomy_version: "operator-defined-v1".into(),
+            evaluation_policy_version: "task-fit-outcomes-v1".into(),
+            minimum_distinct_tasks: 1,
+            minimum_wilson_lower_bound_95: 0.2,
+            maximum_age_seconds: 31_536_000,
+            require_observed_model_identity: true,
+        }),
+        candidates: vec![
+            RouteProfileCandidate {
+                id: "deepseek".into(),
+                provider: "deepseek".into(),
+                model: "deepseek-chat".into(),
+                data_location: RouteProfileLocation::Hosted,
+                context_capacity_tokens: None,
+                input_cost_microusd_per_million_tokens: None,
+                output_cost_microusd_per_million_tokens: None,
+                prompt_addendum: "DeepSeek candidate.".into(),
+                prompt_profile: None,
+            },
+            RouteProfileCandidate {
+                id: "openai".into(),
+                provider: "openai".into(),
+                model: "fixture-model-r1".into(),
+                data_location: RouteProfileLocation::Hosted,
+                context_capacity_tokens: None,
+                input_cost_microusd_per_million_tokens: None,
+                output_cost_microusd_per_million_tokens: None,
+                prompt_addendum: "Reviewed OpenAI candidate.".into(),
+                prompt_profile: None,
+            },
+        ],
+        profile_id: Some("coding-route".into()),
+        profile_version: Some(2),
+        profile_hash: Some("7".repeat(64)),
+    };
+    route_profile.validate().expect("valid task-fit profile");
+    let serialized_profile = serde_json::to_string(&route_profile).expect("route profile JSON");
+    let profile_hash = hex::encode(Sha256::digest(serialized_profile.as_bytes()));
+
+    let nest_dir = tempfile::tempdir().expect("temporary Buzz nest");
+    let report_bytes = include_bytes!("../testdata/harbor-task-fit-v2.json");
+    let report = validate_task_fit_report(report_bytes).expect("fixture report validates");
+    let report_hash = report.report_sha256().to_owned();
+    let report_dir = nest_dir.path().join(".agents/task-fit-evidence");
+    let route_attestation_dir = report_dir.join("attestations/routes").join(&report_hash);
+    fs::create_dir_all(&route_attestation_dir).expect("create local evidence store");
+    fs::write(report_dir.join(format!("{report_hash}.json")), report_bytes)
+        .expect("write imported report");
+    let binding = TaskFitEvidenceBinding {
+        report_sha256: report_hash.clone(),
+        profile_id: "coding-route".into(),
+        profile_version: 2,
+        profile_hash: profile_hash.clone(),
+        candidate_id: "openai".into(),
+    };
+    let payload = TaskFitRouteAttestationPayload {
+        schema_version: 1,
+        report_sha256: report_hash.clone(),
+        action: "reviewed_for_local_route_candidate".into(),
+        task_class: report.task_class().into(),
+        task_class_taxonomy_version: report.task_class_taxonomy_version().into(),
+        binding,
+    };
+    let event = EventBuilder::new(
+        Kind::Custom(30078),
+        serde_json::to_string(&payload).expect("attestation payload"),
+    )
+    .sign_with_keys(&reviewer)
+    .expect("sign local route review");
+    let reviewer_public_key = reviewer.public_key().to_hex();
+    fs::write(
+        route_attestation_dir.join(format!(
+            "coding-route-v2-{}-openai-{reviewer_public_key}.json",
+            profile_hash
+        )),
+        serde_json::to_vec(&event).expect("attestation event JSON"),
+    )
+    .expect("write signed route review");
+
+    let mut h = Harness::spawn_routed_with_task_fit(
+        &openai_url,
+        &deepseek_url,
+        serde_json::from_str(&serialized_profile).expect("route profile value"),
+        TaskFitEnv {
+            nest_dir: nest_dir.path().to_path_buf(),
+            reviewer_public_key,
+            profile_id: "coding-route".into(),
+            profile_version: 2,
+            profile_hash,
+        },
+    )
+    .await;
+    let sid = init_session(&mut h).await;
+    let missing_class_id = h
+        .send(
+            "session/prompt",
+            json!({
+                "sessionId": sid,
+                "prompt": [{ "type": "text", "text": "missing explicit task class" }],
+            }),
+        )
+        .await;
+    let missing_class = h
+        .recv_until(|message| message["id"] == json!(missing_class_id))
+        .await;
+    assert!(missing_class["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("strict_task_fit_task_class_unknown"));
+    assert!(openai_requests.lock().await.is_empty());
+    assert!(deepseek_requests.lock().await.is_empty());
+
+    let mismatched_class_id = h
+        .send(
+            "session/prompt",
+            json!({
+                "sessionId": sid,
+                "prompt": [{ "type": "text", "text": "wrong explicit task class" }],
+                "_meta": { "buzz": { "taskClass": {
+                    "version": 1,
+                    "taskClass": "code_review",
+                    "taxonomyVersion": "operator-defined-v1",
+                    "source": "desktop_ui"
+                } } },
+            }),
+        )
+        .await;
+    let mismatched_class = h
+        .recv_until(|message| message["id"] == json!(mismatched_class_id))
+        .await;
+    assert!(mismatched_class["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("strict_task_fit_task_class_mismatch"));
+    assert!(openai_requests.lock().await.is_empty());
+    assert!(deepseek_requests.lock().await.is_empty());
+
+    let prompt_id = h
+        .send(
+            "session/prompt",
+            json!({
+                "sessionId": sid,
+                "prompt": [{ "type": "text", "text": "route this coding task" }],
+                "_meta": { "buzz": { "taskClass": {
+                    "version": 1,
+                    "taskClass": "coding",
+                    "taxonomyVersion": "operator-defined-v1",
+                    "source": "desktop_ui"
+                } } },
+            }),
+        )
+        .await;
+    let reply = h
+        .recv_until(|message| message["id"] == json!(prompt_id))
+        .await;
+
+    assert_eq!(reply["result"]["stopReason"], "end_turn");
+    assert_eq!(deepseek_requests.lock().await.len(), 0);
+    let openai_requests = openai_requests.lock().await;
+    assert_eq!(openai_requests.len(), 1);
+    assert_eq!(openai_requests[0]["model"], "fixture-model-r1");
+    assert!(openai_requests[0]["messages"][0]["content"]
+        .as_str()
+        .expect("system prompt is text")
+        .contains("Reviewed OpenAI candidate."));
+    drop(openai_requests);
     h.shutdown().await;
 }
 
@@ -1387,7 +2475,8 @@ async fn cancelled_turn_with_usage_emits_notification_before_response() {
                 let body_s = serde_json::to_string(&body).unwrap();
                 let resp = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body_s.len(), body_s,
+                    body_s.len(),
+                    body_s,
                 );
                 let _ = sock.write_all(resp.as_bytes()).await;
                 let _ = sock.shutdown().await;
@@ -1605,7 +2694,9 @@ async fn session_total_poisoned_by_missing_total_and_stays_poisoned() {
         .expect("usage_update for turn 3");
     assert!(
         usage3["params"]["update"]["accumulatedTotalTokens"].is_null()
-            || usage3["params"]["update"].get("accumulatedTotalTokens").is_none(),
+            || usage3["params"]["update"]
+                .get("accumulatedTotalTokens")
+                .is_none(),
         "session is poisoned; accumulatedTotalTokens must remain absent even after a total-bearing turn; got: {usage3:#?}"
     );
 
@@ -1693,4 +2784,49 @@ async fn new_session_resets_total_accumulation() {
     );
 
     h.shutdown().await;
+}
+
+#[tokio::test]
+async fn synthetic_probe_subcommand_sends_one_fixed_bounded_request_and_redacts_receipt() {
+    let (url, requests) = spawn_capturing_fake_llm(vec![openai_text("BUZZ_PROBE_OK")]).await;
+    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_buzz-agent"))
+        .arg("synthetic-probe")
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("BUZZ_AGENT_PROVIDER", "openai")
+        .env("BUZZ_AGENT_MODEL", "probe-only-model")
+        .env("OPENAI_COMPAT_API_KEY", "PROBE_SECRET_SHOULD_NOT_ECHO")
+        .env("OPENAI_COMPAT_BASE_URL", &url)
+        .env("OPENAI_COMPAT_API", "chat")
+        .env("BUZZ_AGENT_PROBE_LOCAL", "1")
+        .output()
+        .await
+        .expect("run synthetic probe");
+
+    assert!(
+        output.status.success(),
+        "probe subprocess should return a JSON receipt: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let receipt: Value = serde_json::from_slice(&output.stdout).expect("JSON receipt");
+    assert_eq!(receipt["status"], "responded");
+    assert_eq!(receipt["provider"], "openai");
+    assert_eq!(receipt["requestedModel"], "probe-only-model");
+    assert_eq!(receipt["responseMarkerMatched"], true);
+    assert!(
+        receipt.get("text").is_none(),
+        "model output is not retained"
+    );
+    let output_text = String::from_utf8_lossy(&output.stdout);
+    assert!(!output_text.contains("PROBE_SECRET_SHOULD_NOT_ECHO"));
+
+    let requests = requests.lock().await;
+    assert_eq!(requests.len(), 1, "one candidate produces one request");
+    assert_eq!(requests[0]["model"], "probe-only-model");
+    assert_eq!(requests[0]["max_completion_tokens"], 256);
+    assert!(requests[0]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|message| { message["content"] == "Reply exactly with BUZZ_PROBE_OK." }));
 }

@@ -160,14 +160,14 @@ globalThis.__TAURI_INTERNALS__ = {
 dom.window.__TAURI_INTERNALS__ = globalThis.__TAURI_INTERNALS__;
 
 // ── Deferred imports ──────────────────────────────────────────────────────────
-let act, render, screen, cleanup, fireEvent, createElement;
+let act, render, screen, cleanup, fireEvent, waitFor, createElement;
 let AgentDefaultsEditor;
 let DefaultConfigStep;
 let QueryClient, QueryClientProvider;
 let acpRuntimesQueryKey, fromRawAcpRuntimeCatalogEntry;
 
 before(async () => {
-  ({ act, render, screen, cleanup, fireEvent } = await import(
+  ({ act, render, screen, cleanup, fireEvent, waitFor } = await import(
     "@testing-library/react"
   ));
   ({ createElement } = await import("react"));
@@ -232,6 +232,24 @@ function rawGooseCatalogEntry() {
   };
 }
 
+function rawBuzzAgentCatalogEntry() {
+  return {
+    ...rawGooseCatalogEntry(),
+    id: "buzz-agent",
+    label: "Buzz Agent",
+    command: "buzz-agent",
+    model_env_var: "BUZZ_AGENT_MODEL",
+    provider_env_var: "BUZZ_AGENT_PROVIDER",
+    thinking_env_var: "BUZZ_AGENT_THINKING_EFFORT",
+    max_tokens_env_var: "BUZZ_AGENT_MAX_OUTPUT_TOKENS",
+    context_limit_env_var: "BUZZ_AGENT_MAX_CONTEXT_TOKENS",
+    max_rounds_env_var: "BUZZ_AGENT_MAX_ROUNDS",
+    summary_model_env_var: "BUZZ_AGENT_SUMMARY_MODEL",
+    summary_max_tokens_env_var: "BUZZ_AGENT_SUMMARY_MAX_OUTPUT_TOKENS",
+    effort_canonical_values: null,
+  };
+}
+
 function makeQueryClient() {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
@@ -267,11 +285,14 @@ async function settle() {
  */
 async function selectEffortOption(testId, value) {
   const trigger = screen.getByTestId(testId);
+  await waitFor(() => {
+    assert.equal(trigger.disabled, false, `${testId} should finish loading`);
+  });
   await act(async () => {
     fireEvent.click(trigger);
   });
   await settle();
-  const option = screen.getByTestId(`${testId}-option-${value}`);
+  const option = await screen.findByTestId(`${testId}-option-${value}`);
   await act(async () => {
     fireEvent.click(option);
   });
@@ -485,6 +506,91 @@ test("AgentDefaultsEditor: effort write→save→reread contract through the rea
   assert.ok(
     triggerRemount.textContent?.includes("Off"),
     `trigger must show "Off" after fresh remount; got: "${triggerRemount.textContent}"`,
+  );
+});
+
+test("AgentDefaultsEditor exposes and saves the configured status-summary model", async () => {
+  const initialConfig = {
+    env_vars: {
+      ANTHROPIC_API_KEY: "sk-test",
+      BUZZ_AGENT_SUMMARY_MODEL: "summary-model-a",
+      BUZZ_AGENT_SUMMARY_MAX_OUTPUT_TOKENS: "1200",
+    },
+    provider: "anthropic",
+    model: "main-model",
+    preferred_runtime: "buzz-agent",
+  };
+
+  globalThis.__TAURI_INTERNALS__.invoke = makeIpcHandler({
+    get_global_agent_config: () => Promise.resolve(initialConfig),
+    discover_acp_providers: () => Promise.resolve([rawBuzzAgentCatalogEntry()]),
+    discover_agent_models: () =>
+      Promise.resolve({
+        agentName: "buzz-agent",
+        agentVersion: "test",
+        models: [
+          { id: "main-model", name: "Main", description: null },
+          { id: "summary-model-a", name: "Summary A", description: null },
+          { id: "summary-model-b", name: "Summary B", description: null },
+        ],
+        agentDefaultModel: "main-model",
+        selectedModel: "main-model",
+        supportsSwitching: true,
+      }),
+  });
+  dom.window.__TAURI_INTERNALS__ = globalThis.__TAURI_INTERNALS__;
+
+  const queryClient = makeQueryClient();
+  queryClient.setQueryData(acpRuntimesQueryKey, [
+    fromRawAcpRuntimeCatalogEntry(rawBuzzAgentCatalogEntry()),
+  ]);
+
+  render(
+    withQueryClient(
+      queryClient,
+      createElement(AgentDefaultsEditor, { layout: "grouped" }),
+    ),
+  );
+  await settle();
+
+  await act(async () => {
+    fireEvent.click(screen.getByTestId("global-agent-advanced-toggle"));
+  });
+  await settle();
+
+  const summaryModel = screen.getByRole("combobox", {
+    name: "Status summary model",
+  });
+  assert.equal(summaryModel.getAttribute("data-value"), "summary-model-a");
+  assert.equal(
+    screen
+      .queryAllByTestId("env-vars-key")
+      .some((input) => input.value === "BUZZ_AGENT_SUMMARY_MODEL"),
+    false,
+    "catalog-backed control owns the key so it is not editable twice",
+  );
+
+  const budget = screen.getByTestId("numeric-summary-max-output-tokens-input");
+  assert.equal(budget.getAttribute("max"), "4096");
+  await act(async () => {
+    fireEvent.change(budget, { target: { value: "1800" } });
+  });
+  await selectEffortOption("global-agent-summary-model", "summary-model-b");
+
+  assert.equal(saveCallCount, 0, "changes remain Save-gated");
+  await act(async () => {
+    fireEvent.click(screen.getByRole("button", { name: /Save defaults/i }));
+  });
+  await settle();
+
+  assert.equal(saveCallCount, 1);
+  assert.equal(
+    capturedSavePayload.env_vars.BUZZ_AGENT_SUMMARY_MODEL,
+    "summary-model-b",
+  );
+  assert.equal(
+    capturedSavePayload.env_vars.BUZZ_AGENT_SUMMARY_MAX_OUTPUT_TOKENS,
+    "1800",
   );
 });
 

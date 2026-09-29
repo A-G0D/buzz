@@ -86,6 +86,8 @@ pub(super) fn preset_catalog_entry(
         max_tokens_env_var: None,
         context_limit_env_var: None,
         max_rounds_env_var: None,
+        summary_model_env_var: None,
+        summary_max_tokens_env_var: None,
         install_hint,
         install_instructions_url: install_instructions_url.to_string(),
         can_auto_install: false,

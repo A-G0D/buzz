@@ -288,6 +288,179 @@ pub async fn get_thread_replies(
     })
 }
 
+/// Fetch a source-backed thread brief using the same deterministic projection
+/// as `buzz messages brief`. The channel is required so the relay read remains
+/// scoped to the exact accessible Buzz conversation.
+#[tauri::command]
+pub async fn get_thread_brief(
+    root_event_id: String,
+    channel_id: String,
+    limit: Option<u32>,
+    depth_limit: Option<u32>,
+    cursor: Option<crate::models::ThreadCursor>,
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    uuid::Uuid::parse_str(&channel_id).map_err(|_| "invalid channel id".to_string())?;
+    let root_id = EventId::from_hex(&root_event_id)
+        .map_err(|error| format!("invalid root event ID: {error}"))?;
+    let root_hex = root_id.to_hex();
+    let cap = limit.unwrap_or(100).clamp(1, 500);
+    let applied_depth_limit = depth_limit.unwrap_or(64);
+    if applied_depth_limit > i32::MAX as u32 {
+        return Err(format!("depth_limit must not exceed {}", i32::MAX));
+    }
+
+    let root_filter = serde_json::json!({
+        "ids": [root_hex],
+        "#h": [channel_id],
+        "kinds": buzz_core_pkg::thread_brief::THREAD_BRIEF_KINDS,
+        "limit": 1,
+    });
+    let reply_filter = build_thread_brief_replies_filter(
+        &root_hex,
+        &channel_id,
+        applied_depth_limit,
+        cap,
+        cursor.as_ref(),
+    );
+    let mut filters = vec![root_filter, serde_json::Value::Object(reply_filter)];
+    if let Some(cursor) = &cursor {
+        if cursor.created_at < 0 {
+            return Err("thread cursor timestamp must be nonnegative".to_string());
+        }
+        let cursor_id = EventId::from_hex(&cursor.event_id)
+            .map_err(|error| format!("invalid thread cursor event ID: {error}"))?;
+        filters.push(serde_json::json!({
+            "ids": [cursor_id.to_hex()],
+            "#h": [channel_id],
+            "kinds": buzz_core_pkg::thread_brief::THREAD_BRIEF_CURSOR_KINDS,
+            "limit": 1,
+        }));
+    }
+
+    let events = query_relay(&state, &filters).await?;
+    let root = events
+        .iter()
+        .find(|event| event.id == root_id)
+        .ok_or_else(|| format!("thread root {root_hex} not found in channel {channel_id}"))?;
+    if !event_has_channel(root, &channel_id) || root_thread_id(root) != root_hex {
+        return Err("selected event is not the canonical root for this channel".to_string());
+    }
+    if let Some(cursor) = &cursor {
+        let cursor_id = EventId::from_hex(&cursor.event_id)
+            .map_err(|error| format!("invalid thread cursor event ID: {error}"))?;
+        let cursor_event = events
+            .iter()
+            .find(|event| event.id == cursor_id)
+            .ok_or_else(|| "thread cursor event was not found in this channel".to_string())?;
+        if !event_has_channel(cursor_event, &channel_id)
+            || root_thread_id(cursor_event) != root_hex
+            || i64::try_from(cursor_event.created_at.as_secs()).ok() != Some(cursor.created_at)
+        {
+            return Err("thread cursor does not belong to the selected thread".to_string());
+        }
+    }
+
+    let event_values = events
+        .iter()
+        .map(serde_json::to_value)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("failed to serialize thread events: {error}"))?;
+    let mut brief =
+        buzz_core_pkg::thread_brief::make_thread_brief(&root_hex, &event_values, cap, depth_limit)?;
+    let source_event_ids = brief["source_event_ids"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let owner_pubkey = state
+        .keys
+        .lock()
+        .map_err(|error| format!("lock workspace identity: {error}"))?
+        .public_key()
+        .to_hex();
+    let relay_url = crate::relay::relay_ws_url_with_override(&state);
+    let nest_dir = crate::managed_agents::nest_dir().ok_or("cannot resolve Buzz workspace")?;
+    let journal = buzz_run_journal::RunJournal::open_scoped(nest_dir, &relay_url, &owner_pubkey)?;
+    let history = journal.thread_attempt_history(&channel_id, &root_hex, &source_event_ids)?;
+    let coordinator_run_history =
+        journal.thread_coordinator_runs(&channel_id, &root_hex, &source_event_ids)?;
+    let managed_turns = serde_json::to_value(history.managed_turns)
+        .map_err(|error| format!("serialize managed turn history: {error}"))?;
+    let coordinator_runs = serde_json::to_value(coordinator_run_history.runs)
+        .map_err(|error| format!("serialize coordinator run history: {error}"))?;
+    buzz_core_pkg::thread_brief::add_managed_turn_history(
+        &mut brief,
+        managed_turns,
+        history.has_more_turns,
+        history.capture_gap_count,
+    );
+    buzz_core_pkg::thread_brief::add_coordinator_run_history(
+        &mut brief,
+        coordinator_runs,
+        coordinator_run_history.has_more_runs,
+        coordinator_run_history.capture_gap_count,
+    );
+    let observed_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis().min(u64::MAX as u128) as u64)
+        .unwrap_or_default();
+    buzz_core_pkg::thread_brief::add_observed_at(&mut brief, observed_at_ms);
+    Ok(brief)
+}
+
+fn build_thread_brief_replies_filter(
+    root_event_id: &str,
+    channel_id: &str,
+    depth_limit: u32,
+    cap: u32,
+    cursor: Option<&crate::models::ThreadCursor>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut filter = serde_json::Map::new();
+    filter.insert("#e".to_string(), serde_json::json!([root_event_id]));
+    filter.insert("#h".to_string(), serde_json::json!([channel_id]));
+    filter.insert(
+        "kinds".to_string(),
+        serde_json::json!(buzz_core_pkg::thread_brief::THREAD_BRIEF_KINDS),
+    );
+    filter.insert("depth_limit".to_string(), serde_json::json!(depth_limit));
+    filter.insert("limit".to_string(), serde_json::json!(cap));
+    filter.insert("include_aux".to_string(), serde_json::json!(true));
+    if let Some(cursor) = cursor {
+        filter.insert(
+            "thread_cursor".to_string(),
+            serde_json::json!(cursor.created_at),
+        );
+        filter.insert(
+            "thread_cursor_id".to_string(),
+            serde_json::json!(cursor.event_id),
+        );
+    }
+    filter
+}
+
+pub(super) fn event_has_channel(event: &Event, channel_id: &str) -> bool {
+    event.tags.iter().any(|tag| {
+        let parts = tag.as_slice();
+        parts.first().map(String::as_str) == Some("h")
+            && parts.get(1).map(String::as_str) == Some(channel_id)
+    })
+}
+
+pub(super) fn root_thread_id(event: &Event) -> String {
+    let tags = event
+        .tags
+        .iter()
+        .map(|tag| tag.as_slice().to_vec())
+        .collect::<Vec<_>>();
+    buzz_core_pkg::nip10::parse_thread_markers_from_parts(tags.iter().map(Vec::as_slice))
+        .resolve()
+        .map(|(root, _)| root)
+        .unwrap_or_else(|| event.id.to_hex())
+}
+
 /// Build the relay `/query` filter for a thread-subtree read.
 /// `kinds` is required to prove the filter cannot match p-gated events; without
 /// it, relay authorization rejects this otherwise kindless query.
@@ -418,6 +591,7 @@ pub async fn send_channel_message(
     sent_from_thread_tag: Option<Vec<String>>,
     mention_pubkeys: Option<Vec<String>>,
     kind: Option<u32>,
+    task_class: Option<String>,
     expected_relay_url: Option<String>,
     expected_signer_pubkey: Option<String>,
     state: State<'_, AppState>,
@@ -448,6 +622,9 @@ pub async fn send_channel_message(
         &signing_keys.public_key().to_hex(),
     )?;
     let kind_num = kind.unwrap_or(buzz_core_pkg::kind::KIND_STREAM_MESSAGE);
+    if task_class.is_some() && kind_num != buzz_core_pkg::kind::KIND_STREAM_MESSAGE {
+        return Err("task-class metadata is supported only on stream messages".into());
+    }
     if sent_from_thread_tag.is_some() && kind_num != buzz_core_pkg::kind::KIND_STREAM_MESSAGE {
         return Err("sent-from-thread provenance requires a stream message".into());
     }
@@ -503,18 +680,34 @@ pub async fn send_channel_message(
                 }
                 None => None,
             };
-            events::build_message(
-                channel_uuid,
-                content.trim(),
-                thread_ref.as_ref(),
-                &mention_refs,
-                &media,
-                &emoji,
-                &mention_refs_only,
-                &link_previews,
-                sent_from_thread_tag.as_deref(),
-                &relay_base,
-            )?
+            if let Some(task_class) = task_class.as_deref() {
+                events::build_message_with_task_class(
+                    channel_uuid,
+                    content.trim(),
+                    thread_ref.as_ref(),
+                    &mention_refs,
+                    &media,
+                    &emoji,
+                    &mention_refs_only,
+                    &link_previews,
+                    sent_from_thread_tag.as_deref(),
+                    &relay_base,
+                    task_class,
+                )?
+            } else {
+                events::build_message(
+                    channel_uuid,
+                    content.trim(),
+                    thread_ref.as_ref(),
+                    &mention_refs,
+                    &media,
+                    &emoji,
+                    &mention_refs_only,
+                    &link_previews,
+                    sent_from_thread_tag.as_deref(),
+                    &relay_base,
+                )?
+            }
         }
     };
 

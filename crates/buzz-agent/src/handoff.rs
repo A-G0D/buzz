@@ -4,6 +4,7 @@ use crate::config::{
     HANDOFF_ORIGINAL_TASK_MAX_BYTES, MAX_CONTEXT_RECOVERIES_PER_RUN,
 };
 use crate::llm::summary_completion_cap;
+use crate::route_preview::check_user_text_context_fit;
 use crate::types::HistoryItem;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -175,6 +176,25 @@ impl RunCtx<'_> {
     /// Holds no gate — callers decide whether a handoff is warranted.
     async fn handoff(&mut self, history_budget_bytes: Option<usize>) -> HandoffOutcome {
         let prompt = self.build_handoff_prompt(history_budget_bytes);
+        if let Some(capacity) = self.context_fit_capacity_tokens {
+            // Reserve the actual wire ceiling: OpenRouter adds a separate
+            // reasoning allowance on top of HANDOFF_MAX_OUTPUT_TOKENS.
+            if let Err(error) = check_user_text_context_fit(
+                capacity,
+                &HANDOFF_SYSTEM_PROMPT,
+                &prompt,
+                &[],
+                summary_completion_cap(self.cfg.provider, HANDOFF_MAX_OUTPUT_TOKENS),
+            ) {
+                tracing::warn!(
+                    session_id = self.session_id,
+                    capacity_tokens = capacity,
+                    %error,
+                    "strict context fit stopped handoff summarizer before provider request",
+                );
+                return HandoffOutcome::Skipped;
+            }
+        }
         let tokens_before = self.projected_handoff_input_tokens();
         let summary = tokio::select! {
             biased;
@@ -518,6 +538,146 @@ mod tests {
         summary_completion_cap, token_threshold, HANDOFF_SYSTEM_PROMPT,
     };
     use crate::config::{Provider, HANDOFF_MAX_OUTPUT_TOKENS};
+
+    #[tokio::test]
+    async fn strict_context_fit_blocks_over_capacity_forced_handoff_before_http() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        use std::time::Duration;
+
+        use tokio::io::AsyncWriteExt;
+        use tokio::sync::{mpsc, watch};
+
+        use crate::agent::RunCtx;
+        use crate::config::{Config, HANDOFF_MAX_OUTPUT_TOKENS};
+        use crate::llm::Llm;
+        use crate::mcp::McpRegistry;
+        use crate::permission::PermissionBroker;
+        use crate::route_preview::check_user_text_context_fit;
+        use crate::types::{
+            CacheTotalState, HistoryItem, SessionUsageBaseline, TurnIOState, TurnTotalState,
+        };
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let observed_requests = Arc::clone(&request_count);
+        let mock_server = tokio::spawn(async move {
+            if let Ok(Ok((mut stream, _))) =
+                tokio::time::timeout(Duration::from_millis(150), listener.accept()).await
+            {
+                observed_requests.fetch_add(1, Ordering::SeqCst);
+                stream
+                    .write_all(
+                        b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let mut cfg = Config::for_discovery(
+            Provider::OpenAi,
+            "local-test-key".into(),
+            format!("http://{address}/v1"),
+            None,
+        );
+        cfg.model = "local-mock-model".into();
+        cfg.max_handoffs = 5;
+        cfg.llm_timeout = Duration::from_secs(1);
+        let llm = Llm::new_for_route(&cfg, true).unwrap();
+        let mcp = Arc::new(McpRegistry::spawn_all(&cfg, &[], "/tmp").await.unwrap());
+        let permissions = Arc::new(PermissionBroker::new(1, Duration::from_secs(1)));
+        let (wire, _wire_rx) = mpsc::channel(1);
+        let (_cancel_tx, mut cancel) = watch::channel(false);
+        let (_steer_tx, mut steer) = mpsc::unbounded_channel();
+        let mut history = vec![HistoryItem::User("existing session history".into())];
+        let mut original_task = Some("Keep this task's important progress".into());
+        let mut handoff_count = 0;
+        let mut last_request_input_tokens = Some(200_000);
+        let mut last_request_history_bytes = Some(32_000);
+        let mut turn_input_tokens = TurnIOState::Unseen;
+        let mut turn_output_tokens = TurnIOState::Unseen;
+        let mut turn_cached_input_tokens = CacheTotalState::Unseen;
+        let mut turn_cache_write_tokens = CacheTotalState::Unseen;
+        let mut turn_pricing_identity = None;
+        let mut turn_total_state = TurnTotalState::Unseen;
+        let mut ctx = RunCtx {
+            cfg: &cfg,
+            effective_model: &cfg.model,
+            route_preflight_error: None,
+            context_fit_capacity_tokens: Some(u64::from(HANDOFF_MAX_OUTPUT_TOKENS)),
+            route_cost_budget: None,
+            route_cost_reserved_microusd: 0,
+            session_id: "test-session",
+            system_prompt: &cfg.system_prompt,
+            llm: &llm,
+            mcp: &mcp,
+            permissions: &permissions,
+            protocol_version: 1,
+            skills: &[],
+            wire: &wire,
+            cancel: &mut cancel,
+            steer: &mut steer,
+            history: &mut history,
+            original_task: &mut original_task,
+            handoff_count: &mut handoff_count,
+            run_id: "test-run".into(),
+            route_measurement_identity: None,
+            route_measurement_sequence: 0,
+            last_request_input_tokens: &mut last_request_input_tokens,
+            last_request_history_bytes: &mut last_request_history_bytes,
+            turn_input_tokens: &mut turn_input_tokens,
+            turn_output_tokens: &mut turn_output_tokens,
+            turn_cached_input_tokens: &mut turn_cached_input_tokens,
+            turn_cache_write_tokens: &mut turn_cache_write_tokens,
+            turn_pricing_identity: &mut turn_pricing_identity,
+            turn_total_state: &mut turn_total_state,
+            usage_baseline: SessionUsageBaseline::default(),
+        };
+
+        let synthetic_prompt = ctx.build_handoff_prompt(None);
+        assert!(check_user_text_context_fit(
+            u64::from(HANDOFF_MAX_OUTPUT_TOKENS),
+            &HANDOFF_SYSTEM_PROMPT,
+            &synthetic_prompt,
+            &[],
+            0,
+        )
+        .is_ok());
+        assert!(check_user_text_context_fit(
+            u64::from(HANDOFF_MAX_OUTPUT_TOKENS),
+            &HANDOFF_SYSTEM_PROMPT,
+            &synthetic_prompt,
+            &[],
+            HANDOFF_MAX_OUTPUT_TOKENS,
+        )
+        .is_err());
+
+        let mut handoff_attempts = 0;
+        assert!(matches!(
+            ctx.maybe_handoff(&mut handoff_attempts).await,
+            super::HandoffOutcome::Skipped
+        ));
+        assert_eq!(handoff_attempts, 1);
+        assert!(matches!(
+            ctx.forced_handoff(32_000).await,
+            super::HandoffOutcome::Skipped
+        ));
+
+        *ctx.history = vec![HistoryItem::User("x".repeat(64 * 1024))];
+        let mut recovery_attempts = 0;
+        assert!(matches!(
+            ctx.recover_from_context_overflow(&mut recovery_attempts)
+                .await,
+            super::ContextRecovery::Exhausted
+        ));
+        assert!(recovery_attempts > 1, "the reduced-prompt retries ran");
+        mock_server.await.unwrap();
+        assert_eq!(request_count.load(Ordering::SeqCst), 0);
+    }
 
     #[test]
     fn handoff_prompt_budget_reserves_summary_output_and_fixed_prompt() {

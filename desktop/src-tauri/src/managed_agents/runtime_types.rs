@@ -117,4 +117,8 @@ pub struct ManagedAgentRuntimeReceipt {
     pub pid: u32,
     pub desktop_instance_id: String,
     pub started_at: String,
+    /// Persisted generation identity for exact lease recovery. Older receipts
+    /// remain readable, but cannot prove which managed generation they name.
+    #[serde(default)]
+    pub start_nonce: Option<String>,
 }

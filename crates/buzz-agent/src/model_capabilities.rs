@@ -157,6 +157,7 @@ struct ProviderFallbacks {
     databricks: FallbackPair,
     databricks_v2: FallbackPair,
     openrouter: FallbackPair,
+    deepseek: FallbackPair,
     #[serde(rename = "_default")]
     default: FallbackPair,
 }
@@ -170,18 +171,20 @@ impl ProviderFallbacks {
             "databricks" => &self.databricks,
             "databricks_v2" => &self.databricks_v2,
             "openrouter" => &self.openrouter,
+            "deepseek" => &self.deepseek,
             _ => &self.default,
         }
     }
 
     /// Named pairs, for validation.
-    fn named(&self) -> [(&str, &FallbackPair); 6] {
+    fn named(&self) -> [(&str, &FallbackPair); 7] {
         [
             ("anthropic", &self.anthropic),
             ("openai", &self.openai),
             ("databricks", &self.databricks),
             ("databricks_v2", &self.databricks_v2),
             ("openrouter", &self.openrouter),
+            ("deepseek", &self.deepseek),
             ("_default", &self.default),
         ]
     }
@@ -210,6 +213,9 @@ struct Manifest {
     #[serde(rename = "_sources", default)]
     #[allow(dead_code)]
     sources: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    effort_mappings: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
 }
 
 /// The resolved six-axis capability profile for one `(provider, model)` query.
@@ -671,6 +677,9 @@ mod tests {
     /// says which questions to ask. Adding, removing, or reordering a `Vector`
     /// here changes the generated corpus — run `just regen-model-corpus`.
     const INPUTS: &[Q] = &[
+    Q::Section { group: "DeepSeek provider canonicalization and conservative unknown fallback", note: Some("DeepSeek baseline is grounded in the official thinking-mode documentation; concrete unknown model IDs retain neutral fallback capabilities.") },
+    Q::Vector { id: "deepseek-trimmed-case-provider-blank-baseline", provider: " DeepSeek ", raw_model_id: "", note: Some("Probes trim/lowercase provider canonicalization and the provider baseline without inferring a model list.") },
+    Q::Vector { id: "deepseek-concrete-unknown-neutral-fallback", provider: "deepseek", raw_model_id: "unlisted-model-id", note: Some("An unknown model ID must not inherit the provider's documented baseline." ) },
     Q::Section { group: "Anthropic curated family-rule model names", note: None },
     Q::Vector { id: "anthropic-claude-3-family", provider: "anthropic", raw_model_id: "claude-3-7-sonnet-20250219", note: None },
     Q::Vector { id: "anthropic-claude-opus-4-5", provider: "anthropic", raw_model_id: "claude-opus-4-5", note: None },
@@ -942,6 +951,29 @@ mod tests {
     }
 
     #[test]
+    fn deepseek_baseline_canonicalizes_provider_and_unknown_ids_stay_neutral() {
+        let baseline = resolve(" DeepSeek ", "");
+        assert_eq!(baseline.thinking_mode, ThinkingMode::Adaptive);
+        assert_eq!(baseline.default_effort, Some(ThinkingEffort::High));
+        assert_eq!(
+            baseline.supported_efforts,
+            &[
+                ThinkingEffort::None,
+                ThinkingEffort::Minimal,
+                ThinkingEffort::Low,
+                ThinkingEffort::Medium,
+                ThinkingEffort::High,
+                ThinkingEffort::XHigh,
+                ThinkingEffort::Max,
+            ]
+        );
+        assert_eq!(
+            resolve("deepseek", "unlisted-model-id"),
+            resolve("unknown-provider", "unlisted-model-id")
+        );
+    }
+
+    #[test]
     fn corpus_matches_generated_snapshot() {
         // Drift gate: the committed corpus must be byte-identical to what the
         // production resolver generates right now. A byte match proves every
@@ -957,7 +989,7 @@ mod tests {
     }
 
     #[test]
-    fn corpus_has_exactly_168_executable_vectors() {
+    fn corpus_has_exactly_170_executable_vectors() {
         // Locks the vector count so a silent INPUTS edit can't quietly drop
         // coverage; must equal the gate in the TS harness
         // (modelCapabilitiesCorpus.test.mjs).
@@ -966,7 +998,7 @@ mod tests {
             .filter(|q| matches!(q, Q::Vector { .. }))
             .count();
         assert_eq!(
-            vectors, 168,
+            vectors, 170,
             "corpus executable-vector count changed; update this gate deliberately"
         );
     }

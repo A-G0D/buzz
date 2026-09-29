@@ -12,6 +12,7 @@ import {
   AuxiliaryPanel,
   AuxiliaryPanelBody,
   AuxiliaryPanelHeader,
+  AuxiliaryPanelHeaderActions,
   AuxiliaryPanelHeaderGroup,
   AuxiliaryPanelTitle,
 } from "@/shared/layout/AuxiliaryPanel";
@@ -22,6 +23,7 @@ export function MessageThreadPanelHeader({
   headerLeading,
   headerTitle = "Thread",
   headerTitleAriaLabel,
+  headerTrailing,
   isFocusMode,
   isSinglePanelView,
   onClose,
@@ -31,6 +33,7 @@ export function MessageThreadPanelHeader({
   headerLeading?: React.ReactNode;
   headerTitle?: string;
   headerTitleAriaLabel?: string;
+  headerTrailing?: React.ReactNode;
   isFocusMode: boolean;
   isSinglePanelView: boolean;
   onClose: () => void;
@@ -68,6 +71,11 @@ export function MessageThreadPanelHeader({
       >
         <AuxiliaryPanelTitle>{title}</AuxiliaryPanelTitle>
       </AuxiliaryPanelHeaderGroup>
+      {headerTrailing ? (
+        <AuxiliaryPanelHeaderActions>
+          {headerTrailing}
+        </AuxiliaryPanelHeaderActions>
+      ) : null}
     </AuxiliaryPanelHeader>
   );
 }
@@ -220,6 +228,9 @@ export function MessageThreadPanelSkeleton({
           headerLeading={headerLeading}
           headerTitle={headerTitle}
           headerTitleAriaLabel={headerTitleAriaLabel}
+          headerTrailing={
+            <Skeleton aria-hidden="true" className="mr-1 size-8 rounded-lg" />
+          }
           isFocusMode={isFocusMode}
           isSinglePanelView={isSinglePanelView}
           onClose={onClose}

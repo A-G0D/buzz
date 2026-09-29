@@ -210,6 +210,9 @@ pub enum OutputFormat {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Read the local history of Buzz-managed ACP turn attempts
+    #[command(subcommand)]
+    Runs(RunsCmd),
     /// Draft owner-reviewed agent creation and updates
     #[command(subcommand)]
     Agents(AgentsCmd),
@@ -279,6 +282,56 @@ enum Cmd {
     /// Community moderation — reports queue, bans, timeouts, audit trail
     #[command(subcommand)]
     Moderation(ModerationCmd),
+}
+
+#[derive(Subcommand)]
+pub(crate) enum RunsCmd {
+    /// List recent locally recorded ACP turn attempts
+    List {
+        /// Relay-authorized thread channel UUID
+        #[arg(long)]
+        channel: String,
+        /// Canonical root event ID whose readable thread scopes the result
+        #[arg(long)]
+        thread_root: String,
+        /// Maximum rows to return (1–100)
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+    /// List local coordinator runs after re-resolving a current project home
+    /// and proving each run's source event(s) are readable on that channel
+    ProjectList {
+        /// NIP-MP project coordinate (selector only; relay state is authoritative)
+        #[arg(long)]
+        project_coordinate: String,
+        /// Candidate home channel UUID (selector only; relay state is authoritative)
+        #[arg(long)]
+        home_channel: String,
+        /// Maximum candidate rows to inspect (1–20)
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+        /// Continue after a prior page; supply both cursor fields
+        #[arg(long, requires = "cursor_run_id")]
+        cursor_updated_at_ms: Option<i64>,
+        /// Continue after a prior page; supply both cursor fields
+        #[arg(long, requires = "cursor_updated_at_ms")]
+        cursor_run_id: Option<String>,
+    },
+    /// Show one ACP turn attempt or one stable source-linked coordinator run
+    Show {
+        /// Buzz ACP turn UUID (an attempt ID, not a task ID)
+        #[arg(long, required_unless_present = "run_id", conflicts_with = "run_id")]
+        turn_id: Option<String>,
+        /// Stable local coordinator-run UUID shown by `buzz runs list`
+        #[arg(long, required_unless_present = "turn_id", conflicts_with = "turn_id")]
+        run_id: Option<String>,
+        /// Relay-authorized thread channel UUID
+        #[arg(long)]
+        channel: String,
+        /// Canonical root event ID whose readable thread scopes the result
+        #[arg(long)]
+        thread_root: String,
+    },
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -434,6 +487,13 @@ pub enum MessagesCmd {
         /// Pubkey to mention (hex or npub; repeatable). Supplying any explicit identity permits unresolved or ambiguous @Name text as presentation-only; uniquely resolved member names still notify.
         #[arg(long = "mention")]
         mentions: Vec<String>,
+        /// Explicit task class for a kind-9 message: coding, code_review, research, writing, analysis, planning, summarization, or classification
+        #[arg(
+            long,
+            value_name = "CLASS",
+            long_help = "Explicit operator-supplied task class for a kind-9 message. Supported: coding, code_review, research, writing, analysis, planning, summarization, classification."
+        )]
+        task_class: Option<String>,
     },
     /// Send a code diff / patch to a channel
     SendDiff {
@@ -539,6 +599,42 @@ pub enum MessagesCmd {
         /// Maximum reply nesting depth to include
         #[arg(long)]
         depth_limit: Option<u32>,
+    },
+    /// Get a sourced, deterministic brief for a message thread
+    #[command(
+        after_help = "Examples:\n  buzz messages brief --channel <UUID> --event <EVENT_ID>\n  buzz messages brief --link 'buzz://message?channel=<UUID>&id=<EVENT_ID>&thread=<ROOT_ID>'\n  buzz messages brief --channel <UUID> --event <ROOT_ID> --cursor-created-at <SECONDS> --cursor-event-id <EVENT_ID>\n  buzz messages brief --channel <UUID> --event <ROOT_ID> --workflow <WORKFLOW_UUID>\n  buzz messages brief --channel <UUID> --event <ROOT_ID> --managed-turns"
+    )]
+    Brief {
+        /// Channel UUID; required unless --link is supplied
+        #[arg(long, required_unless_present = "link", conflicts_with = "link")]
+        channel: Option<String>,
+        /// Message event ID (64-char hex); required unless --link is supplied
+        #[arg(long, required_unless_present = "link", conflicts_with = "link")]
+        event: Option<String>,
+        /// Canonical buzz://message deep link; uses the configured relay and identity
+        #[arg(long, conflicts_with_all = ["channel", "event"])]
+        link: Option<String>,
+        /// Maximum reply events to include
+        #[arg(long)]
+        limit: Option<u32>,
+        /// Maximum reply nesting depth to include (defaults to 64; max is 2147483647)
+        #[arg(long)]
+        depth_limit: Option<u32>,
+        /// Continue after the timestamp in a previous brief's status.next_cursor
+        #[arg(long, requires = "cursor_event_id")]
+        cursor_created_at: Option<i64>,
+        /// Continue after the event ID in a previous brief's status.next_cursor
+        #[arg(long, requires = "cursor_created_at")]
+        cursor_event_id: Option<String>,
+        /// Include workflow runs whose trigger event matches this thread's source events
+        #[arg(long)]
+        workflow: Option<String>,
+        /// Maximum workflow-run history pages to scan (default 10; maximum 50)
+        #[arg(long, requires = "workflow")]
+        workflow_pages: Option<u32>,
+        /// Include matching local Buzz-managed ACP attempts and recent lifecycle events
+        #[arg(long)]
+        managed_turns: bool,
     },
     /// Full-text search across messages
     #[command(
@@ -2192,6 +2288,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
     let client = BuzzClient::new(relay_url, keys, auth_tag, auth_tag_json)?;
 
     match cli.command {
+        Cmd::Runs(sub) => commands::runs::dispatch(sub, &client).await,
         Cmd::Agents(sub) => commands::agents::dispatch(sub, &client).await,
         Cmd::Messages(sub) => commands::messages::dispatch(sub, &client, &cli.format).await,
         Cmd::Channels(sub) => commands::channels::dispatch(sub, &client, &cli.format).await,
@@ -2315,6 +2412,172 @@ mod tests {
         .is_err());
     }
 
+    #[test]
+    fn messages_brief_requires_both_cursor_fields() {
+        let channel = "123e4567-e89b-12d3-a456-426614174000";
+        let event = "a".repeat(64);
+        assert!(Cli::try_parse_from([
+            "buzz",
+            "messages",
+            "brief",
+            "--channel",
+            channel,
+            "--event",
+            event.as_str(),
+            "--cursor-created-at",
+            "10",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "buzz",
+            "messages",
+            "brief",
+            "--channel",
+            channel,
+            "--event",
+            event.as_str(),
+            "--cursor-created-at",
+            "10",
+            "--cursor-event-id",
+            event.as_str(),
+        ])
+        .is_ok());
+    }
+
+    #[test]
+    fn messages_brief_accepts_optional_managed_turn_history() {
+        let channel = "123e4567-e89b-12d3-a456-426614174000";
+        let event = "a".repeat(64);
+        let parsed = Cli::try_parse_from([
+            "buzz",
+            "messages",
+            "brief",
+            "--channel",
+            channel,
+            "--event",
+            event.as_str(),
+            "--managed-turns",
+        ]);
+        assert!(parsed.is_ok());
+    }
+
+    #[test]
+    fn messages_brief_workflow_pages_requires_workflow() {
+        let channel = "123e4567-e89b-12d3-a456-426614174000";
+        let event = "a".repeat(64);
+        let base = [
+            "buzz",
+            "messages",
+            "brief",
+            "--channel",
+            channel,
+            "--event",
+            event.as_str(),
+        ];
+        let mut without_workflow = base.to_vec();
+        without_workflow.extend(["--workflow-pages", "2"]);
+        assert!(Cli::try_parse_from(without_workflow).is_err());
+
+        let mut with_workflow = base.to_vec();
+        with_workflow.extend([
+            "--workflow",
+            "123e4567-e89b-12d3-a456-426614174000",
+            "--workflow-pages",
+            "2",
+        ]);
+        assert!(Cli::try_parse_from(with_workflow).is_ok());
+    }
+
+    #[test]
+    fn runs_commands_require_an_exact_thread_read_scope() {
+        let channel = "123e4567-e89b-12d3-a456-426614174000";
+        let root = "a".repeat(64);
+        assert!(Cli::try_parse_from(["buzz", "runs", "list"]).is_err());
+        assert!(Cli::try_parse_from(["buzz", "runs", "list", "--channel", channel,]).is_err());
+        assert!(Cli::try_parse_from([
+            "buzz",
+            "runs",
+            "list",
+            "--channel",
+            channel,
+            "--thread-root",
+            root.as_str(),
+        ])
+        .is_ok());
+
+        let project = format!("30621:{}:demo", "a".repeat(64));
+        assert!(Cli::try_parse_from([
+            "buzz",
+            "runs",
+            "project-list",
+            "--project-coordinate",
+            project.as_str(),
+            "--home-channel",
+            channel,
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "buzz",
+            "runs",
+            "project-list",
+            "--project-coordinate",
+            project.as_str(),
+            "--home-channel",
+            channel,
+            "--cursor-updated-at-ms",
+            "10",
+        ])
+        .is_err());
+
+        let base = [
+            "buzz",
+            "runs",
+            "show",
+            "--channel",
+            channel,
+            "--thread-root",
+        ];
+        assert!(Cli::try_parse_from(base).is_err());
+        assert!(Cli::try_parse_from([
+            "buzz",
+            "runs",
+            "show",
+            "--channel",
+            channel,
+            "--thread-root",
+            root.as_str(),
+            "--turn-id",
+            "123e4567-e89b-12d3-a456-426614174001",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "buzz",
+            "runs",
+            "show",
+            "--channel",
+            channel,
+            "--thread-root",
+            root.as_str(),
+            "--run-id",
+            "123e4567-e89b-12d3-a456-426614174002",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "buzz",
+            "runs",
+            "show",
+            "--channel",
+            channel,
+            "--thread-root",
+            root.as_str(),
+            "--turn-id",
+            "123e4567-e89b-12d3-a456-426614174001",
+            "--run-id",
+            "123e4567-e89b-12d3-a456-426614174002",
+        ])
+        .is_err());
+    }
+
     /// `canvas history --limit` is bounded 1–10000 at parse time: zero and
     /// max+1 reject, the maximum is accepted, and the max stays above one
     /// 1,000-row relay page so the >1,000 pagination path remains reachable.
@@ -2384,6 +2647,7 @@ mod tests {
             "projects",
             "reactions",
             "repos",
+            "runs",
             "social",
             "upload",
             "users",
@@ -2442,6 +2706,7 @@ mod tests {
         assert_eq!(
             names(&cmd, "messages"),
             vec![
+                "brief",
                 "delete",
                 "edit",
                 "get",
@@ -2587,7 +2852,8 @@ mod tests {
             ("feed", 1),
             ("issues", 6),
             ("media", 1),
-            ("messages", 8),
+            ("messages", 9),
+            ("runs", 3),
             ("pack", 2),
             ("patches", 4),
             ("pr", 5),

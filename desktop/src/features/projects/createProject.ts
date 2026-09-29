@@ -26,6 +26,12 @@ import {
   KIND_REPO_ANNOUNCEMENT,
 } from "@/shared/constants/kinds";
 import { getCachedRelayOrigin } from "@/shared/lib/mediaUrl";
+import { writeProjectAgentProfileDefault } from "@/features/projects/projectAgentProfileDefault";
+import { writeProjectAgentRouteProfileDefault } from "@/features/projects/projectAgentProfileDefault";
+import {
+  writeProjectAgentResourceDefaults,
+  type ProjectAgentResourceDefaults,
+} from "@/features/projects/projectAgentProfileDefault";
 
 export type CreateProjectInput = {
   name: string;
@@ -34,6 +40,12 @@ export type CreateProjectInput = {
   projectVisibility?: ProjectListingVisibility;
   agents?: readonly CreateChannelManagedAgentInput[];
   templateId?: string;
+  /** Private local default for agents subsequently added to the new project. */
+  agentExecutionProfileId?: string;
+  /** Private local route profile for initial and subsequently added agents. */
+  agentRouteProfileId?: string;
+  /** Private local per-agent settings default for this project. */
+  agentResourceDefaults?: ProjectAgentResourceDefaults | null;
 };
 
 export type CreateProjectResult = {
@@ -41,6 +53,9 @@ export type CreateProjectResult = {
   /** Retained for callers shared with legacy repository-only creation. */
   compatibilityWarning?: string;
   project: Project;
+  agentProfileDefaultSaveFailed?: true;
+  agentRouteProfileDefaultSaveFailed?: true;
+  agentResourceDefaultSaveFailed?: true;
 };
 
 export type CreateProjectResumeState = {
@@ -207,12 +222,46 @@ async function finishCreate(
   projectId: string,
 ): Promise<CreateProjectResult> {
   const agentChannelId = channel?.id ?? project.projectChannelId;
+  const profileSaved = agentChannelId
+    ? writeProjectAgentProfileDefault(
+        getCachedRelayOrigin() ?? "",
+        project.owner,
+        agentChannelId,
+        input.agentExecutionProfileId ?? null,
+      )
+    : !input.agentExecutionProfileId;
+  const routeProfileSaved = agentChannelId
+    ? writeProjectAgentRouteProfileDefault(
+        getCachedRelayOrigin() ?? "",
+        project.owner,
+        agentChannelId,
+        input.agentRouteProfileId ?? null,
+      )
+    : !input.agentRouteProfileId;
+  const resourceDefaultsSaved = agentChannelId
+    ? writeProjectAgentResourceDefaults(
+        getCachedRelayOrigin() ?? "",
+        project.owner,
+        agentChannelId,
+        input.agentResourceDefaults ?? null,
+      )
+    : !input.agentResourceDefaults;
   if (agentChannelId && input.agents && input.agents.length > 0) {
     await addRequestedAgents(agentChannelId, input.agents);
   }
   resume.projectIds.delete(projectId);
   resume.channels.delete(projectId);
-  return { channel, project };
+  return {
+    channel,
+    project,
+    ...(!profileSaved && { agentProfileDefaultSaveFailed: true as const }),
+    ...(!routeProfileSaved && {
+      agentRouteProfileDefaultSaveFailed: true as const,
+    }),
+    ...(!resourceDefaultsSaved && {
+      agentResourceDefaultSaveFailed: true as const,
+    }),
+  };
 }
 
 /** Creates the home channel, a bound default repository, and the NIP-MP project. */

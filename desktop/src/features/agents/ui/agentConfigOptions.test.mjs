@@ -6,10 +6,13 @@ import {
   getPersonaModelOptions,
   getPersonaProviderOptions,
   getProviderApiKeyLabel,
+  getProviderApiKeyEnvVar,
+  requiredCredentialEnvKeys,
   resetConfigForHarnessChange,
   runtimeSupportsLlmProviderSelection,
 } from "./agentConfigOptions.tsx";
 import { formatModelDiscoveryErrorStatus } from "./personaModelDiscoveryStatus.ts";
+import { getGlobalModelFallback } from "./bakedEnvHelpers.ts";
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -275,6 +278,27 @@ test("getProviderApiKeyLabel_openai_compat_returns_distinct_label", () => {
 test("getProviderApiKeyLabel_openrouter_returns_openrouter_label", () => {
   // Key fix: OpenRouter was mislabeled "OpenAI API Key" before this change.
   assert.equal(getProviderApiKeyLabel("openrouter"), "OpenRouter API Key");
+});
+
+test("DeepSeek is selectable with its own API key and provider model fallback", () => {
+  const options = getPersonaProviderOptions("", "buzz-agent");
+  assert.ok(
+    options.some(
+      (option) => option.id === "deepseek" && option.label === "DeepSeek",
+    ),
+  );
+  assert.equal(getProviderApiKeyLabel("deepseek"), "DeepSeek API Key");
+  assert.equal(getProviderApiKeyEnvVar("deepseek"), "DEEPSEEK_API_KEY");
+  assert.deepEqual(requiredCredentialEnvKeys("buzz-agent", "deepseek"), [
+    "DEEPSEEK_API_KEY",
+  ]);
+  assert.equal(
+    getGlobalModelFallback(
+      [{ key: "DEEPSEEK_MODEL", value: "deepseek-chat", masked: false }],
+      "deepseek",
+    ),
+    "deepseek-chat",
+  );
 });
 
 test("getProviderApiKeyLabel_databricks_returns_null", () => {

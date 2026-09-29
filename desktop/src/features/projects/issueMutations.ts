@@ -11,6 +11,7 @@ type CreateProjectIssueInput = {
   title: string;
   body: string;
   category?: ProjectTaskCategory;
+  parentIssueId?: string;
 };
 
 export async function publishProjectIssue(
@@ -21,6 +22,7 @@ export async function publishProjectIssue(
     kind: KIND_GIT_ISSUE,
     content: input.body.trim(),
     tags: buildGitIssueTags({
+      parentIssueId: input.parentIssueId,
       repoAddress: project.repoAddress,
       repoOwner: project.owner,
       title: input.title,

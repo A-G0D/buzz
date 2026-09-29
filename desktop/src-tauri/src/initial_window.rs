@@ -3,6 +3,10 @@
 #[cfg(target_os = "macos")]
 pub(crate) const INITIAL_RENDER_READY_EVENT: &str = "initial-render-ready";
 
+#[cfg(target_os = "macos")]
+pub(crate) const INITIAL_RENDER_RECOVERY_SCRIPT: &str =
+    include_str!("../../src/app/nativeStartupRecovery.js");
+
 pub(crate) fn reveal_initial_window<R: tauri::Runtime>(window: &tauri::Window<R>) {
     if let Err(error) = window.show() {
         eprintln!("buzz-desktop: failed to reveal main window: {error}");

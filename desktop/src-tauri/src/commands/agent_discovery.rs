@@ -153,6 +153,8 @@ pub async fn save_custom_harness(
         max_tokens_env_var: None,
         context_limit_env_var: None,
         max_rounds_env_var: None,
+        summary_model_env_var: None,
+        summary_max_tokens_env_var: None,
         install_hint: definition.install_hint,
         install_instructions_url: definition.install_instructions_url,
         can_auto_install: false,

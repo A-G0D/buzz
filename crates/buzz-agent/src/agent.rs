@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
+use hmac::{Hmac, KeyInit, Mac};
 use serde_json::json;
+use sha2::Sha256;
 use tokio::sync::{mpsc, watch, Semaphore};
 use tokio::task::JoinSet;
 use tracing::Instrument as _;
@@ -15,11 +17,12 @@ use crate::llm::Llm;
 use crate::mcp::McpRegistry;
 use crate::mcp::ResultBudget;
 use crate::permission::PermissionDecision;
+use crate::route_preview::{check_context_fit, RouteCostBudget};
 
 use crate::types::{
     AgentError, CacheTotalState, ContentBlock, HistoryItem, PricingIdentity, ProviderStop,
-    SessionUsageBaseline, StopReason, ToolCall, ToolResult, ToolResultContent, TurnIOState,
-    TurnTotalState,
+    SessionUsageBaseline, StopReason, ToolCall, ToolDef, ToolResult, ToolResultContent,
+    TurnIOState, TurnTotalState,
 };
 use crate::wire::{self, WireSender};
 
@@ -33,6 +36,43 @@ const UNSUPPORTED_IMAGE_TOOL_MESSAGE: &str = "The current model does not support
 /// result because truncation can happen without a tool call (and an unpaired
 /// tool result is invalid on every provider wire format).
 const MAX_TOKENS_RECOVERY_MESSAGE: &str = "Your previous response reached the model's output token limit and was truncated. Any incomplete tool calls were discarded and were not run. Stop prolonged internal reasoning now. Use the available tools immediately: write a script or artifact to a file and run it in small, verifiable steps instead of emitting the entire solution inline. Continue the task concisely from the preserved text.";
+
+pub(crate) fn device_keyed_endpoint_fingerprint(base_url: &str) -> Option<String> {
+    let device_key = std::env::var("BUZZ_PRIVATE_KEY").ok()?;
+    if device_key.is_empty() || base_url.is_empty() {
+        return None;
+    }
+    let mut mac = Hmac::<Sha256>::new_from_slice(device_key.as_bytes()).ok()?;
+    mac.update(b"buzz-route-endpoint-fingerprint-v1\0");
+    mac.update(base_url.as_bytes());
+    Some(hex::encode(mac.finalize().into_bytes()))
+}
+
+#[derive(Clone, Debug)]
+pub struct RouteMeasurementIdentity {
+    pub profile_id: String,
+    pub profile_version: u32,
+    pub profile_hash: String,
+    pub candidate_id: String,
+    pub provider_id: String,
+    pub model_id: String,
+}
+
+/// Build the same tool list for route preflight and provider dispatch.
+pub(crate) fn request_tool_definitions(
+    mcp: &McpRegistry,
+    has_skills: bool,
+    has_summary_model: bool,
+) -> Vec<ToolDef> {
+    let mut tools = mcp.tools();
+    if has_skills {
+        tools.push(builtin::load_skill_def());
+    }
+    if has_summary_model {
+        tools.push(builtin::summarize_status_def());
+    }
+    tools
+}
 
 /// Remove image blocks that the provider has explicitly rejected while keeping
 /// their surrounding tool result (and therefore the tool-call/result pairing)
@@ -145,6 +185,16 @@ pub struct RunCtx<'a> {
     /// Effective model for this session. Usually equals `cfg.model`; overridden
     /// per-session by `session/set_model`. All LLM calls use this value.
     pub effective_model: &'a str,
+    /// Route-profile preflight error. A present value ends the turn before any
+    /// model call so unknown, unsafe, or unconfigured routes cannot fall back.
+    pub route_preflight_error: Option<String>,
+    /// Operator-declared context capacity for a strict-fit route. Rechecked at
+    /// every provider request because tool results can grow history mid-turn.
+    pub context_fit_capacity_tokens: Option<u64>,
+    /// Optional hard ceiling on the conservative cost estimate for calls to
+    /// this turn's selected route. Each call reserves its full output cap.
+    pub route_cost_budget: Option<RouteCostBudget>,
+    pub route_cost_reserved_microusd: u64,
     pub session_id: &'a str,
     pub system_prompt: &'a str,
     pub llm: &'a Llm,
@@ -175,6 +225,12 @@ pub struct RunCtx<'a> {
     /// per-`session/prompt` random token so that IDs from one prompt invocation
     /// never collide with those from another even within the same session.
     pub run_id: String,
+    /// Set only when a versioned route profile selected and initialized a
+    /// concrete candidate for this ACP prompt.
+    pub route_measurement_identity: Option<RouteMeasurementIdentity>,
+    /// Monotonic within this ACP prompt; failed calls can consume an index but
+    /// never emit a throughput sample.
+    pub route_measurement_sequence: u64,
     /// Cache-summed input tokens reported by the provider on this session's
     /// most recent request (persists across `session/prompt` calls), or `None`
     /// before the first response and immediately after a handoff resets the
@@ -315,7 +371,81 @@ impl RunCtx<'_> {
         .await;
     }
 
+    async fn emit_route_throughput_sample(
+        &self,
+        response: &crate::types::LlmResponse,
+        elapsed: std::time::Duration,
+        request_sequence: Option<u64>,
+    ) {
+        let (Some(identity), Some(request_sequence), Some(input_tokens), Some(output_tokens)) = (
+            self.route_measurement_identity.as_ref(),
+            request_sequence,
+            response.input_tokens,
+            response.output_tokens,
+        ) else {
+            return;
+        };
+        if input_tokens == 0 || output_tokens == 0 {
+            return;
+        }
+        if response
+            .request_model
+            .as_deref()
+            .is_some_and(|model| model != identity.model_id)
+        {
+            return;
+        }
+        let elapsed_ms = elapsed.as_millis();
+        let Ok(elapsed_ms) = u64::try_from(elapsed_ms) else {
+            return;
+        };
+        if elapsed_ms == 0 {
+            return;
+        }
+        let Some(effective_output_tokens_per_second_milli) = u128::from(output_tokens)
+            .checked_mul(1_000_000)
+            .and_then(|value| value.checked_div(u128::from(elapsed_ms)))
+            .and_then(|value| u64::try_from(value).ok())
+        else {
+            return;
+        };
+        let Some(endpoint_hash) = device_keyed_endpoint_fingerprint(&self.cfg.base_url) else {
+            return;
+        };
+        if effective_output_tokens_per_second_milli == 0 {
+            return;
+        }
+        let thinking_effort = crate::route_thinking_effort(self.cfg.thinking_effort);
+        let sample = json!({
+            "sessionId": self.session_id,
+            "attemptId": self.run_id,
+            "profileId": identity.profile_id,
+            "profileVersion": identity.profile_version,
+            "profileHash": identity.profile_hash,
+            "endpointHash": endpoint_hash,
+            "candidateId": identity.candidate_id,
+            "providerId": identity.provider_id,
+            "modelId": identity.model_id,
+            "thinkingEffort": thinking_effort,
+            "requestSequence": request_sequence,
+            "inputTokens": input_tokens,
+            "outputTokens": output_tokens,
+            "elapsedMs": elapsed_ms,
+            "effectiveOutputTokensPerSecondMilli": effective_output_tokens_per_second_milli,
+        });
+        wire::send(
+            self.wire,
+            wire::session_update_with_route_throughput(self.session_id, &self.run_id, sample),
+        )
+        .await;
+    }
+
     pub async fn run(&mut self, prompt: Vec<ContentBlock>) -> Result<StopReason, AgentError> {
+        if let Some(error) = self.route_preflight_error.take() {
+            return Err(AgentError::InvalidParams(format!(
+                "route preflight abstained: {error}"
+            )));
+        }
         let user_text = prompt_to_text(prompt)?;
         if user_text.len() > MAX_PROMPT_BYTES {
             return Err(AgentError::InvalidParams(format!(
@@ -397,12 +527,52 @@ impl RunCtx<'_> {
                 }
             }
 
-            let mut tools = self.mcp.tools();
-            // Inject the built-in load_skill tool when skills are available.
-            if !self.skills.is_empty() {
-                tools.push(builtin::load_skill_def());
+            let tools = request_tool_definitions(
+                self.mcp,
+                !self.skills.is_empty(),
+                self.cfg.summary_model.is_some(),
+            );
+            if let Some(capacity) = self.context_fit_capacity_tokens {
+                check_context_fit(
+                    capacity,
+                    self.system_prompt,
+                    self.history,
+                    &tools,
+                    self.cfg.max_output_tokens,
+                )
+                .map_err(|error| {
+                    AgentError::InvalidParams(format!(
+                        "strict context fit stopped before provider request: {error}"
+                    ))
+                })?;
+            }
+            if let Some(budget) = self.route_cost_budget {
+                let estimated_cost = budget
+                    .estimate_call_microusd(
+                        self.system_prompt,
+                        self.history,
+                        &tools,
+                        self.cfg.max_output_tokens,
+                    )
+                    .ok_or_else(|| {
+                        AgentError::InvalidParams(
+                            "route cost estimate is unavailable; no provider request was sent"
+                                .into(),
+                        )
+                    })?;
+                self.route_cost_reserved_microusd = budget
+                    .reserve_call(self.route_cost_reserved_microusd, estimated_cost)
+                    .map_err(AgentError::InvalidParams)?;
             }
             round = round.saturating_add(1);
+            if self.route_measurement_identity.is_some() {
+                if let Some(next) = self.route_measurement_sequence.checked_add(1) {
+                    self.route_measurement_sequence = next;
+                }
+            }
+            let route_measurement_sequence =
+                (self.route_measurement_sequence > 0).then_some(self.route_measurement_sequence);
+            let request_started_at = std::time::Instant::now();
             let response_result = tokio::select! {
                 biased;
                 _ = self.cancel.changed() => return Ok(StopReason::Cancelled),
@@ -431,7 +601,15 @@ impl RunCtx<'_> {
                 } => unreachable!(),
             };
             let response = match response_result {
-                Ok(response) => response,
+                Ok(response) => {
+                    self.emit_route_throughput_sample(
+                        &response,
+                        request_started_at.elapsed(),
+                        route_measurement_sequence,
+                    )
+                    .await;
+                    response
+                }
                 Err(AgentError::UnsupportedImageInput(detail)) => {
                     let removed = replace_unsupported_images(self.history);
                     if removed == 0 {
@@ -496,7 +674,7 @@ impl RunCtx<'_> {
                         // the offending sizes, and a visible failure is the
                         // point — the alternative is retrying forever.
                         ContextRecovery::Exhausted => {
-                            return Err(AgentError::LlmContextExceeded(e))
+                            return Err(AgentError::LlmContextExceeded(e));
                         }
                     }
                 }
@@ -860,6 +1038,35 @@ impl RunCtx<'_> {
                 result.provider_id = call.provider_id.clone();
                 emit_completed(self.wire, self.session_id, call, &result).await;
                 results[idx] = Some(result);
+                continue;
+            }
+
+            if call.name == builtin::SUMMARIZE_STATUS_TOOL {
+                emit_in_progress(self.wire, self.session_id, call).await;
+                let summary = tokio::select! {
+                    biased;
+                    _ = self.cancel.changed() => None,
+                    result = builtin::call_summarize_status(
+                        &call.arguments,
+                        self.llm,
+                        self.cfg,
+                        self.context_fit_capacity_tokens,
+                        self.effective_model,
+                    ) => {
+                        Some(result)
+                    }
+                };
+                match summary {
+                    Some(mut result) => {
+                        result.provider_id = call.provider_id.clone();
+                        emit_completed(self.wire, self.session_id, call, &result).await;
+                        results[idx] = Some(result);
+                    }
+                    None => {
+                        emit_failed(self.wire, self.session_id, call, "cancelled").await;
+                        results[idx] = Some(synthetic_tool_result(call, "cancelled".into()));
+                    }
+                }
                 continue;
             }
 

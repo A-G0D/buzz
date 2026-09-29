@@ -595,6 +595,27 @@ fn codex_spawn_does_not_set_a_claude_executable() {
 }
 
 #[test]
+fn workspace_owner_identity_is_stamped_after_untrusted_values() {
+    let owner_hex = "ab".repeat(32);
+    let mut command = std::process::Command::new("buzz-acp");
+    command.env("BUZZ_WORKSPACE_OWNER_PUBKEY", "agent-supplied");
+    super::apply_workspace_owner_identity_env(&mut command, Some(&owner_hex));
+    let stamped = command
+        .get_envs()
+        .find(|(key, _)| *key == "BUZZ_WORKSPACE_OWNER_PUBKEY")
+        .and_then(|(_, value)| value)
+        .expect("workspace owner is stamped");
+    assert_eq!(stamped.to_string_lossy(), owner_hex);
+
+    super::apply_workspace_owner_identity_env(&mut command, None);
+    let removed = command
+        .get_envs()
+        .find(|(key, _)| *key == "BUZZ_WORKSPACE_OWNER_PUBKEY")
+        .is_some_and(|(_, value)| value.is_none());
+    assert!(removed, "missing owner must clear inherited identity");
+}
+
+#[test]
 fn custom_acp_command_keeps_relay_git_credentials() {
     let helper = std::path::Path::new("/opt/buzz/git-credential-nostr");
     let mut custom = std::process::Command::new("custom-acp");
@@ -903,7 +924,38 @@ fn receipt_fixture(
         pid: std::process::id(),
         desktop_instance_id: "test-instance".into(),
         started_at: "now".into(),
+        start_nonce: Some("a".repeat(32)),
     }
+}
+
+#[test]
+fn receipt_validation_rejects_malformed_generation_nonce() {
+    let mut receipt = receipt_fixture(
+        crate::managed_agents::ManagedAgentRuntimeKey::new("aa".repeat(32), "wss://relay.example")
+            .unwrap(),
+    );
+    receipt.start_nonce = Some("not-a-generation".into());
+    let path = std::path::PathBuf::from(format!("{}.json", receipt.key.runtime_id()));
+    assert!(!super::valid_agent_runtime_receipt_with(
+        &path,
+        &receipt,
+        "test-instance",
+        |_| true,
+        |_, _| true,
+    ));
+}
+
+#[test]
+fn legacy_runtime_receipts_deserialize_without_generation_nonce() {
+    let receipt = receipt_fixture(
+        crate::managed_agents::ManagedAgentRuntimeKey::new("aa".repeat(32), "wss://relay.example")
+            .unwrap(),
+    );
+    let mut legacy = serde_json::to_value(receipt).unwrap();
+    legacy.as_object_mut().unwrap().remove("startNonce");
+    let decoded: crate::managed_agents::ManagedAgentRuntimeReceipt =
+        serde_json::from_value(legacy).unwrap();
+    assert_eq!(decoded.start_nonce, None);
 }
 
 #[test]
@@ -1273,7 +1325,8 @@ fn make_pair_runtime_placeholder() -> crate::managed_agents::ManagedAgentPairRun
             "wss://relay.example",
             &Default::default(),
             false,
-        ),
+        )
+        .expect("prospective prompt profile resolution succeeds"),
         setup_mode: false,
         adapter_availability: None,
         start_nonce: "test-nonce".to_string(),

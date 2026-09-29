@@ -6,6 +6,7 @@ import { useAppNavigation } from "@/app/navigation/useAppNavigation";
 import { useChannelsQuery } from "@/features/channels/hooks";
 import { ChannelScreenLoadingFallback } from "@/features/channels/ui/ChannelScreenLoadingFallback";
 import { useProfileQuery } from "@/features/profile/hooks";
+import { useCommunities } from "@/features/communities/useCommunities";
 import type { Project } from "@/features/projects/hooks";
 import {
   isProjectHomeWorkspaceSheetTab,
@@ -102,6 +103,7 @@ export function ProjectChannelHome({
   const { goChannel, goProject, goProjects } = useAppNavigation();
   const sidebar = useOptionalSidebar();
   const identityQuery = useIdentityQuery();
+  const { activeCommunity } = useCommunities();
   const profileQuery = useProfileQuery();
   const channelsQuery = useChannelsQuery();
   const search = useSearch({ strict: false }) as {
@@ -424,9 +426,16 @@ export function ProjectChannelHome({
                 channel={homeChannel}
                 channels={channelsQuery.data ?? []}
                 identityPubkey={identityQuery.data?.pubkey}
+                relayUrl={activeCommunity?.relayUrl ?? ""}
                 onAddRepository={handleAddFiles}
                 onOpenChannel={(channelId) => {
                   void goChannel(channelId);
+                }}
+                onOpenThread={(channelId, rootEventId) => {
+                  void goChannel(channelId, {
+                    messageId: rootEventId,
+                    threadRootId: rootEventId,
+                  });
                 }}
                 onOpenRepository={handleOpenRepository}
                 onOpenWorkspace={handleOpenWorkspace}

@@ -67,6 +67,14 @@ export type AgentConfigFieldDescriptor =
       value: string | null;
     }
   | {
+      kind: "summaryModel";
+      optionSource: "acpModels";
+      currentPersistence: EnvVarPersistence;
+      targetApplication: EnvVarPersistence;
+      render: "control";
+      value: string | null;
+    }
+  | {
       kind: "effort";
       optionSource:
         | "buzzAgentCatalog"
@@ -83,7 +91,11 @@ export type AgentConfigFieldDescriptor =
       value: string | null;
     }
   | {
-      kind: "maxOutputTokens" | "contextLimit" | "maxRounds";
+      kind:
+        | "maxOutputTokens"
+        | "contextLimit"
+        | "maxRounds"
+        | "summaryMaxOutputTokens";
       currentPersistence: EnvVarPersistence;
       targetApplication: { kind: "envVar"; key: string };
       render: "control";
@@ -96,15 +108,20 @@ export type AgentConfigOmission = {
 };
 
 /**
- * A numeric tuning descriptor: one of the three env-var-backed number fields
- * (max output tokens, context limit, max rounds).
+ * A numeric tuning descriptor: one of the runtime-catalog-backed number fields.
  *
  * Defined here so both the field model derivation and the rendering surfaces
  * share a single type — avoids the type being redefined in UI layers.
  */
 export type NumericDescriptor = Extract<
   AgentConfigFieldDescriptor,
-  { kind: "maxOutputTokens" | "contextLimit" | "maxRounds" }
+  {
+    kind:
+      | "maxOutputTokens"
+      | "contextLimit"
+      | "maxRounds"
+      | "summaryMaxOutputTokens";
+  }
 >;
 
 export type AgentConfigFieldModel = {
@@ -159,6 +176,21 @@ export function deriveNumericDescriptors(
       value: null,
     });
   }
+  if (runtime.summaryMaxTokensEnvVar) {
+    ds.push({
+      kind: "summaryMaxOutputTokens",
+      currentPersistence: {
+        kind: "envVar",
+        key: runtime.summaryMaxTokensEnvVar,
+      },
+      targetApplication: {
+        kind: "envVar",
+        key: runtime.summaryMaxTokensEnvVar,
+      },
+      render: "control",
+      value: null,
+    });
+  }
   return ds;
 }
 
@@ -202,6 +234,23 @@ export function deriveAgentConfigFieldModel({
     render: "control",
     value: config.model,
   });
+
+  if (runtime?.summaryModelEnvVar) {
+    fields.push({
+      kind: "summaryModel",
+      optionSource: "acpModels",
+      currentPersistence: {
+        kind: "envVar",
+        key: runtime.summaryModelEnvVar,
+      },
+      targetApplication: {
+        kind: "envVar",
+        key: runtime.summaryModelEnvVar,
+      },
+      render: "control",
+      value: valueFromEnv(config, runtime.summaryModelEnvVar),
+    });
+  }
 
   if (runtime?.thinkingEnvVar) {
     // targetApplication is always the runtime's native key — how the harness
@@ -316,9 +365,15 @@ export function structuredEnvKeys(
     if (d.kind === "effort" && d.currentPersistence.kind === "envVar") {
       keys.push(d.currentPersistence.key);
     } else if (
+      d.kind === "summaryModel" &&
+      d.currentPersistence.kind === "envVar"
+    ) {
+      keys.push(d.currentPersistence.key);
+    } else if (
       d.kind === "maxOutputTokens" ||
       d.kind === "contextLimit" ||
-      d.kind === "maxRounds"
+      d.kind === "maxRounds" ||
+      d.kind === "summaryMaxOutputTokens"
     ) {
       keys.push(d.currentPersistence.key);
     }

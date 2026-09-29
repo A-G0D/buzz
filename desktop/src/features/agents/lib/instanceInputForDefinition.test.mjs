@@ -160,6 +160,32 @@ test("mapping carries the runtime and definition fields", async () => {
   assert.deepEqual(input.backend, { type: "local" });
 });
 
+test("selected archetype is carried only on the local managed-instance input", async () => {
+  const source = persona();
+  const local = await buildInstanceInputForDefinition(
+    source,
+    gooseRuntime,
+    undefined,
+    undefined,
+    "critic",
+  );
+  assert.equal(local.executionProfileId, "critic");
+  assert.equal(source.systemPrompt, "prompt", "shared persona stays unchanged");
+
+  const remote = await buildInstanceInputForDefinition(
+    source,
+    gooseRuntime,
+    undefined,
+    { type: "provider", id: "remote", config: {} },
+    "critic",
+  );
+  assert.equal(
+    "executionProfileId" in remote,
+    false,
+    "ACP archetypes must not be claimed by an unsupported remote backend",
+  );
+});
+
 test("no backend intent is byte-identical to the pre-intent mapping", async () => {
   // The 3 pre-B5 call sites (useManagedAgentActions, usePersonaActions,
   // UserProfilePanel) pass no intent; their output must not move.

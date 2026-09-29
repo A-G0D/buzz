@@ -30,6 +30,13 @@ pub(crate) const SESSION_TITLE_ENV_VAR: &str = "BUZZ_ACP_SESSION_TITLE";
 /// Stable agent display name forwarded to the ACP tool surface for git
 /// attribution and private-conversation provenance.
 pub(crate) const DISPLAY_NAME_ENV_VAR: &str = "BUZZ_ACP_DISPLAY_NAME";
+/// Review-only mode may be enabled only by the local critic-run launcher.
+pub(crate) const REVIEW_ONLY_ENV_VAR: &str = "BUZZ_AGENT_REVIEW_ONLY";
+
+/// Clear inherited review-only mode from ordinary managed-agent launches.
+pub(crate) fn clear_review_only_env(command: &mut std::process::Command) {
+    command.env_remove(REVIEW_ONLY_ENV_VAR);
+}
 
 /// Apply the shared stable agent name to both session display metadata and
 /// git attribution, clearing both keys when no usable name is available.
@@ -121,7 +128,10 @@ pub(crate) fn child_rust_log_filter() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_replay_floor_env, resolve_session_title, REPLAY_FLOOR_ENV_VAR};
+    use super::{
+        apply_replay_floor_env, clear_review_only_env, resolve_session_title,
+        REPLAY_FLOOR_ENV_VAR, REVIEW_ONLY_ENV_VAR,
+    };
 
     fn replay_floor_of(cmd: &std::process::Command) -> Option<String> {
         cmd.get_envs()
@@ -146,6 +156,22 @@ mod tests {
             replay_floor_of(&cmd).as_deref(),
             Some("1756600000"),
             "this send's floor must win over the user-supplied value"
+        );
+    }
+
+    #[test]
+    fn ordinary_agent_spawn_clears_ambient_review_only_flag() {
+        let mut cmd = std::process::Command::new("true");
+        cmd.env(REVIEW_ONLY_ENV_VAR, "1");
+
+        clear_review_only_env(&mut cmd);
+
+        assert_eq!(
+            cmd.get_envs()
+                .find(|(key, _)| *key == std::ffi::OsStr::new(REVIEW_ONLY_ENV_VAR))
+                .map(|(_, value)| value),
+            Some(None),
+            "ordinary managed agents must not inherit the critic-only switch"
         );
     }
 

@@ -18,6 +18,7 @@ pub mod projects;
 pub mod reactions;
 mod repo_default_branch;
 pub mod repos;
+pub mod runs;
 pub mod social;
 pub mod upload;
 pub mod users;

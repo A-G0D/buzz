@@ -181,6 +181,7 @@ impl AgentDefinition {
             definition_parallelism: self.parallelism,
             relay_mesh: None,
             effort_level: None,
+            execution_profile: None,
         }
     }
 }
@@ -243,6 +244,25 @@ pub struct RelayAgentInfo {
     #[serde(default)]
     pub respond_to_allowlist: Vec<String>,
 }
+
+/// Local, immutable-at-create execution guidance. This belongs to one managed
+/// instance and is never included in the shared persona event or content hash.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentExecutionProfileSnapshot {
+    pub id: String,
+    pub version: u32,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_addendum: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallelism: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_timeout_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_turn_duration_seconds: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ManagedAgentRecord {
     pub pubkey: String,
@@ -497,6 +517,11 @@ pub struct ManagedAgentRecord {
     /// switches (invalid values skip-as-absent at projection time).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort_level: Option<String>,
+    /// Create-time snapshot of local execution archetype behavior. Applied to
+    /// this instance only; it cannot change shared persona configuration or
+    /// grant permissions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_profile: Option<AgentExecutionProfileSnapshot>,
 }
 
 #[derive(Debug)]
@@ -609,6 +634,8 @@ pub struct ManagedAgentSummary {
     pub log_path: String,
     pub respond_to: RespondTo,
     pub respond_to_allowlist: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution_profile: Option<AgentExecutionProfileSnapshot>,
 }
 
 #[derive(Debug, Serialize)]
@@ -700,6 +727,10 @@ pub struct AcpRuntimeCatalogEntry {
     pub max_tokens_env_var: Option<String>,
     pub context_limit_env_var: Option<String>,
     pub max_rounds_env_var: Option<String>,
+    /// Environment variable for Buzz Agent's optional status-summary model.
+    pub summary_model_env_var: Option<String>,
+    /// Environment variable for the status-summary output-token limit.
+    pub summary_max_tokens_env_var: Option<String>,
     pub install_hint: String,
     pub install_instructions_url: String,
     /// true when at least one automated install step is available

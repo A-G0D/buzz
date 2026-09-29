@@ -40,6 +40,7 @@ import {
 } from "@/features/agents/ui/AgentConfigFields";
 import { cn } from "@/shared/lib/cn";
 import { Button } from "@/shared/ui/button";
+import { GlobalAgentResourcePolicyEditor } from "@/features/agents/ui/GlobalAgentResourcePolicyEditor";
 
 type SaveState = "idle" | "saving" | "saved" | "error";
 
@@ -364,6 +365,7 @@ export function AgentDefaultsEditor({
           </div>
         </div>
       )}
+      {!flatLayout ? <GlobalAgentResourcePolicyEditor /> : null}
     </div>
   );
 }

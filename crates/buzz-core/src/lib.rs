@@ -36,10 +36,14 @@ pub mod pairing;
 pub mod presence;
 /// NIP-PMA owner-encrypted private managed-agent wire codec.
 pub mod private_managed_agent;
+/// Authoritative NIP-MP project-home resolution from relay events.
+pub mod project_home;
 /// Canonical relay runtime identities.
 pub mod relay;
 /// Tenant identity — the server-resolved community key carried on scoped paths.
 pub mod tenant;
+/// Source-linked deterministic message-thread brief projection and read kinds.
+pub mod thread_brief;
 /// NIP-CW thread-mode normalized newest-first window contract.
 pub mod thread_window;
 /// Schnorr signature and event ID verification.

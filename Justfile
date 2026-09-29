@@ -363,6 +363,10 @@ test-unit:
     #!/usr/bin/env bash
     set -euo pipefail
     ./scripts/test-ensure-local-relay-key.sh
+    # This ignored cross-process bridge test needs the sibling executable.
+    # Keep it explicit in the unit lane, independent of nextest availability.
+    cargo build -p buzz-agent --bin buzz-agent
+    cargo test -p buzz-acp --lib acp::tests::production_route_journal_bridge_accepts_real_buzz_agent_channel_turn -- --ignored --exact --nocapture
     if command -v cargo-nextest &>/dev/null; then
         cargo nextest run -p buzz-core -p buzz-auth --lib
         cargo nextest run -p buzz-audit --lib

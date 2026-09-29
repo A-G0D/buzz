@@ -1,6 +1,8 @@
 pub(crate) mod access_policy;
 mod agent_env;
 pub(crate) mod agent_events;
+pub(crate) mod agent_prompt_profile;
+pub(crate) mod agent_route_profile;
 pub(crate) mod agent_snapshot;
 pub(crate) mod agent_snapshot_envelope;
 pub(crate) mod team_snapshot;
@@ -19,8 +21,10 @@ mod definition_validation;
 mod discovery;
 pub(crate) mod effective_config;
 mod env_vars;
+pub(crate) mod execution_profile;
 pub(crate) mod git_bash;
 pub(crate) mod global_config;
+pub(crate) mod global_resource_policy;
 mod managed_node_paths;
 mod nest;
 pub(crate) mod parallelism;
@@ -42,6 +46,7 @@ mod session_policy;
 pub(crate) mod snapshot_avatar;
 pub(crate) mod spawn_snapshot;
 pub(crate) mod storage;
+pub(crate) use storage::active_managed_agent_pubkeys;
 pub(crate) mod team_catalog;
 pub(crate) mod team_events;
 mod team_repair;
@@ -85,6 +90,12 @@ pub(crate) use git_bash::{discover_git_bash, GitBashPrerequisite};
 pub(crate) use global_config::{
     load_global_agent_config, resolve_effective_model_provider, save_global_agent_config,
     validate_global_config, GlobalAgentConfig,
+};
+pub(crate) use global_resource_policy::{
+    device_memory_snapshot, load_global_agent_resource_policy, reserve_critic_worker_processes,
+    reserve_managed_agent_start, save_global_agent_resource_policy,
+    validate_global_agent_resource_policy, with_memory_admission, DeviceMemorySnapshot,
+    GlobalAgentResourcePolicy, ManagedAgentStartReservation,
 };
 pub(crate) use managed_node_paths::*;
 pub use nest::*;

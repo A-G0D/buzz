@@ -6,6 +6,8 @@ import {
   eventToProjectIssue,
   getAllTags,
   getTag,
+  projectIssueHierarchy,
+  projectIssueContentWithAcceptanceCriteria,
   ISSUE_ASSIGNMENT_LABEL,
   ISSUE_UNASSIGNMENT_LABEL,
   nextProjectIssueCommentCreatedAt,
@@ -431,6 +433,191 @@ test("builds repository-scoped issue creation tags", () => {
       ["p", OWNER],
       ["subject", "Fix the broken workflow"],
     ],
+  );
+});
+
+test("stores acceptance criteria as a clear section in issue content", () => {
+  assert.equal(
+    projectIssueContentWithAcceptanceCriteria(
+      "  Add context.  ",
+      "  The exact result appears.  ",
+    ),
+    "Add context.\n\nAcceptance criteria:\nThe exact result appears.",
+  );
+  assert.equal(
+    projectIssueContentWithAcceptanceCriteria("  Add context.  ", "  "),
+    "Add context.",
+  );
+  assert.equal(
+    projectIssueContentWithAcceptanceCriteria(
+      "  ",
+      "  It still has a criterion.  ",
+    ),
+    "Acceptance criteria:\nIt still has a criterion.",
+  );
+});
+
+test("builds and reduces epic-to-subtask relationships within one repository", () => {
+  const epicId = "1".repeat(64);
+  const childId = "2".repeat(64);
+  const epic = eventToProjectIssue(
+    issueEvent({
+      id: epicId,
+      tags: [
+        ["a", REPO_ADDRESS],
+        ["subject", "Release the agent workspace"],
+        ["t", "epic"],
+      ],
+    }),
+  );
+  const child = eventToProjectIssue(
+    issueEvent({
+      id: childId,
+      tags: [
+        ["a", REPO_ADDRESS],
+        ["subject", "Build route test"],
+        ["parent", epicId],
+      ],
+    }),
+  );
+  const tags = buildGitIssueTags({
+    parentIssueId: epicId.toUpperCase(),
+    repoAddress: REPO_ADDRESS,
+    repoOwner: OWNER,
+    title: "Build route test",
+  });
+
+  assert.deepEqual(tags.at(-1), ["parent", epicId]);
+  assert.equal(child.parentIssueId, epicId);
+  const hierarchy = projectIssueHierarchy([child, epic]);
+  assert.equal(hierarchy.parentByChildId.get(childId), epicId);
+  assert.deepEqual(
+    hierarchy.childrenByParentId.get(epicId).map((issue) => issue.id),
+    [childId],
+  );
+  assert.equal(hierarchy.invalidParentByIssueId.size, 0);
+});
+
+test("keeps dangling, cross-repository, nested, and cyclic parents visible at root", () => {
+  const epicId = "1".repeat(64);
+  const childId = "2".repeat(64);
+  const nestedId = "3".repeat(64);
+  const epic = eventToProjectIssue(
+    issueEvent({
+      id: epicId,
+      tags: [
+        ["a", REPO_ADDRESS],
+        ["t", "epic"],
+      ],
+    }),
+  );
+  const child = eventToProjectIssue(
+    issueEvent({
+      id: childId,
+      tags: [
+        ["a", REPO_ADDRESS],
+        ["parent", epicId],
+      ],
+    }),
+  );
+  const nestedEpic = eventToProjectIssue(
+    issueEvent({
+      id: nestedId,
+      tags: [
+        ["a", REPO_ADDRESS],
+        ["t", "epic"],
+        ["parent", childId],
+      ],
+    }),
+  );
+  const crossRepo = eventToProjectIssue(
+    issueEvent({
+      id: "4".repeat(64),
+      tags: [
+        ["a", `30617:${OWNER}:elsewhere`],
+        ["parent", epicId],
+      ],
+    }),
+  );
+  const missing = eventToProjectIssue(
+    issueEvent({
+      id: "5".repeat(64),
+      tags: [
+        ["a", REPO_ADDRESS],
+        ["parent", "6".repeat(64)],
+      ],
+    }),
+  );
+  const selfId = "7".repeat(64);
+  const selfParent = eventToProjectIssue(
+    issueEvent({
+      id: selfId,
+      tags: [
+        ["a", REPO_ADDRESS],
+        ["parent", selfId],
+      ],
+    }),
+  );
+  const cycleAId = "8".repeat(64);
+  const cycleBId = "9".repeat(64);
+  const cycleA = eventToProjectIssue(
+    issueEvent({
+      id: cycleAId,
+      tags: [
+        ["a", REPO_ADDRESS],
+        ["t", "epic"],
+        ["parent", cycleBId],
+      ],
+    }),
+  );
+  const cycleB = eventToProjectIssue(
+    issueEvent({
+      id: cycleBId,
+      tags: [
+        ["a", REPO_ADDRESS],
+        ["t", "epic"],
+        ["parent", cycleAId],
+      ],
+    }),
+  );
+  const hierarchy = projectIssueHierarchy([
+    epic,
+    child,
+    nestedEpic,
+    crossRepo,
+    missing,
+    selfParent,
+    cycleA,
+    cycleB,
+  ]);
+
+  assert.equal(hierarchy.parentByChildId.get(childId), epicId);
+  assert.equal(hierarchy.invalidParentByIssueId.get(nestedId), "not-root-epic");
+  assert.equal(
+    hierarchy.invalidParentByIssueId.get(crossRepo.id),
+    "different-repository",
+  );
+  assert.equal(hierarchy.invalidParentByIssueId.get(missing.id), "missing");
+  assert.equal(hierarchy.invalidParentByIssueId.get(selfId), "self");
+  assert.equal(hierarchy.invalidParentByIssueId.get(cycleAId), "not-root-epic");
+  assert.equal(hierarchy.invalidParentByIssueId.get(cycleBId), "not-root-epic");
+  assert.equal(hierarchy.parentByChildId.has(nestedId), false);
+  assert.equal(hierarchy.parentByChildId.has(crossRepo.id), false);
+  assert.equal(hierarchy.parentByChildId.has(selfId), false);
+  assert.equal(hierarchy.parentByChildId.has(cycleAId), false);
+  assert.equal(hierarchy.parentByChildId.has(cycleBId), false);
+});
+
+test("rejects malformed epic parent references before event signing", () => {
+  assert.throws(
+    () =>
+      buildGitIssueTags({
+        parentIssueId: "not-an-event-id",
+        repoAddress: REPO_ADDRESS,
+        repoOwner: OWNER,
+        title: "Build route test",
+      }),
+    /Parent task ID must be 64 hex characters/,
   );
 });
 

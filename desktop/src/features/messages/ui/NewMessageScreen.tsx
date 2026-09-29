@@ -245,6 +245,12 @@ export function NewMessageScreen() {
       mentionPubkeys: string[],
       mediaTags?: string[][],
       targetChannelId?: string | null,
+      _threadContext?: {
+        parentEventId: string | null;
+        threadHeadId: string | null;
+      } | null,
+      _forceRest?: boolean,
+      taskClass?: string | null,
     ) => {
       const preparedDirectMessage = preparedDirectMessageRef.current;
       const directMessage =
@@ -268,6 +274,7 @@ export function NewMessageScreen() {
           // the entire navigation on a WebSocket OK frame that staging may
           // never deliver.
           transport: "http",
+          taskClass,
         });
       } catch (error) {
         preparedDirectMessageRef.current = null;
@@ -620,6 +627,7 @@ export function NewMessageScreen() {
         onSend={sendFirstMessage}
         placeholder={composerPlaceholder}
         showBackgroundUploadProgress
+        showTaskClassPicker
       />
       <div aria-hidden="true" className="min-h-8 bg-background px-5 pb-1.5" />
     </div>

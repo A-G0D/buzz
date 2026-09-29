@@ -132,6 +132,7 @@ export type ChannelPaneProps = {
       threadHeadId: string | null;
     } | null,
     forceRest?: boolean,
+    taskClass?: string | null,
   ) => Promise<void>;
   onSendToChannel: (
     message: TimelineMessage,
@@ -154,6 +155,8 @@ export type ChannelPaneProps = {
       parentEventId: string | null;
       threadHeadId: string | null;
     } | null,
+    forceRest?: boolean,
+    taskClass?: string | null,
   ) => Promise<void>;
   onTargetReached?: (messageId: string) => void;
   onToggleReaction?: (

@@ -580,6 +580,7 @@ export function useMentionSendFlow({
             sendChannelId,
             draft.capturedThreadContext,
             draft.preparedLinkPreviews != null,
+            draft.taskClass,
           );
           // The relay accepted the publish: flush the queued wakes now,
           // before the post-send cancellation check — a cancellation racing
@@ -733,6 +734,7 @@ export function useMentionSendFlow({
       preparedLinkPreviews = null,
       sentDraftKey,
       recoveryDraftKey,
+      taskClass = null,
       spoileredAttachmentUrls = new Set(),
       trimmed,
     }: SendMessageWithMentionFlowInput) => {
@@ -874,6 +876,7 @@ export function useMentionSendFlow({
           capturedChannelId: effectiveChannelId,
           capturedThreadContext,
           trimmed,
+          taskClass,
           mentionPubkeys: pubkeys,
           nonMemberPubkeys: promptNonMemberPubkeys,
           outgoingTags,
@@ -968,6 +971,7 @@ export function useMentionSendFlow({
     setNonMemberPromptError(null);
   }, [invitation.cancel]);
   return {
+    clearComposer,
     // Agent starts are detached (publish-first), so useDetachedAgentStart's
     // in-flight state deliberately does not gate the composer — a background
     // start must not block the next send.

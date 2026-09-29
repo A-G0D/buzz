@@ -1,4 +1,43 @@
 use super::*;
+
+#[test]
+fn deepseek_model_discovery_uses_configured_dynamic_models_endpoint() {
+    let env = BTreeMap::from([(
+        "DEEPSEEK_BASE_URL".to_string(),
+        "https://proxy.example/v1/".to_string(),
+    )]);
+    assert_eq!(deepseek_models_url(&env), "https://proxy.example/v1/models");
+    assert_eq!(
+        deepseek_models_url(&BTreeMap::new()),
+        "https://api.deepseek.com/models"
+    );
+}
+
+#[test]
+fn deepseek_model_normalization_keeps_provider_model_ids() {
+    let models = normalize_openai_compatible_models(
+        OpenAiModelListResponse {
+            data: vec![
+                OpenAiModelListItem {
+                    id: "deepseek-chat".into(),
+                    created: None,
+                },
+                OpenAiModelListItem {
+                    id: "deepseek-reasoner".into(),
+                    created: None,
+                },
+            ],
+        },
+        Some("deepseek"),
+    );
+    assert_eq!(
+        models
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["deepseek-chat", "deepseek-reasoner"]
+    );
+}
 #[test]
 fn access_policy_change_requires_runtime_refresh_for_effective_gate_changes() {
     use crate::managed_agents::RespondTo;

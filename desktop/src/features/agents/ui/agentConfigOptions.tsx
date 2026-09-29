@@ -46,6 +46,7 @@ const KNOWN_LLM_PROVIDER_IDS = [
   "anthropic",
   "databricks",
   "databricks_v2",
+  "deepseek",
   "openai",
   "openai-compat",
   "openrouter",
@@ -135,6 +136,11 @@ const PROVIDER_CREDENTIAL_CONFIG: Partial<
     secretEnvVar: "OPENROUTER_API_KEY",
     apiKeyLabel: "OpenRouter API Key",
   },
+  deepseek: {
+    requiredEnvKeys: ["DEEPSEEK_API_KEY"],
+    secretEnvVar: "DEEPSEEK_API_KEY",
+    apiKeyLabel: "DeepSeek API Key",
+  },
 };
 
 const DEFAULT_MODEL_OPTION: PersonaModelOption = {
@@ -146,6 +152,7 @@ export const PERSONA_LLM_PROVIDER_OPTIONS: readonly PersonaModelOption[] = [
   { id: "anthropic", label: "Anthropic" },
   { id: "openai", label: "OpenAI" },
   { id: "openai-compat", label: "OpenAI-compatible" },
+  { id: "deepseek", label: "DeepSeek" },
   { id: "openrouter", label: "OpenRouter" },
   { id: "relay-mesh", label: "Buzz shared compute" },
   { id: "databricks", label: "Databricks" },

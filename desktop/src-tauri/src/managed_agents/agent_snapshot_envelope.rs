@@ -426,6 +426,7 @@ mod tests {
             persona_source_version: None,
             provider: None,
             team_catalog_source: None,
+            execution_profile: None,
         }
     }
 

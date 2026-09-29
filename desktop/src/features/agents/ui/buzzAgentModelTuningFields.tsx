@@ -230,6 +230,7 @@ const NUMERIC_KIND_LABELS: Record<NumericDescriptor["kind"], string> = {
   maxOutputTokens: "Max output tokens",
   contextLimit: "Context limit",
   maxRounds: "Max rounds",
+  summaryMaxOutputTokens: "Status summary output tokens",
 };
 
 const NUMERIC_KIND_DESCRIPTIONS: Record<NumericDescriptor["kind"], string> = {
@@ -239,12 +240,15 @@ const NUMERIC_KIND_DESCRIPTIONS: Record<NumericDescriptor["kind"], string> = {
     "Maximum context window tokens tracked before a handoff. Leave blank to inherit.",
   maxRounds:
     "Maximum LLM + tool-call rounds per turn. 0 = unlimited. Leave blank to inherit.",
+  summaryMaxOutputTokens:
+    "Maximum tokens generated for a status summary. Leave blank for the agent default (1200).",
 };
 
 const NUMERIC_KIND_TEST_IDS: Record<NumericDescriptor["kind"], string> = {
   maxOutputTokens: "numeric-max-output-tokens-input",
   contextLimit: "numeric-context-limit-input",
   maxRounds: "numeric-max-rounds-input",
+  summaryMaxOutputTokens: "numeric-summary-max-output-tokens-input",
 };
 
 /**
@@ -258,7 +262,28 @@ export const NUMERIC_KIND_MIN: Record<NumericDescriptor["kind"], number> = {
   maxOutputTokens: 1,
   contextLimit: 1,
   maxRounds: 0,
+  summaryMaxOutputTokens: 1,
 };
+
+/** Input maximums declared by the corresponding runtime configuration parser. */
+export const NUMERIC_KIND_MAX: Partial<
+  Record<NumericDescriptor["kind"], number>
+> = {
+  summaryMaxOutputTokens: 4096,
+};
+
+export function isNumericTuningValueValid(
+  kind: NumericDescriptor["kind"],
+  rawValue: string,
+): boolean {
+  if (rawValue.trim() === "") return true;
+  const value = Number(rawValue);
+  return (
+    Number.isInteger(value) &&
+    value >= NUMERIC_KIND_MIN[kind] &&
+    (NUMERIC_KIND_MAX[kind] === undefined || value <= NUMERIC_KIND_MAX[kind])
+  );
+}
 
 /**
  * Descriptor-driven numeric tuning inputs.
@@ -291,27 +316,33 @@ export function NumericTuningFields({
         const description = NUMERIC_KIND_DESCRIPTIONS[d.kind];
         const testId = NUMERIC_KIND_TEST_IDS[d.kind];
         const inheritedVal = inheritedEnvVars[key];
+        const rawValue = envVars[key] ?? "";
+        const isValid = isNumericTuningValueValid(d.kind, rawValue);
         return (
           <div className="space-y-1.5" key={key}>
             <label className="text-sm font-medium" htmlFor={testId}>
               {label}
             </label>
             <Input
+              aria-invalid={!isValid}
               aria-describedby={`help-${testId}`}
               autoComplete="off"
               data-testid={testId}
               disabled={disabled}
               id={testId}
               inputMode="numeric"
+              max={NUMERIC_KIND_MAX[d.kind]}
               min={NUMERIC_KIND_MIN[d.kind]}
               onChange={(event) => onEnvVarChange(key, event.target.value)}
               placeholder={numericTuningPlaceholder(inheritedVal)}
               step="1"
               type="number"
-              value={envVars[key] ?? ""}
+              value={rawValue}
             />
             <p className="text-xs text-muted-foreground" id={`help-${testId}`}>
-              {description}
+              {isValid
+                ? description
+                : `Enter a whole number from ${NUMERIC_KIND_MIN[d.kind]} to ${NUMERIC_KIND_MAX[d.kind] ?? "the runtime limit"}.`}
             </p>
           </div>
         );

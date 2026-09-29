@@ -72,6 +72,8 @@ pub(crate) struct SpawnConfigInputs<'a> {
     pub system_prompt: Option<&'a str>,
     pub model: Option<&'a str>,
     pub provider: Option<&'a str>,
+    /// Versioned route profile pinned for this local Buzz Agent launch.
+    pub route_profile: Option<&'a super::agent_route_profile::AgentRouteProfileIdentity>,
     /// Compile-time distribution capability projected at this runtime boundary.
     /// The stored record remains portable; only effective spawned access is stamped.
     pub enforced_owner_only: bool,
@@ -115,6 +117,7 @@ pub(crate) struct SpawnConfigSnapshot {
     pub system_prompt: Option<String>,
     pub model: Option<String>,
     pub provider: Option<String>,
+    pub route_profile: Option<super::agent_route_profile::AgentRouteProfileIdentity>,
     /// `None` when a user env override shadows `BUZZ_ACP_SESSION_TITLE`: spawn
     /// writes the title BEFORE the user env layer, so the override is what
     /// actually runs and it already reaches this snapshot through `env`.
@@ -188,6 +191,7 @@ impl SpawnConfigSnapshot {
             system_prompt,
             model,
             provider,
+            route_profile,
             enforced_owner_only,
             session_policy,
         } = inputs;
@@ -222,6 +226,9 @@ impl SpawnConfigSnapshot {
                     !suppress
                         .iter()
                         .any(|suppressed| k.eq_ignore_ascii_case(suppressed))
+                        && !k.eq_ignore_ascii_case(
+                            super::agent_route_profile::ROUTE_PROFILE_ID_ENV,
+                        )
                 });
                 env
             },
@@ -230,6 +237,7 @@ impl SpawnConfigSnapshot {
             system_prompt: system_prompt.map(str::to_string),
             model: model.map(str::to_string),
             provider: provider.map(str::to_string),
+            route_profile: route_profile.cloned(),
             session_title: (!descriptor.env.contains_key(SESSION_TITLE_ENV_VAR))
                 .then(|| resolve_session_title(record.display_name.as_deref(), &record.name))
                 .flatten(),
@@ -287,9 +295,9 @@ impl std::fmt::Debug for SpawnConfigSnapshot {
 /// started right now under the current `personas`/`teams`/`global`, resolving
 /// a blank record relay against `workspace_relay`.
 ///
-/// Pure — no `AppHandle`, no disk, no keyring. This is the *prospective* side
-/// of the comparison; the stamped side is built at spawn from the values that
-/// actually fed the child's `Command`.
+/// No `AppHandle` or keyring. This is the *prospective* side of the comparison;
+/// it reads the local prompt-profile catalog in addition to the agent config.
+/// The stamped side is built at spawn from values that fed the child's `Command`.
 pub(crate) fn prospective_spawn_config_snapshot(
     record: &ManagedAgentRecord,
     personas: &[AgentDefinition],
@@ -297,7 +305,7 @@ pub(crate) fn prospective_spawn_config_snapshot(
     workspace_relay: &str,
     global: &GlobalAgentConfig,
     enforced_owner_only: bool,
-) -> SpawnConfigSnapshot {
+) -> Result<SpawnConfigSnapshot, String> {
     // Prospective re-snapshot: apply the same `apply_persona_snapshot` the
     // start/restore paths run right before spawning, so this describes what a
     // restart would actually run. Idempotent, so a spawn-time stamp taken
@@ -329,14 +337,44 @@ pub(crate) fn prospective_spawn_config_snapshot(
     // definition) resolves as if all three were absent: `spawn_agent_child`
     // refuses to spawn an orphan regardless, and `eligible_restart_diff`
     // suppresses the badge for one.
-    let (prompt, model, provider) = match resolve_effective_config(record, personas, global) {
+    let (base_prompt, model, provider) = match resolve_effective_config(record, personas, global) {
         EffectiveConfigResult::Resolved(cfg) => {
             (cfg.system_prompt.value, cfg.model.value, cfg.provider.value)
         }
         EffectiveConfigResult::OrphanedInstance { .. } => (None, None, None),
     };
+    let route_profile =
+        super::agent_route_profile::resolve_for_spawn(record, &descriptor.command)?;
+    let prompt_profile = if route_profile.is_some() {
+        None
+    } else {
+        super::agent_prompt_profile::resolve_for_spawn(
+            record,
+            &descriptor.command,
+            &descriptor.env,
+            model.as_deref(),
+        )?
+    };
+    let profile_base_prompt = if route_profile.is_some() {
+        super::config_bridge::effort::get_ci(&descriptor.env, "BUZZ_ACP_SYSTEM_PROMPT")
+            .map(String::as_str)
+            .or(base_prompt.as_deref())
+    } else {
+        prompt_profile
+            .as_ref()
+            .and_then(|resolved| resolved.profile.as_ref())
+            .and_then(|_| {
+                super::config_bridge::effort::get_ci(&descriptor.env, "BUZZ_ACP_SYSTEM_PROMPT")
+            })
+            .map(String::as_str)
+            .or(base_prompt.as_deref())
+    };
+    let prompt = super::agent_prompt_profile::compose_system_prompt(
+        profile_base_prompt,
+        prompt_profile.as_ref(),
+    );
 
-    SpawnConfigSnapshot::from_inputs(SpawnConfigInputs {
+    Ok(SpawnConfigSnapshot::from_inputs(SpawnConfigInputs {
         record,
         descriptor: &descriptor,
         // Resolved, not stored: every record spawns on the workspace relay
@@ -346,9 +384,10 @@ pub(crate) fn prospective_spawn_config_snapshot(
         system_prompt: prompt.as_deref(),
         model: model.as_deref(),
         provider: provider.as_deref(),
+        route_profile: route_profile.as_ref().map(|resolved| &resolved.identity),
         enforced_owner_only,
         session_policy: record.session_policy,
-    })
+    }))
 }
 
 #[cfg(test)]

@@ -13,14 +13,21 @@ mod llm;
 mod mcp;
 pub mod model_capabilities;
 mod permission;
+pub mod route_preview;
+pub mod task_fit_evidence;
 pub mod types;
 mod wire;
 
 pub use catalog::{
-    discover_databricks_models, discover_databricks_models_with_cache_dir, ModelEntry,
+    discover_databricks_models, discover_databricks_models_with_cache_dir,
+    discover_deepseek_models, ModelEntry,
 };
 pub use config::Provider;
 pub use types::AgentError;
+
+/// Hard output cap for the fixed, one-request provider connection probe.
+/// Reasoning models may spend tokens before emitting their final text.
+pub const SYNTHETIC_PROBE_MAX_OUTPUT_TOKENS: u32 = 256;
 
 /// Environment keys the Windows Git Bash resolver may inspect. `spawn_one()`
 /// forwards every key in this list into its otherwise-cleared MCP child; Doctor
@@ -45,11 +52,19 @@ use serde_json::{json, Value};
 use tokio::io::BufReader;
 use tokio::sync::{mpsc, watch, Mutex};
 
-use crate::agent::RunCtx;
-use crate::config::{Config, MAX_SYSTEM_PROMPT_BYTES, PROTOCOL_VERSION};
+use crate::agent::{RouteMeasurementIdentity, RunCtx};
+use crate::config::{Config, ThinkingEffort, MAX_SYSTEM_PROMPT_BYTES, PROTOCOL_VERSION};
 use crate::hints::SkillEntry;
 use crate::llm::Llm;
 use crate::mcp::McpRegistry;
+use crate::route_preview::{
+    select_profile_route_for_prompt_with_task_fit_evidence, BoundRouteSelection, Evidence,
+    EvidenceSource, RouteCandidate, RouteContextFitSummary, RouteCostBudget, RouteDecision,
+    RouteProfileDocument,
+};
+use crate::task_fit_evidence::{
+    TaskFitEvidenceSnapshot, TaskFitRouteProfileIdentity, TaskFitUnknownReason,
+};
 use crate::types::{ContentBlock, HistoryItem};
 use crate::wire::{
     classify, goose_session_update, Inbound, InitializeParams, SessionCancelParams,
@@ -57,9 +72,24 @@ use crate::wire::{
     WireSender, INVALID_PARAMS, METHOD_NOT_FOUND, PARSE_ERROR,
 };
 
+const CRITIC_ROUTE_COST_BUDGET_ENV: &str = "BUZZ_AGENT_ROUTE_COST_BUDGET_MICROUSD";
+
 struct App {
     cfg: Config,
     llm: Arc<Llm>,
+    /// When enabled by the trusted local launcher, this ACP process accepts
+    /// only one prompt per session and exposes no MCP, skill, or summarizer
+    /// tools. Critic rounds use this for text-only review of a frozen input.
+    review_only: bool,
+    /// Optional non-secret profile that selects one configured API route for
+    /// each ACP prompt. It is parsed once and bound to session prompts per run.
+    route_profile: Option<RouteProfileDocument>,
+    /// Verified local report reviews for the exact pinned task-fit route.
+    route_task_fit_evidence: Option<TaskFitEvidenceSnapshot>,
+    /// Local history is consulted only for profiles with an explicit
+    /// throughput policy. Failure leaves evidence unknown and the policy may
+    /// either abstain or use its explicit warm-up fallback.
+    route_journal: Option<buzz_run_journal::RunJournal>,
     sessions: Mutex<HashMap<String, Session>>,
     /// ACP protocol version negotiated at `initialize`, stored for the whole
     /// connection lifetime. The `session/request_permission` wire shape derives
@@ -88,6 +118,10 @@ struct Session {
     history: Vec<HistoryItem>,
     cancel_tx: watch::Sender<bool>,
     busy: bool,
+    prompt_count: u32,
+    /// Changes whenever prompt-relevant session state changes. Route preflight
+    /// snapshots this value and must match it before reserving the turn.
+    state_revision: u64,
     /// Run id of the in-flight prompt, set when a prompt starts and cleared
     /// when it ends. `None` means no active run — a steer request targeting
     /// this session is rejected. Steer-capable clients learn this value from
@@ -146,6 +180,213 @@ struct Session {
     accumulated_total_state: crate::types::TurnTotalState,
 }
 
+struct SessionPromptSnapshot {
+    state_revision: u64,
+    id: String,
+    mcp: Arc<McpRegistry>,
+    skills: Vec<SkillEntry>,
+    history: Vec<HistoryItem>,
+    original_task: Option<String>,
+    handoff_count: usize,
+    last_request_input_tokens: Option<u64>,
+    last_request_history_bytes: Option<usize>,
+    effective_system_prompt: Arc<str>,
+    effective_model_override: Option<String>,
+    usage_baseline: crate::types::SessionUsageBaseline,
+}
+
+struct ReservedSessionPrompt {
+    snapshot: SessionPromptSnapshot,
+    cancel_rx: watch::Receiver<bool>,
+    steer_rx: mpsc::UnboundedReceiver<Vec<ContentBlock>>,
+}
+
+fn route_provider_id(provider: Provider) -> &'static str {
+    match provider {
+        Provider::Anthropic => "anthropic",
+        Provider::OpenAi => "openai",
+        Provider::Databricks => "databricks",
+        Provider::DatabricksV2 => "databricks-v2",
+        Provider::OpenRouter => "openrouter",
+        Provider::DeepSeek => "deepseek",
+    }
+}
+
+fn route_thinking_effort(effort: Option<ThinkingEffort>) -> &'static str {
+    match effort {
+        None => "default",
+        Some(ThinkingEffort::None) => "none",
+        Some(ThinkingEffort::Minimal) => "minimal",
+        Some(ThinkingEffort::Low) => "low",
+        Some(ThinkingEffort::Medium) => "medium",
+        Some(ThinkingEffort::High) => "high",
+        Some(ThinkingEffort::XHigh) => "xhigh",
+        Some(ThinkingEffort::Max) => "max",
+    }
+}
+
+fn route_profile_identity(
+    profile: &RouteProfileDocument,
+) -> (Option<String>, Option<u32>, Option<String>) {
+    let id = profile.profile_id.clone();
+    let version = profile.profile_version;
+    let saved_hash = profile.profile_hash.clone();
+    let resolved_id = std::env::var("BUZZ_ACP_ROUTE_PROFILE_ID").ok();
+    let resolved_version = std::env::var("BUZZ_ACP_ROUTE_PROFILE_VERSION")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok());
+    let resolved_hash = std::env::var("BUZZ_ACP_ROUTE_PROFILE_HASH").ok();
+    if resolved_id == id
+        && resolved_version == version
+        && resolved_hash.as_deref().is_some_and(|hash| {
+            hash.len() == 64
+                && hash
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+    {
+        return (id, version, resolved_hash);
+    }
+    (id, version, saved_hash)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RouteProfileOverrideError {
+    ModelNotListed,
+    AmbiguousModel,
+}
+
+impl RouteProfileOverrideError {
+    const fn reason_code(self) -> &'static str {
+        match self {
+            Self::ModelNotListed => "manual_override_model_not_listed",
+            Self::AmbiguousModel => "manual_override_model_ambiguous",
+        }
+    }
+
+    const fn message(self) -> &'static str {
+        match self {
+            Self::ModelNotListed => {
+                "session model override is not listed in the active route profile"
+            }
+            Self::AmbiguousModel => {
+                "session model override matches multiple active route profile candidates"
+            }
+        }
+    }
+}
+
+fn route_profile_for_model_override(
+    profile: &RouteProfileDocument,
+    provider_id: &str,
+    model_id: &str,
+) -> Result<(RouteProfileDocument, String), RouteProfileOverrideError> {
+    let mut matching = profile
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.provider == provider_id && candidate.model == model_id);
+    let Some(candidate) = matching.next() else {
+        return Err(RouteProfileOverrideError::ModelNotListed);
+    };
+    if matching.next().is_some() {
+        return Err(RouteProfileOverrideError::AmbiguousModel);
+    }
+
+    let candidate_id = candidate.id.clone();
+    let mut constrained = profile.clone();
+    constrained
+        .candidates
+        .retain(|candidate| candidate.id == candidate_id);
+    constrained.preference_order = vec![candidate_id.clone()];
+    if constrained.prefer_fastest_measured {
+        // Explicit selection changes ranking, not eligibility. Keep the
+        // measured-throughput floor that fastest-measured routing implies.
+        constrained
+            .min_effective_output_tokens_per_second_milli
+            .get_or_insert(1);
+        constrained.prefer_fastest_measured = false;
+    }
+
+    Ok((constrained, candidate_id))
+}
+
+fn apply_critic_route_cost_budget_override(
+    profile: &mut Option<RouteProfileDocument>,
+    raw_budget: Option<&str>,
+    review_only: bool,
+) -> Result<(), String> {
+    let Some(raw_budget) = raw_budget else {
+        return Ok(());
+    };
+    if !review_only {
+        return Err(format!(
+            "{CRITIC_ROUTE_COST_BUDGET_ENV} is reserved for bounded critic reviews"
+        ));
+    }
+    let budget = raw_budget.parse::<u64>().map_err(|_| {
+        format!("{CRITIC_ROUTE_COST_BUDGET_ENV} must be an unsigned integer in micro-USD")
+    })?;
+    let profile = profile
+        .as_mut()
+        .ok_or_else(|| "critic route cost budget requires a resolved route profile".to_owned())?;
+    profile
+        .lower_max_turn_cost_ceiling(budget)
+        .map_err(|error| format!("invalid critic route cost budget: {error}"))
+}
+
+fn route_decision_notice(
+    session_id: &str,
+    attempt_id: &str,
+    profile: &RouteProfileDocument,
+    outcome: &str,
+    candidate: Option<&RouteCandidate>,
+    context_fit: Option<RouteContextFitSummary>,
+    reason_code: Option<&str>,
+) -> Value {
+    let (profile_id, profile_version, profile_hash) = route_profile_identity(profile);
+    let mut notice = json!({
+        "sessionId": session_id,
+        "attemptId": attempt_id,
+        "profileId": profile_id,
+        "profileVersion": profile_version,
+        "profileHash": profile_hash,
+        "outcome": outcome,
+        "candidateId": candidate.map(|candidate| candidate.id.as_str()),
+        "providerId": candidate.map(|candidate| route_provider_id(candidate.provider)),
+        "modelId": candidate.map(|candidate| candidate.model.as_str()),
+        "reasonCode": reason_code,
+    });
+    if let Some(context_fit) = context_fit {
+        notice["contextFit"] = json!(context_fit);
+    }
+    notice
+}
+
+fn route_abstention_reason(decision: &RouteDecision) -> &'static str {
+    let RouteDecision::Abstain { reason } = decision else {
+        return "route_abstained";
+    };
+    match reason.as_str() {
+        "safety refusal is terminal" => "safety_refusal",
+        "route configuration has both a single preference and a preference order"
+        | "route preference order contains a duplicate candidate ID" => {
+            "invalid_preference_configuration"
+        }
+        "preferred candidate is unknown" => "unknown_preference",
+        "preferred candidate is ineligible" => "ineligible_preference",
+        "no candidate satisfies the hard requirements" => "no_eligible_candidate",
+        "no candidate satisfies strict context fit" => "context_capacity_insufficient",
+        "strict context fit is unavailable" => "context_fit_unavailable",
+        "multiple candidates are eligible and no preference order was supplied" => {
+            "multiple_eligible_without_preference"
+        }
+        value if value.starts_with("route preference names unknown candidate ") => {
+            "unknown_preference"
+        }
+        _ => "route_abstained",
+    }
+}
+
 fn die(msg: String) -> ! {
     tracing::error!("{msg}");
     std::process::exit(2);
@@ -153,6 +394,12 @@ fn die(msg: String) -> ! {
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
+    if matches!(args.get(1).map(String::as_str), Some("synthetic-probe")) {
+        return tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?
+            .block_on(synthetic_probe_cli());
+    }
     if matches!(args.get(1).map(String::as_str), Some("auth")) {
         return tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -163,6 +410,81 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         .enable_all()
         .build()?
         .block_on(async_main());
+    Ok(())
+}
+
+async fn synthetic_probe_cli() -> Result<(), Box<dyn std::error::Error>> {
+    const SYSTEM: &str =
+        "You are checking a model connection. Do not use tools. Reply exactly with BUZZ_PROBE_OK.";
+    const USER: &str = "Reply exactly with BUZZ_PROBE_OK.";
+    let local = std::env::var("BUZZ_AGENT_PROBE_LOCAL").as_deref() == Ok("1");
+    let receipt = match Config::from_env() {
+        Err(_) => json!({
+            "status": "failed",
+            "provider": null,
+            "requestedModel": null,
+            "responseMarkerMatched": null,
+            "inputTokens": null,
+            "outputTokens": null,
+            "totalTokens": null,
+            "failureClass": "configuration_error"
+        }),
+        Ok(mut config) => {
+            config.system_prompt = SYSTEM.into();
+            config.max_output_tokens = SYNTHETIC_PROBE_MAX_OUTPUT_TOKENS;
+            config.max_token_recoveries = 0;
+            config.llm_timeout = std::time::Duration::from_secs(30);
+            let provider = match config.provider {
+                Provider::Anthropic => "anthropic",
+                Provider::OpenAi => "openai",
+                Provider::Databricks => "databricks",
+                Provider::DatabricksV2 => "databricks_v2",
+                Provider::OpenRouter => "openrouter",
+                Provider::DeepSeek => "deepseek",
+            };
+            let model = config.model.clone();
+            let result = if local && !crate::route_preview::is_loopback_endpoint(&config.base_url) {
+                Err("local_endpoint_required")
+            } else {
+                match Llm::new_for_synthetic_probe(&config) {
+                    Err(_) => Err("client_setup_error"),
+                    Ok(llm) => llm
+                        .complete(
+                            &config,
+                            SYSTEM,
+                            &[HistoryItem::User(USER.into())],
+                            &[],
+                            &config.model,
+                        )
+                        .await
+                        .map_err(|_| "provider_error"),
+                }
+            };
+            match result {
+                Err(failure_class) => json!({
+                    "status": "failed",
+                    "provider": provider,
+                    "requestedModel": model,
+                    "responseMarkerMatched": null,
+                    "inputTokens": null,
+                    "outputTokens": null,
+                    "totalTokens": null,
+                    "failureClass": failure_class
+                }),
+                Ok(response) => json!({
+                    "status": "responded",
+                    "provider": provider,
+                    "requestedModel": response.request_model.unwrap_or(model),
+                    "responseMarkerMatched": response.text.trim().contains("BUZZ_PROBE_OK"),
+                    "inputTokens": response.input_tokens,
+                    "outputTokens": response.output_tokens,
+                    "totalTokens": response.total_tokens,
+                    "failureClass": null
+                }),
+            }
+        }
+    };
+    println!("{}", serde_json::to_string(&receipt)?);
     Ok(())
 }
 
@@ -208,8 +530,118 @@ async fn async_main() {
         .with_writer(std::io::stderr)
         .with_ansi(false)
         .init();
-    let cfg = Config::from_env().unwrap_or_else(|e| die(e));
-    let llm = Arc::new(Llm::new(&cfg).unwrap_or_else(|e| die(e.to_string())));
+    let mut cfg = Config::from_env().unwrap_or_else(|e| die(e));
+    let review_only = match std::env::var("BUZZ_AGENT_REVIEW_ONLY") {
+        Ok(value) if value == "1" => true,
+        Ok(_) => die("config: BUZZ_AGENT_REVIEW_ONLY accepts only the value '1'".into()),
+        Err(std::env::VarError::NotPresent) => false,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            die("config: BUZZ_AGENT_REVIEW_ONLY must be UTF-8".into())
+        }
+    };
+    if review_only {
+        // A critic does not inherit skills or invoke the nested status model.
+        // Its only context is the explicit system and user text supplied by the
+        // trusted round coordinator.
+        cfg.summary_model = None;
+        cfg.hints_enabled = false;
+    }
+    let mut route_profile = match std::env::var("BUZZ_AGENT_ROUTE_PROFILE_JSON") {
+        Ok(raw) => Some(
+            RouteProfileDocument::parse(raw.as_bytes())
+                .unwrap_or_else(|error| die(format!("config: {error}"))),
+        ),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            die("config: BUZZ_AGENT_ROUTE_PROFILE_JSON must be UTF-8".into())
+        }
+    };
+    let route_cost_budget_override = match std::env::var(CRITIC_ROUTE_COST_BUDGET_ENV) {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => die(format!(
+            "config: {CRITIC_ROUTE_COST_BUDGET_ENV} must be UTF-8"
+        )),
+    };
+    apply_critic_route_cost_budget_override(
+        &mut route_profile,
+        route_cost_budget_override.as_deref(),
+        review_only,
+    )
+    .unwrap_or_else(|error| die(format!("config: {error}")));
+    if review_only
+        && route_profile.as_ref().is_some_and(|profile| {
+            profile.candidates.iter().any(|candidate| {
+                candidate.data_location != crate::route_preview::RouteProfileLocation::Local
+            })
+        })
+    {
+        die("config: review-only mode accepts only local route candidates".into());
+    }
+    if review_only && !crate::route_preview::is_loopback_endpoint(&cfg.base_url) {
+        die("config: review-only mode requires a loopback default model endpoint".into());
+    }
+    // Text supplied for a review may contain private project material. Require
+    // the default endpoint to be loopback and forbid redirects/proxy routing;
+    // route-profile candidates are separately constrained to local targets.
+    let llm = Arc::new(
+        if review_only {
+            Llm::new_for_route(&cfg, true)
+        } else {
+            Llm::new(&cfg)
+        }
+        .unwrap_or_else(|e| die(e.to_string())),
+    );
+    let route_task_fit_evidence = route_profile
+        .as_ref()
+        .filter(|profile| profile.uses_task_fit_routing())
+        .and_then(|profile| {
+            let (Some(profile_id), Some(profile_version), Some(profile_hash)) =
+                route_profile_identity(profile)
+            else {
+                tracing::warn!("task-fit route provenance is incomplete; routing will abstain");
+                return None;
+            };
+            let Ok(reviewer_public_key) =
+                std::env::var(crate::task_fit_evidence::TASK_FIT_REVIEW_PUBLIC_KEY_ENV)
+            else {
+                tracing::warn!("task-fit reviewer identity is unavailable; routing will abstain");
+                return None;
+            };
+            let Ok(nest_dir) = std::env::var("BUZZ_NEST_DIR") else {
+                tracing::warn!("task-fit evidence store path is unavailable; routing will abstain");
+                return None;
+            };
+            match TaskFitEvidenceSnapshot::load_local(
+                Path::new(&nest_dir),
+                TaskFitRouteProfileIdentity {
+                    profile_id,
+                    profile_version,
+                    profile_hash,
+                },
+                &reviewer_public_key,
+            ) {
+                Ok(snapshot) => Some(snapshot),
+                Err(error) => {
+                    tracing::warn!("task-fit evidence is unavailable: {error}");
+                    None
+                }
+            }
+        });
+    let route_journal = if route_profile
+        .as_ref()
+        .is_some_and(RouteProfileDocument::uses_throughput_routing)
+    {
+        match buzz_run_journal::RunJournal::open_default_scoped() {
+            Ok(journal) => Some(journal),
+            Err(error) => {
+                tracing::warn!("route throughput evidence is unavailable: {error}");
+                None
+            }
+        }
+    } else {
+        None
+    };
     let max_line = cfg.max_line_bytes;
     let permissions = Arc::new(permission::PermissionBroker::new(
         cfg.max_pending_permissions,
@@ -218,6 +650,10 @@ async fn async_main() {
     let app = Arc::new(App {
         cfg,
         llm,
+        review_only,
+        route_profile,
+        route_task_fit_evidence,
+        route_journal,
         sessions: Mutex::new(HashMap::new()),
         negotiated_version: AtomicU32::new(PROTOCOL_VERSION),
         permissions,
@@ -379,6 +815,14 @@ async fn initialize(app: &Arc<App>, id: Value, params: Value, wire_tx: &WireSend
                     "mcpCapabilities": { "http": false, "sse": false },
                 },
                 "agentInfo": { "name": "buzz-agent", "version": env!("CARGO_PKG_VERSION") },
+                "_meta": {
+                    "buzz": {
+                        "taskClass": {
+                            "version": 1,
+                            "required": app.route_profile.as_ref().is_some_and(|profile| profile.task_fit_policy.is_some()),
+                        }
+                    }
+                },
             }),
         ),
     )
@@ -429,6 +873,20 @@ fn discovery_error_fallback(cfg: &Config) -> Vec<ModelEntry> {
     }
 }
 
+fn deepseek_catalog_fallback(
+    model: &str,
+    error: AgentError,
+) -> Result<Vec<ModelEntry>, AgentError> {
+    if matches!(error, AgentError::LlmAuth(_)) {
+        return Err(error);
+    }
+    let model = model.trim().to_owned();
+    Ok(vec![ModelEntry {
+        id: model.clone(),
+        name: model,
+    }])
+}
+
 async fn session_new(app: &Arc<App>, id: Value, params: Value, wire_tx: &WireSender) {
     let p: SessionNewParams = match decode(params, "session/new") {
         Ok(p) => p,
@@ -440,6 +898,15 @@ async fn session_new(app: &Arc<App>, id: Value, params: Value, wire_tx: &WireSen
             id,
             INVALID_PARAMS,
             "session/new: cwd must be an absolute path",
+        )
+        .await;
+    }
+    if app.review_only && !p.mcp_servers.is_empty() {
+        return reject(
+            wire_tx,
+            id,
+            INVALID_PARAMS,
+            "session/new: review-only sessions cannot start MCP tools",
         )
         .await;
     }
@@ -456,7 +923,7 @@ async fn session_new(app: &Arc<App>, id: Value, params: Value, wire_tx: &WireSen
             .await;
         }
     }
-    let (hints_text, skills) = if app.cfg.hints_enabled {
+    let (hints_text, skills) = if app.cfg.hints_enabled && !app.review_only {
         hints::build_hints_section(std::path::Path::new(&p.cwd))
     } else {
         (String::new(), Vec::new())
@@ -532,6 +999,37 @@ async fn session_new(app: &Arc<App>, id: Value, params: Value, wire_tx: &WireSen
                     .map(|m| json!({ "modelId": m.id, "name": m.name }))
                     .collect()
             }
+            Provider::DeepSeek => {
+                match resolve_models_catalog(&app.models_cache, discover_deepseek_models(&app.cfg))
+                    .await
+                {
+                    Ok(models) => models
+                        .iter()
+                        .map(|m| json!({ "modelId": m.id, "name": m.name }))
+                        .collect(),
+                    Err(error) => {
+                        let models = match deepseek_catalog_fallback(&app.cfg.model, error) {
+                            Ok(models) => models,
+                            Err(error) => {
+                                return reject(
+                                    wire_tx,
+                                    id,
+                                    error.json_rpc_code(),
+                                    &error.to_string(),
+                                )
+                                .await;
+                            }
+                        };
+                        tracing::warn!(
+                            "DeepSeek model catalog unavailable; using configured model"
+                        );
+                        models
+                            .iter()
+                            .map(|m| json!({ "modelId": m.id, "name": m.name }))
+                            .collect()
+                    }
+                }
+            }
             _ => vec![json!({ "modelId": app.cfg.model, "name": app.cfg.model })],
         }
     };
@@ -565,6 +1063,8 @@ async fn session_new(app: &Arc<App>, id: Value, params: Value, wire_tx: &WireSen
             history: Vec::new(),
             cancel_tx,
             busy: false,
+            prompt_count: 0,
+            state_revision: 0,
             active_run_id: None,
             steer_tx: None,
             original_task: None,
@@ -608,7 +1108,12 @@ async fn reject(wire_tx: &WireSender, id: Value, code: i32, message: &str) {
 
 async fn cancel_session(app: &Arc<App>, params: Value) {
     if let Ok(p) = serde_json::from_value::<SessionCancelParams>(params) {
-        if let Some(s) = app.sessions.lock().await.get(&p.session_id) {
+        let mut sessions = app.sessions.lock().await;
+        if let Some(s) = sessions.get_mut(&p.session_id) {
+            // Invalidate snapshots that are still doing route preflight. The
+            // watch receiver is installed only at admission, so send alone
+            // would lose cancels received before reserve_session.
+            s.state_revision = next_session_revision(s.state_revision);
             let _ = s.cancel_tx.send(true);
         }
     }
@@ -636,6 +1141,15 @@ async fn set_model_session(app: &Arc<App>, id: Value, params: Value, wire_tx: &W
         )
         .await;
     }
+    if app.review_only {
+        return reject(
+            wire_tx,
+            id,
+            INVALID_PARAMS,
+            "session/set_model: review-only model identity is pinned at launch",
+        )
+        .await;
+    }
     let mut sessions = app.sessions.lock().await;
     let Some(s) = sessions.get_mut(&p.session_id) else {
         return reject(
@@ -646,7 +1160,7 @@ async fn set_model_session(app: &Arc<App>, id: Value, params: Value, wire_tx: &W
         )
         .await;
     };
-    s.effective_model = Some(p.model_id.clone());
+    update_session_model_override(&mut s.effective_model, &mut s.state_revision, &p.model_id);
     tracing::info!(
         session_id = %p.session_id,
         model_id = %p.model_id,
@@ -751,22 +1265,15 @@ async fn run_prompt(app: Arc<App>, id: Value, params: Value, wire_tx: WireSender
         Ok(p) => p,
         Err(m) => return reject(&wire_tx, id, INVALID_PARAMS, &m).await,
     };
-    let (
-        sid,
-        mcp,
-        skills,
-        mut history,
-        mut original_task,
-        mut handoff_count,
-        mut last_request_input_tokens,
-        mut last_request_history_bytes,
-        mut cancel_rx,
-        effective_system_prompt,
-        effective_model_override,
-        run_id,
-        mut steer_rx,
-        usage_baseline,
-    ) = match acquire_session(&app, &p.session_id).await {
+    if let Some(reason) = strict_task_class_preflight_reason(
+        app.route_profile.as_ref(),
+        p.task_class_metadata().as_ref(),
+    ) {
+        // Reject before session snapshot/reservation: strict-fit abstentions must neither
+        // touch a provider nor consume a review-only session's one-shot turn.
+        return reject(&wire_tx, id, INVALID_PARAMS, reason).await;
+    }
+    let snapshot = match snapshot_session(&app, &p.session_id).await {
         Ok(v) => v,
         Err(reason) => {
             return reject(
@@ -775,24 +1282,318 @@ async fn run_prompt(app: Arc<App>, id: Value, params: Value, wire_tx: WireSender
                 INVALID_PARAMS,
                 &format!("session/prompt: {reason}"),
             )
-            .await
+            .await;
         }
     };
-    // Advertise the active run id so steer-capable clients can target this turn
-    // via `expectedRunId`. Mirrors goose's `send_active_run_update`.
+    #[cfg(debug_assertions)]
+    wait_for_route_preflight_test_barrier(&id).await;
+    let sid = snapshot.id.clone();
+    let effective_system_prompt = Arc::clone(&snapshot.effective_system_prompt);
+    let effective_model_override = snapshot.effective_model_override.clone();
+    let run_id = match session_token() {
+        Ok(token) => format!("run_{token}"),
+        Err(_) => {
+            return reject(
+                &wire_tx,
+                id,
+                INVALID_PARAMS,
+                "session/prompt: rng failure; retry prompt",
+            )
+            .await;
+        }
+    };
+    // Resolve the one route used for this whole ACP prompt. An explicit
+    // session/set_model choice wins; otherwise the optional profile applies
+    // hard data gates and its ordered preference before the first request.
+    let mut active_cfg = app.cfg.clone();
+    // Preserve the prompt supplied to session/new on the default route. If a
+    // route candidate is selected below, its bound config carries this same
+    // session prompt plus that candidate's route-specific additions.
+    active_cfg.system_prompt = effective_system_prompt.to_string();
+    let mut active_llm = Arc::clone(&app.llm);
+    let mut active_model = effective_model_override
+        .clone()
+        .unwrap_or_else(|| app.cfg.model.clone());
+    let mut route_preflight_error = None;
+    let mut route_context_capacity_tokens = None;
+    let mut route_cost_budget: Option<RouteCostBudget> = None;
+    let route_profile_override = app.route_profile.as_ref().and_then(|profile| {
+        effective_model_override.as_deref().map(|model| {
+            route_profile_for_model_override(profile, route_provider_id(app.cfg.provider), model)
+        })
+    });
+    let route_decision = if let Some(profile) = &app.route_profile {
+        if let Some(Err(reason)) = route_profile_override.as_ref() {
+            route_preflight_error = Some(reason.message().into());
+            Some(route_decision_notice(
+                &sid,
+                &run_id,
+                profile,
+                "refused",
+                None,
+                None,
+                Some(reason.reason_code()),
+            ))
+        } else {
+            let selection_profile = route_profile_override
+                .as_ref()
+                .and_then(|result| result.as_ref().ok())
+                .map(|(profile, _)| profile)
+                .unwrap_or(profile);
+            let is_explicit_override = effective_model_override.is_some();
+            let route_profile_hash = route_profile_identity(profile).2;
+            let selection = select_profile_route_for_prompt_with_task_fit_evidence(
+                selection_profile,
+                &effective_system_prompt,
+                &p.prompt,
+                &snapshot.history,
+                |config| {
+                    crate::agent::request_tool_definitions(
+                        &snapshot.mcp,
+                        !snapshot.skills.is_empty(),
+                        config.summary_model.is_some(),
+                    )
+                },
+                |entry, config, input_tokens| {
+                    let Some(journal) = app.route_journal.as_ref() else {
+                        return Evidence::Unknown;
+                    };
+                    let Some(endpoint_hash) =
+                        crate::agent::device_keyed_endpoint_fingerprint(&config.base_url)
+                    else {
+                        return Evidence::Unknown;
+                    };
+                    let Some(profile_hash) = route_profile_hash.as_ref() else {
+                        return Evidence::Unknown;
+                    };
+                    let query = buzz_run_journal::RouteThroughputQuery {
+                        profile_hash: profile_hash.clone(),
+                        endpoint_hash,
+                        candidate_id: entry.id.clone(),
+                        provider_id: route_provider_id(config.provider).into(),
+                        model_id: config.model.clone(),
+                        thinking_effort: route_thinking_effort(config.thinking_effort).into(),
+                        input_tokens,
+                    };
+                    match journal.route_throughput_summary(&query) {
+                        Ok(summary) => summary
+                            .effective_output_tokens_per_second_milli
+                            .map(|value| Evidence::Known {
+                                value,
+                                source: EvidenceSource::Measured,
+                            })
+                            .unwrap_or(Evidence::Unknown),
+                        Err(error) => {
+                            tracing::debug!("route throughput lookup failed: {error}");
+                            Evidence::Unknown
+                        }
+                    }
+                },
+                |entry, config, policy| {
+                    let Some(evidence) = app.route_task_fit_evidence.as_ref() else {
+                        return crate::task_fit_evidence::TaskFitEligibility::Unknown(
+                            TaskFitUnknownReason::EvidenceStoreUnavailable,
+                        );
+                    };
+                    evidence.evaluate_candidate(
+                        &entry.id,
+                        route_provider_id(config.provider),
+                        &config.model,
+                        policy,
+                        chrono::Utc::now(),
+                    )
+                },
+                |provider, model, prompt| app.cfg.for_route_target(provider, model, prompt),
+            );
+            match selection {
+                Ok(BoundRouteSelection::Chosen { selected, preview }) => {
+                    route_cost_budget = profile.cost_budget_for_candidate(&selected.candidate.id);
+                    if profile.max_turn_cost_microusd.is_some() && route_cost_budget.is_none() {
+                        route_preflight_error =
+                            Some("selected route has no complete per-turn pricing".into());
+                    }
+                    let context_fit = selected.candidate.context_fit_summary();
+                    if profile.strict_context_fit {
+                        route_context_capacity_tokens = context_fit.map(|fit| fit.capacity_tokens);
+                    }
+                    if let Some(config) = selected.config() {
+                        match Llm::new_for_route(
+                            config,
+                            selected.data_location()
+                                == Some(crate::route_preview::DataLocation::Local),
+                        ) {
+                            Ok(llm) => {
+                                active_model = selected.candidate.model.clone();
+                                active_cfg = config.clone();
+                                active_llm = Arc::new(llm);
+                                tracing::info!(
+                                    route_profile_version = profile.version,
+                                    ?preview,
+                                    route_candidate_id = %selected.candidate.id,
+                                    provider = ?selected.candidate.provider,
+                                    model = %selected.candidate.model,
+                                    "selected provider route for ACP prompt"
+                                );
+                                Some(route_decision_notice(
+                                    &sid,
+                                    &run_id,
+                                    profile,
+                                    if is_explicit_override {
+                                        "overridden"
+                                    } else {
+                                        "selected"
+                                    },
+                                    Some(&selected.candidate),
+                                    context_fit,
+                                    is_explicit_override
+                                        .then_some("explicit_session_model_override"),
+                                ))
+                            }
+                            Err(error) => {
+                                route_preflight_error = Some(error.to_string());
+                                Some(route_decision_notice(
+                                    &sid,
+                                    &run_id,
+                                    profile,
+                                    "refused",
+                                    Some(&selected.candidate),
+                                    context_fit,
+                                    Some("provider_client_initialization_failed"),
+                                ))
+                            }
+                        }
+                    } else {
+                        route_preflight_error =
+                            Some("selected candidate has no configured provider connection".into());
+                        Some(route_decision_notice(
+                            &sid,
+                            &run_id,
+                            profile,
+                            "refused",
+                            Some(&selected.candidate),
+                            context_fit,
+                            Some("provider_connection_unconfigured"),
+                        ))
+                    }
+                }
+                Ok(BoundRouteSelection::Abstained { preview }) => {
+                    tracing::info!(
+                        route_profile_version = profile.version,
+                        ?preview,
+                        "route profile abstained"
+                    );
+                    route_preflight_error = Some(format!("no eligible route: {preview:?}"));
+                    let reason_code = route_abstention_reason(&preview.decision);
+                    Some(route_decision_notice(
+                        &sid,
+                        &run_id,
+                        profile,
+                        "abstained",
+                        None,
+                        None,
+                        Some(reason_code),
+                    ))
+                }
+                Err(error) => {
+                    route_preflight_error = Some(error.to_string());
+                    Some(route_decision_notice(
+                        &sid,
+                        &run_id,
+                        profile,
+                        "refused",
+                        None,
+                        None,
+                        Some("route_configuration_invalid"),
+                    ))
+                }
+            }
+        }
+    } else {
+        None
+    };
+    if let Some(error) = route_preflight_error.as_deref() {
+        if let Err(reason) = validate_session_snapshot(&app, &snapshot).await {
+            return reject(
+                &wire_tx,
+                id,
+                INVALID_PARAMS,
+                &format!("session/prompt: {reason}"),
+            )
+            .await;
+        }
+        if let Some(route_decision) = route_decision {
+            wire::send(
+                &wire_tx,
+                wire::session_update_with_meta(
+                    &sid,
+                    json!({ "sessionUpdate": "session_info_update" }),
+                    json!({ "buzz": { "routeDecisionV1": route_decision } }),
+                ),
+            )
+            .await;
+        }
+        return reject(
+            &wire_tx,
+            id,
+            INVALID_PARAMS,
+            &format!("route preflight abstained: {error}"),
+        )
+        .await;
+    }
+    let reservation = match reserve_session(&app, snapshot, &run_id).await {
+        Ok(reservation) => reservation,
+        Err(reason) => {
+            return reject(
+                &wire_tx,
+                id,
+                INVALID_PARAMS,
+                &format!("session/prompt: {reason}"),
+            )
+            .await;
+        }
+    };
+    let ReservedSessionPrompt {
+        snapshot: admitted,
+        mut cancel_rx,
+        mut steer_rx,
+    } = reservation;
+    let mcp = admitted.mcp;
+    let skills = admitted.skills;
+    let mut history = admitted.history;
+    let mut original_task = admitted.original_task;
+    let mut handoff_count = admitted.handoff_count;
+    let mut last_request_input_tokens = admitted.last_request_input_tokens;
+    let mut last_request_history_bytes = admitted.last_request_history_bytes;
+    let usage_baseline = admitted.usage_baseline;
+    // Advertise the active run ID so steer-capable clients can target this turn
+    // via `expectedRunId`. Buzz's namespaced route record shares the standard
+    // opaque ACP `_meta` field and is joined to this active run by buzz-acp.
+    let route_measurement_identity = route_decision.as_ref().and_then(|notice| {
+        if notice["outcome"].as_str() != Some("selected") {
+            return None;
+        }
+        Some(RouteMeasurementIdentity {
+            profile_id: notice["profileId"].as_str()?.to_owned(),
+            profile_version: u32::try_from(notice["profileVersion"].as_u64()?).ok()?,
+            profile_hash: notice["profileHash"].as_str()?.to_owned(),
+            candidate_id: notice["candidateId"].as_str()?.to_owned(),
+            provider_id: notice["providerId"].as_str()?.to_owned(),
+            model_id: notice["modelId"].as_str()?.to_owned(),
+        })
+    });
+    let mut notification_meta = json!({ "goose": { "activeRunId": run_id } });
+    if let Some(route_decision) = route_decision {
+        notification_meta["buzz"] = json!({ "routeDecisionV1": route_decision });
+    }
     wire::send(
         &wire_tx,
-        wire::session_update_with_goose_meta(
+        wire::session_update_with_meta(
             &sid,
             json!({ "sessionUpdate": "session_info_update" }),
-            json!({ "activeRunId": run_id }),
+            notification_meta,
         ),
     )
     .await;
-    // Resolve effective model: session override wins over config default.
-    let effective_model_str = effective_model_override
-        .as_deref()
-        .unwrap_or(&app.cfg.model);
     let mut turn_input_tokens: crate::types::TurnIOState = crate::types::TurnIOState::Unseen;
     let mut turn_output_tokens: crate::types::TurnIOState = crate::types::TurnIOState::Unseen;
     let mut turn_cached_input_tokens: crate::types::CacheTotalState =
@@ -808,11 +1609,15 @@ async fn run_prompt(app: Arc<App>, id: Value, params: Value, wire_tx: WireSender
     // end-of-turn wire emission.
     let mut turn_pricing_identity: Option<Option<crate::types::PricingIdentity>> = None;
     let mut ctx = RunCtx {
-        cfg: &app.cfg,
-        effective_model: effective_model_str,
+        cfg: &active_cfg,
+        effective_model: &active_model,
+        route_preflight_error: None,
+        context_fit_capacity_tokens: route_context_capacity_tokens,
+        route_cost_budget,
+        route_cost_reserved_microusd: 0,
         session_id: &sid,
-        system_prompt: &effective_system_prompt,
-        llm: &app.llm,
+        system_prompt: &active_cfg.system_prompt,
+        llm: &active_llm,
         mcp: &mcp,
         permissions: &app.permissions,
         protocol_version: app.negotiated_version.load(Ordering::Relaxed),
@@ -824,6 +1629,8 @@ async fn run_prompt(app: Arc<App>, id: Value, params: Value, wire_tx: WireSender
         original_task: &mut original_task,
         handoff_count: &mut handoff_count,
         run_id,
+        route_measurement_identity,
+        route_measurement_sequence: 0,
         last_request_input_tokens: &mut last_request_input_tokens,
         last_request_history_bytes: &mut last_request_history_bytes,
         turn_input_tokens: &mut turn_input_tokens,
@@ -836,7 +1643,6 @@ async fn run_prompt(app: Arc<App>, id: Value, params: Value, wire_tx: WireSender
     };
     let result = ctx.run(p.prompt).await;
     if let Some(s) = app.sessions.lock().await.get_mut(&sid) {
-        s.busy = false;
         // Clear run state so a late steer can't queue into a finished turn.
         s.active_run_id = None;
         s.steer_tx = None;
@@ -915,7 +1721,7 @@ async fn run_prompt(app: Arc<App>, id: Value, params: Value, wire_tx: WireSender
                 accumulated_cached.exact_value(),
                 accumulated_written.exact_value(),
                 accumulated_total,
-                effective_model_str,
+                &active_model,
                 // Pass the proven per-turn identity if consistent; absent otherwise.
                 turn_pricing_identity
                     .as_ref()
@@ -923,6 +1729,10 @@ async fn run_prompt(app: Arc<App>, id: Value, params: Value, wire_tx: WireSender
             );
             wire::send(&wire_tx, goose_session_update(&sid, update)).await;
         }
+    }
+    if let Some(s) = app.sessions.lock().await.get_mut(&sid) {
+        s.busy = false;
+        s.state_revision = next_session_revision(s.state_revision);
     }
     match result {
         Ok(stop) => {
@@ -936,80 +1746,170 @@ async fn run_prompt(app: Arc<App>, id: Value, params: Value, wire_tx: WireSender
     }
 }
 
-async fn acquire_session(
+fn strict_task_class_preflight_reason(
+    profile: Option<&RouteProfileDocument>,
+    metadata: Option<&wire::TaskClassMetadata>,
+) -> Option<&'static str> {
+    let policy = profile?.task_fit_policy.as_ref()?;
+    let Some(metadata) = metadata.filter(|metadata| metadata.validate()) else {
+        return Some("strict_task_fit_task_class_unknown");
+    };
+    if metadata.task_class != policy.task_class
+        || metadata.taxonomy_version != policy.task_class_taxonomy_version
+    {
+        return Some("strict_task_fit_task_class_mismatch");
+    }
+    None
+}
+
+async fn snapshot_session(
     app: &Arc<App>,
     session_id: &str,
-) -> Result<
-    (
-        String,
-        Arc<McpRegistry>,
-        Vec<SkillEntry>,
-        Vec<HistoryItem>,
-        Option<String>,
-        usize,
-        Option<u64>,
-        Option<usize>,
-        watch::Receiver<bool>,
-        Arc<str>,
-        Option<String>,
-        String,
-        mpsc::UnboundedReceiver<Vec<ContentBlock>>,
-        crate::types::SessionUsageBaseline,
-    ),
-    &'static str,
-> {
-    let mut sessions = app.sessions.lock().await;
-    let s = sessions.get_mut(session_id).ok_or("unknown session")?;
+) -> Result<SessionPromptSnapshot, &'static str> {
+    let sessions = app.sessions.lock().await;
+    let s = sessions.get(session_id).ok_or("unknown session")?;
     if s.busy {
         return Err("prompt already in flight");
     }
-    // Generate the run id before mutating session state. On RNG failure we reject
-    // the prompt cleanly: the session stays idle and the caller can retry. Generating
-    // after `s.busy = true` with `?` would wedge the session permanently busy.
-    let run_id = format!(
-        "run_{}",
-        session_token().map_err(|_| "rng failure; retry prompt")?
-    );
-    s.busy = true;
-    let (tx, rx) = watch::channel(false);
-    s.cancel_tx = tx;
-    // Skills are read-only after session creation; clone the Vec so RunCtx
-    // can hold a reference without holding the sessions lock.
-    let skills = s.skills.clone();
-    // Fresh run id + steer channel for this turn. The run id lets steer-capable
-    // clients target *this* turn (rejecting steers aimed at a turn that already
-    // ended); the channel carries mid-turn injections to the run loop.
-    s.active_run_id = Some(run_id.clone());
-    let (steer_tx, steer_rx) = mpsc::unbounded_channel();
-    s.steer_tx = Some(steer_tx);
-    let effective_model = s.effective_model.clone();
-    Ok((
-        s.id.clone(),
-        s.mcp.clone(),
-        skills,
-        std::mem::take(&mut s.history),
-        s.original_task.take(),
-        s.handoff_count,
-        s.last_request_input_tokens,
-        s.last_request_history_bytes,
-        rx,
-        Arc::clone(&s.effective_system_prompt),
-        effective_model,
-        run_id,
-        steer_rx,
-        // Snapshot rather than a handle: the run loop reports cumulative usage
-        // after every LLM round, and taking the sessions lock on each of those
-        // would serialise concurrent sessions behind one another's provider
-        // round-trips. Nothing else advances these counters while this turn
-        // holds `busy`, so the snapshot cannot go stale under it.
-        crate::types::SessionUsageBaseline {
+    if app.review_only && s.prompt_count > 0 {
+        return Err("review-only session accepts one prompt");
+    }
+    Ok(SessionPromptSnapshot {
+        state_revision: s.state_revision,
+        id: s.id.clone(),
+        mcp: Arc::clone(&s.mcp),
+        skills: s.skills.clone(),
+        history: s.history.clone(),
+        original_task: s.original_task.clone(),
+        handoff_count: s.handoff_count,
+        last_request_input_tokens: s.last_request_input_tokens,
+        last_request_history_bytes: s.last_request_history_bytes,
+        effective_system_prompt: Arc::clone(&s.effective_system_prompt),
+        effective_model_override: s.effective_model.clone(),
+        usage_baseline: crate::types::SessionUsageBaseline {
             input_tokens: s.accumulated_input_tokens,
             output_tokens: s.accumulated_output_tokens,
             cached_input_tokens: s.accumulated_cached_input_tokens,
             cache_write_tokens: s.accumulated_cache_write_tokens,
             total_state: s.accumulated_total_state,
         },
-    ))
+    })
+}
+
+/// Deterministic barrier for integration tests that exercise route-preflight
+/// races. It exists only in debug builds and is inactive unless the child test
+/// process explicitly provides a private temporary directory.
+#[cfg(debug_assertions)]
+async fn wait_for_route_preflight_test_barrier(id: &Value) {
+    const BARRIER_ENV: &str = "BUZZ_AGENT_TEST_ROUTE_PREFLIGHT_BARRIER_DIR";
+    let Some(directory) = std::env::var_os(BARRIER_ENV) else {
+        return;
+    };
+    let Some(request_id) = id.as_i64() else {
+        return;
+    };
+    let directory = std::path::PathBuf::from(directory);
+    let ready = directory.join(format!("{request_id}.ready"));
+    let release = directory.join(format!("{request_id}.release"));
+    if let Err(error) = std::fs::write(&ready, b"ready") {
+        tracing::warn!(%error, "could not signal route-preflight test barrier");
+        return;
+    }
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        if release.exists() {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            tracing::warn!(request_id, "route-preflight test barrier timed out");
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
+async fn reserve_session(
+    app: &Arc<App>,
+    snapshot: SessionPromptSnapshot,
+    run_id: &str,
+) -> Result<ReservedSessionPrompt, &'static str> {
+    let mut sessions = app.sessions.lock().await;
+    let s = sessions.get_mut(&snapshot.id).ok_or("unknown session")?;
+    if let Some(reason) = session_admission_error(
+        snapshot.state_revision,
+        s.state_revision,
+        s.busy,
+        s.prompt_count,
+        app.review_only,
+    ) {
+        return Err(reason);
+    }
+
+    s.busy = true;
+    s.prompt_count = s.prompt_count.saturating_add(1);
+    s.state_revision = next_session_revision(s.state_revision);
+    let (cancel_tx, cancel_rx) = watch::channel(false);
+    s.cancel_tx = cancel_tx;
+    // Revision equality proves these values are still current. Move the
+    // session-owned history only after the reservation succeeds.
+    drop(std::mem::take(&mut s.history));
+    s.original_task = None;
+    s.active_run_id = Some(run_id.to_owned());
+    let (steer_tx, steer_rx) = mpsc::unbounded_channel();
+    s.steer_tx = Some(steer_tx);
+    Ok(ReservedSessionPrompt {
+        snapshot,
+        cancel_rx,
+        steer_rx,
+    })
+}
+
+async fn validate_session_snapshot(
+    app: &Arc<App>,
+    snapshot: &SessionPromptSnapshot,
+) -> Result<(), &'static str> {
+    let sessions = app.sessions.lock().await;
+    let s = sessions.get(&snapshot.id).ok_or("unknown session")?;
+    session_admission_error(
+        snapshot.state_revision,
+        s.state_revision,
+        s.busy,
+        s.prompt_count,
+        app.review_only,
+    )
+    .map_or(Ok(()), Err)
+}
+
+fn next_session_revision(revision: u64) -> u64 {
+    revision.saturating_add(1)
+}
+
+fn update_session_model_override(
+    effective_model: &mut Option<String>,
+    state_revision: &mut u64,
+    model_id: &str,
+) {
+    *effective_model = Some(model_id.to_owned());
+    *state_revision = next_session_revision(*state_revision);
+}
+
+fn session_admission_error(
+    snapshot_revision: u64,
+    current_revision: u64,
+    busy: bool,
+    prompt_count: u32,
+    review_only: bool,
+) -> Option<&'static str> {
+    if busy {
+        Some("prompt already in flight")
+    } else if review_only && prompt_count > 0 {
+        Some("review-only session accepts one prompt")
+    } else if snapshot_revision != current_revision {
+        Some("session changed during route preflight; retry prompt")
+    } else {
+        None
+    }
 }
 
 fn session_token() -> Result<String, String> {
@@ -1020,8 +1920,219 @@ fn session_token() -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    use super::{
+        apply_critic_route_cost_budget_override, route_abstention_reason, route_decision_notice,
+        route_profile_for_model_override, session_admission_error, update_session_model_override,
+        RouteContextFitSummary,
+    };
     use crate::catalog::ModelEntry;
+    use crate::route_preview::{
+        DataLocation, Evidence, RouteProfileDataPolicy, RouteProfileDocument,
+    };
     use crate::types::AgentError;
+    use serde_json::json;
+
+    #[test]
+    fn set_model_revision_invalidates_an_older_route_snapshot() {
+        let snapshot_revision = 0;
+        let mut effective_model = None;
+        let mut current_revision = snapshot_revision;
+        update_session_model_override(&mut effective_model, &mut current_revision, "changed-model");
+        assert_eq!(effective_model.as_deref(), Some("changed-model"));
+        assert_eq!(current_revision, 1);
+        assert_eq!(
+            session_admission_error(snapshot_revision, current_revision, false, 0, false,),
+            Some("session changed during route preflight; retry prompt")
+        );
+    }
+
+    #[test]
+    fn critic_round_budget_only_lowers_the_reviewers_resolved_route_ceiling() {
+        let mut profile = Some(
+            RouteProfileDocument::parse(
+                br#"{
+                    "version":1,
+                    "max_turn_cost_microusd":100,
+                    "candidates":[{"id":"local","provider":"openai","model":"local-model","data_location":"local"}],
+                    "profile_id":"local-review",
+                    "profile_version":2,
+                    "profile_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                }"#,
+            )
+            .unwrap(),
+        );
+
+        apply_critic_route_cost_budget_override(&mut profile, Some("40"), true).unwrap();
+        assert_eq!(profile.as_ref().unwrap().max_turn_cost_microusd, Some(40));
+        assert_eq!(profile.as_ref().unwrap().profile_version, Some(2));
+        assert_eq!(
+            profile.as_ref().unwrap().profile_hash.as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+
+        apply_critic_route_cost_budget_override(&mut profile, Some("80"), true).unwrap();
+        assert_eq!(profile.as_ref().unwrap().max_turn_cost_microusd, Some(40));
+    }
+
+    #[test]
+    fn critic_round_budget_rejects_untrusted_or_malformed_overrides() {
+        let mut profile = Some(RouteProfileDocument::parse(
+            br#"{"version":1,"candidates":[{"id":"local","provider":"openai","model":"local-model","data_location":"local"}]}"#,
+        ).unwrap());
+        assert!(apply_critic_route_cost_budget_override(&mut profile, Some("20"), false).is_err());
+        assert!(
+            apply_critic_route_cost_budget_override(&mut profile, Some("20usd"), true).is_err()
+        );
+        assert!(apply_critic_route_cost_budget_override(&mut None, Some("20"), true).is_err());
+        assert!(apply_critic_route_cost_budget_override(&mut profile, None, false).is_ok());
+    }
+
+    #[test]
+    fn model_override_pin_preserves_profile_gates_and_requires_unique_exact_match() {
+        let profile = RouteProfileDocument::parse(
+            br#"{
+                "version":1,
+                "data_policy":"local-only",
+                "strict_context_fit":true,
+                "max_turn_cost_microusd":1000000,
+                "prefer_fastest_measured":true,
+                "profile_id":"profile-a",
+                "profile_version":2,
+                "profile_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "candidates":[
+                    {
+                        "id":"pinned",
+                        "provider":"openai",
+                        "model":"target-model",
+                        "data_location":"local",
+                        "context_capacity_tokens":10000,
+                        "input_cost_microusd_per_million_tokens":100,
+                        "output_cost_microusd_per_million_tokens":100
+                    },
+                    {
+                        "id":"other",
+                        "provider":"deepseek",
+                        "model":"other-model",
+                        "data_location":"local"
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let (pinned, candidate_id) =
+            route_profile_for_model_override(&profile, "openai", "target-model").unwrap();
+        assert_eq!(candidate_id, "pinned");
+        assert_eq!(pinned.candidates.len(), 1);
+        assert_eq!(pinned.candidates[0].id, "pinned");
+        assert_eq!(pinned.preference_order, ["pinned"]);
+        assert_eq!(pinned.data_policy, RouteProfileDataPolicy::LocalOnly);
+        assert!(pinned.strict_context_fit);
+        assert_eq!(pinned.max_turn_cost_microusd, Some(1_000_000));
+        assert!(!pinned.prefer_fastest_measured);
+        assert_eq!(pinned.min_effective_output_tokens_per_second_milli, Some(1));
+        assert_eq!(pinned.profile_id, profile.profile_id);
+        assert_eq!(pinned.profile_version, profile.profile_version);
+        assert_eq!(pinned.profile_hash, profile.profile_hash);
+        assert_eq!(
+            route_profile_for_model_override(&profile, "openai", "missing-model")
+                .err()
+                .unwrap()
+                .reason_code(),
+            "manual_override_model_not_listed"
+        );
+
+        let mut ambiguous = profile;
+        let mut duplicate_model = ambiguous.candidates[0].clone();
+        duplicate_model.id = "same-model-second-id".into();
+        ambiguous.candidates.push(duplicate_model);
+        assert_eq!(
+            route_profile_for_model_override(&ambiguous, "openai", "target-model")
+                .err()
+                .unwrap()
+                .reason_code(),
+            "manual_override_model_ambiguous"
+        );
+    }
+
+    #[test]
+    fn route_decision_notice_contains_only_join_and_decision_provenance() {
+        let profile = RouteProfileDocument {
+            version: 1,
+            data_policy: RouteProfileDataPolicy::default(),
+            preference_order: vec![],
+            candidates: vec![],
+            profile_id: Some("local-first".into()),
+            profile_version: Some(3),
+            profile_hash: Some("a".repeat(64)),
+            strict_context_fit: false,
+            max_turn_cost_microusd: None,
+            prefer_fastest_measured: false,
+            min_effective_output_tokens_per_second_milli: None,
+            allow_preference_order_warmup: false,
+            task_fit_policy: None,
+        };
+        let candidate = crate::route_preview::RouteCandidate {
+            id: "local-fast".into(),
+            provider: crate::config::Provider::OpenAi,
+            model: "gpt-test".into(),
+            available: Evidence::Unknown,
+            data_location: Evidence::Known {
+                value: DataLocation::Local,
+                source: crate::route_preview::EvidenceSource::OperatorConfig,
+            },
+            max_cost_microusd: Evidence::Unknown,
+            max_seconds: Evidence::Unknown,
+            context_tokens: Evidence::Unknown,
+            input_context_upper_bound_tokens: Evidence::Unknown,
+            tokens_per_second_milli: Evidence::Unknown,
+            tools: Evidence::Unknown,
+        };
+        let notice = route_decision_notice(
+            "session-1",
+            "run_attempt-1",
+            &profile,
+            "selected",
+            Some(&candidate),
+            Some(RouteContextFitSummary {
+                estimate_method: crate::route_preview::ContextEstimateMethod::Utf8BytesPlusFramingAndOutputReserveV1,
+                capacity_source: crate::route_preview::ContextCapacitySource::OperatorDeclared,
+                input_tokens_upper_bound: 512,
+                capacity_tokens: 2048,
+            }),
+            None,
+        );
+        assert_eq!(notice["sessionId"], "session-1");
+        assert_eq!(notice["attemptId"], "run_attempt-1");
+        assert_eq!(notice["profileId"], "local-first");
+        assert_eq!(notice["profileVersion"], 3);
+        assert_eq!(notice["candidateId"], "local-fast");
+        assert_eq!(notice["providerId"], "openai");
+        assert_eq!(notice["modelId"], "gpt-test");
+        assert_eq!(notice["contextFit"]["capacitySource"], "operator_declared");
+        assert_eq!(notice["contextFit"]["inputTokensUpperBound"], 512);
+        assert_eq!(notice["contextFit"]["capacityTokens"], 2048);
+        assert!(notice.get("prompt").is_none());
+        assert!(notice.get("apiKey").is_none());
+        assert!(notice.get("error").is_none());
+        let message = crate::wire::session_update_with_meta(
+            "session-1",
+            json!({ "sessionUpdate": "session_info_update" }),
+            json!({
+                "goose": { "activeRunId": "run_attempt-1" },
+                "buzz": { "routeDecisionV1": notice.clone() },
+            }),
+        );
+        assert_eq!(
+            message["params"]["update"]["_meta"]["buzz"]["routeDecisionV1"]["attemptId"],
+            "run_attempt-1"
+        );
+
+        let unsafe_reason = crate::route_preview::RouteDecision::Abstain {
+            reason: "provider error with secret text".into(),
+        };
+        assert_eq!(route_abstention_reason(&unsafe_reason), "route_abstained");
+    }
 
     /// Regression: a discovery error must not pin the models_cache for the process lifetime.
     ///
@@ -1115,6 +2226,35 @@ mod tests {
             vec![ModelEntry {
                 id: "databricks-gpt-5-5".into(),
                 name: "GPT-5.5".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn deepseek_invalid_key_auth_error_does_not_fall_back() {
+        for error in [
+            AgentError::LlmAuth("DeepSeek model catalog HTTP 401".into()),
+            crate::catalog::classify_deepseek_catalog_error(AgentError::Llm(
+                "DeepSeek model catalog failed HTTP 403: forbidden".into(),
+            )),
+        ] {
+            let result = crate::deepseek_catalog_fallback("deepseek-chat", error);
+            assert!(matches!(result, Err(AgentError::LlmAuth(_))));
+        }
+    }
+
+    #[test]
+    fn deepseek_catalog_outage_uses_configured_model_fallback() {
+        let models = crate::deepseek_catalog_fallback(
+            "deepseek-chat",
+            AgentError::Llm("503: catalog unavailable".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            models,
+            vec![ModelEntry {
+                id: "deepseek-chat".into(),
+                name: "deepseek-chat".into(),
             }]
         );
     }

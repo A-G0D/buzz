@@ -350,7 +350,7 @@ fn is_openai_compatible_provider(provider: Option<&str>) -> bool {
             .map(str::trim)
             .map(str::to_ascii_lowercase)
             .as_deref(),
-        Some("openai" | "openai-compat")
+        Some("openai" | "openai-compat" | "deepseek")
     )
 }
 
@@ -364,6 +364,17 @@ fn openai_compatible_models_url(env: &BTreeMap<String, String>) -> String {
 fn openai_compatible_models_url_for_discovery(env: &BTreeMap<String, String>) -> String {
     let base_url = env_or_process_value(env, "OPENAI_COMPAT_BASE_URL")
         .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+    format!("{}/models", base_url.trim_end_matches('/'))
+}
+
+#[cfg(test)]
+fn deepseek_models_url(env: &BTreeMap<String, String>) -> String {
+    let base_url = env_value(env, "DEEPSEEK_BASE_URL")
+        .unwrap_or_else(|| "https://api.deepseek.com".to_string());
+    deepseek_models_url_from_base(&base_url)
+}
+
+fn deepseek_models_url_from_base(base_url: &str) -> String {
     format!("{}/models", base_url.trim_end_matches('/'))
 }
 
@@ -495,17 +506,30 @@ async fn discover_openai_compatible_models(
         return Ok(None);
     }
 
+    let deepseek = provider
+        .as_deref()
+        .is_some_and(|provider| provider.trim().eq_ignore_ascii_case("deepseek"));
+    let discovery_label = if deepseek { "DeepSeek" } else { "OpenAI" };
+    let api_key_env = if deepseek {
+        "DEEPSEEK_API_KEY"
+    } else {
+        "OPENAI_COMPAT_API_KEY"
+    };
     let api_key = if relay_mesh {
         crate::managed_agents::RELAY_MESH_API_KEY_PLACEHOLDER.to_string()
     } else {
-        match provider.required_env(env, "OPENAI_COMPAT_API_KEY")? {
+        match provider.required_env(env, api_key_env)? {
             Some(api_key) => api_key,
             None => return Ok(None),
         }
     };
-    let redaction_env = redaction_env_with_value(env, "OPENAI_COMPAT_API_KEY", &api_key);
+    let redaction_env = redaction_env_with_value(env, api_key_env, &api_key);
     let url = if relay_mesh {
         format!("{}/models", crate::managed_agents::RELAY_MESH_API_BASE_URL)
+    } else if deepseek {
+        let base_url = env_or_process_value(env, "DEEPSEEK_BASE_URL")
+            .unwrap_or_else(|| "https://api.deepseek.com".to_string());
+        deepseek_models_url_from_base(&base_url)
     } else {
         openai_compatible_models_url_for_discovery(env)
     };
@@ -514,21 +538,27 @@ async fn discover_openai_compatible_models(
         .bearer_auth(&api_key)
         .send()
         .await
-        .map_err(|error| format!("OpenAI model discovery request failed: {error}"))?;
+        .map_err(|error| format!("{discovery_label} model discovery request failed: {error}"))?;
     let status = response.status();
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
         let body = crate::managed_agents::redact_env_values_in(&body, &redaction_env);
-        return Err(format!("OpenAI model discovery HTTP {status}: {body}"));
+        return Err(format!(
+            "{discovery_label} model discovery HTTP {status}: {body}"
+        ));
     }
 
     let response = response
         .json::<OpenAiModelListResponse>()
         .await
-        .map_err(|error| format!("OpenAI model discovery response parse failed: {error}"))?;
+        .map_err(|error| {
+            format!("{discovery_label} model discovery response parse failed: {error}")
+        })?;
     let models = normalize_openai_compatible_models(response, provider.as_deref());
     if models.is_empty() {
-        return Err("OpenAI model discovery returned no compatible text models".to_string());
+        return Err(format!(
+            "{discovery_label} model discovery returned no models"
+        ));
     }
 
     Ok(Some(AgentModelsResponse {

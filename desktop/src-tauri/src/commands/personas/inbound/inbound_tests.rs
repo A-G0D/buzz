@@ -243,6 +243,7 @@ fn local_agent() -> ManagedAgentRecord {
         definition_parallelism: None,
         relay_mesh: None,
         effort_level: None,
+        execution_profile: None,
     }
 }
 

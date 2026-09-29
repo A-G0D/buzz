@@ -32,22 +32,25 @@ export async function expandTilde(input: string): Promise<string | undefined> {
   return trimmed;
 }
 
-export function migrateLegacyCommunityStorage(
-  storage: Storage = localStorage,
-): void {
+export function migrateLegacyCommunityStorage(storage?: Storage): void {
   try {
-    if (storage.getItem(COMMUNITIES_KEY) === null) {
-      const legacyCommunities = storage.getItem(LEGACY_WORKSPACES_KEY);
+    // Resolve the browser storage object inside the guard: WebKit can throw
+    // while evaluating `window.localStorage`, before any Storage method runs.
+    const targetStorage = storage ?? globalThis.window?.localStorage;
+    if (!targetStorage) return;
+
+    if (targetStorage.getItem(COMMUNITIES_KEY) === null) {
+      const legacyCommunities = targetStorage.getItem(LEGACY_WORKSPACES_KEY);
       if (legacyCommunities !== null) {
-        storage.setItem(COMMUNITIES_KEY, legacyCommunities);
+        targetStorage.setItem(COMMUNITIES_KEY, legacyCommunities);
       }
     }
-    if (storage.getItem(ACTIVE_COMMUNITY_KEY) === null) {
-      const legacyActiveCommunity = storage.getItem(
+    if (targetStorage.getItem(ACTIVE_COMMUNITY_KEY) === null) {
+      const legacyActiveCommunity = targetStorage.getItem(
         LEGACY_ACTIVE_WORKSPACE_KEY,
       );
       if (legacyActiveCommunity !== null) {
-        storage.setItem(ACTIVE_COMMUNITY_KEY, legacyActiveCommunity);
+        targetStorage.setItem(ACTIVE_COMMUNITY_KEY, legacyActiveCommunity);
       }
     }
   } catch (error) {

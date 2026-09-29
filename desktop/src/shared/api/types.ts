@@ -294,6 +294,23 @@ export type ManagedAgentBackend =
   | { type: "local" }
   | { type: "provider"; id: string; config: Record<string, unknown> };
 
+export type AgentArchetypeInfo = {
+  id: string;
+  name: string;
+  description: string;
+  snapshot: AgentExecutionProfileSnapshot;
+};
+
+export type AgentExecutionProfileSnapshot = {
+  id: string;
+  version: number;
+  name: string;
+  promptAddendum?: string | null;
+  parallelism?: number | null;
+  idleTimeoutSeconds?: number | null;
+  maxTurnDurationSeconds?: number | null;
+};
+
 /** ACP conversation boundary configured on an agent definition. */
 export type AcpSessionPolicy = "channel" | "thread";
 
@@ -328,6 +345,8 @@ export type ManagedAgent = {
   parallelism: number;
   sessionPolicy: AcpSessionPolicy;
   systemPrompt: string | null;
+  /** Local create-time archetype snapshot. Never published with the persona. */
+  executionProfile?: AgentExecutionProfileSnapshot | null;
   avatarUrl: string | null;
   model: string | null;
   modelSource: "definition" | "global" | "instance_legacy" | null;
@@ -412,6 +431,8 @@ export type CreateManagedAgentInput = {
   idleTimeoutSeconds?: number;
   maxTurnDurationSeconds?: number;
   parallelism?: number;
+  /** Built-in local archetype selected for this managed instance. */
+  executionProfileId?: string;
   systemPrompt?: string;
   avatarUrl?: string;
   model?: string;
@@ -511,6 +532,10 @@ export type AcpRuntimeCatalogEntry = {
   maxTokensEnvVar: string | null;
   contextLimitEnvVar: string | null;
   maxRoundsEnvVar: string | null;
+  /** Environment variable for an optional status-summary model override. */
+  summaryModelEnvVar: string | null;
+  /** Environment variable for the status-summary output-token limit. */
+  summaryMaxTokensEnvVar: string | null;
   installHint: string;
   installInstructionsUrl: string;
   canAutoInstall: boolean;
@@ -871,6 +896,296 @@ export type ThreadRepliesResponse = {
   nextCursor: ThreadCursor | null;
 };
 
+/** Source-linked projection shared with `buzz messages brief`. */
+export type ThreadManagedTurnBrief = {
+  turn: {
+    turn_id: string;
+    agent_index: number;
+    status: string;
+    liveness: string;
+    task_state: string;
+    updated_at_ms: number;
+  };
+  recent_events: Array<{
+    sequence: number;
+    kind: string;
+    occurred_at_ms: number;
+    details: Record<string, unknown>;
+  }>;
+  event_history_may_be_truncated: boolean;
+};
+
+export type ThreadSteeringControl = {
+  turn_id: string;
+  agent_index: number;
+  source_event_id: string;
+  state:
+    | "submitted"
+    | "adapter_acknowledged"
+    | "adapter_rejected"
+    | "attempt_failed"
+    | "delivery_unknown"
+    | "unknown";
+  submission_recorded: boolean;
+  submitted_at_ms: number | null;
+  adapter_outcome:
+    | "adapter_acknowledged"
+    | "adapter_rejected"
+    | "attempt_failed"
+    | "delivery_unknown"
+    | "unknown"
+    | null;
+  outcome_at_ms: number | null;
+  /** The ACP receipt does not establish that the model observed the guidance. */
+  agent_observed: "unknown";
+  event_history_may_be_truncated: boolean;
+};
+
+export type ThreadCoordinatorRunBrief = {
+  run_id: string;
+  channel_id: string;
+  session_scope: string;
+  thread_root_event_id: string | null;
+  original_intent_event_id: string;
+  project_coordinate: string | null;
+  project_link_conflict: boolean;
+  attempt_turns: ThreadManagedTurnBrief["turn"][];
+  attempt_history_may_be_truncated: boolean;
+  recent_events: Array<{
+    sequence: number;
+    run_id: string;
+    event_key: string;
+    kind: string;
+    occurred_at_ms: number;
+    details: Record<string, unknown>;
+  }>;
+  event_history_may_be_truncated: boolean;
+  created_at_ms: number;
+  updated_at_ms: number;
+  task_state: "unknown";
+};
+
+export type ThreadBriefResponse = {
+  thread_root_id: string;
+  original_intent: RelayEvent;
+  summary: {
+    text: string;
+    method: "deterministic";
+    task_completion: "unknown";
+  };
+  progress_events: RelayEvent[];
+  auxiliary_events: RelayEvent[];
+  status: {
+    task_state: "unknown";
+    /** Local time the latest brief query completed; not a relay snapshot time. */
+    observed_at_ms?: number;
+    reply_event_count: number;
+    latest_activity: { event_id: string; created_at: number } | null;
+    next_cursor: { created_at: number; event_id: string } | null;
+    requested_depth_limit: number | null;
+    applied_depth_limit: number;
+    depth_limit_may_truncate: boolean;
+    possibly_truncated: boolean;
+    managed_turns: ThreadManagedTurnBrief[];
+    /** Present when local managed-attempt history was requested and readable. */
+    steering_controls?: ThreadSteeringControl[];
+    coordinator_runs: ThreadCoordinatorRunBrief[];
+    managed_turn_lookup: {
+      source: "local_acp_attempt_journal";
+      scope: "caller-readable exact thread";
+      has_more_turns: boolean;
+      capture_reliability: "best_effort";
+      capture_gap_count: number;
+      capture_gap_scope: "current_relay_owner_journal";
+      task_state: "unknown";
+      liveness: "unknown";
+    };
+    coordinator_run_lookup: {
+      source: "local_coordinator_run_journal";
+      scope: "caller-readable exact thread";
+      has_more_runs: boolean;
+      capture_reliability: "best_effort";
+      capture_gap_count: number;
+      capture_gap_scope: "current_relay_owner_journal";
+      task_state: "unknown";
+    };
+  };
+  source_event_ids: string[];
+};
+
+/** Stable local-candidate cursor for a relay-authorized project run page. */
+export type ProjectCoordinatorRunCursor = {
+  updated_at_ms: number;
+  run_id: string;
+};
+
+/** One attempt whose captured sources were re-read on its recorded channel. */
+export type ProjectAttemptEvidence = {
+  turn_id: string;
+  channel_id: string;
+  session_scope: string;
+  thread_root_event_id: string | null;
+  batch_trigger_event_ids: string[];
+  merged_cancelled_event_ids: string[];
+  agent_index: number;
+  status: string;
+  liveness: "unknown";
+  task_state: "unknown";
+  runtime_session_match: "unknown";
+  control_target_available: false;
+  started_at_ms: number;
+  updated_at_ms: number;
+};
+
+/** Project-scoped run evidence with no message bodies or control handle. */
+export type ProjectCoordinatorRunEvidence = {
+  run_id: string;
+  channel_id: string;
+  session_scope: string;
+  thread_root_event_id: string | null;
+  original_intent_event_id: string;
+  project_coordinate: string | null;
+  project_link_conflict: boolean;
+  attempt_turns: ProjectAttemptEvidence[];
+  attempt_history_may_be_truncated: boolean;
+  event_history_may_be_truncated: boolean;
+  created_at_ms: number;
+  updated_at_ms: number;
+  task_state: "unknown";
+  history_reliability: "best_effort";
+  history_completeness: "unknown";
+};
+
+/** Project-scoped run evidence returned only after current relay checks. */
+export type ProjectCoordinatorRunsResponse = {
+  project_coordinate: string;
+  runs: ProjectCoordinatorRunEvidence[];
+  attempt_evidence_may_be_truncated: boolean;
+  has_more_candidates: boolean;
+  next_cursor: ProjectCoordinatorRunCursor | null;
+};
+
+export type CriticRoundSettings = {
+  maxOutputTokens: number;
+  timeLimitSeconds: number;
+  thinkingEffortRequested: string | null;
+  estimatedRoundCostBudgetMicrousd?: number | null;
+  routeProfile?: CriticRouteProfileRef | null;
+  coordinatorGuide?: CriticGuideRef | null;
+};
+
+export type CriticGuideRef = {
+  path: "AGENT_GUIDES/CRITICS.md";
+  sha256: string;
+};
+
+export type CriticCoordinatorGuidePreview = CriticGuideRef & {
+  byteLength: number;
+  text: string;
+};
+
+export type CriticRouteProfileRef = {
+  id: string;
+  version: number;
+  hash: string;
+};
+
+export type CriticRouteCandidatePreview = {
+  id: string;
+  provider: string;
+  model: string;
+  configured: boolean;
+  costPricingAvailable: boolean;
+  promptProfile: { id: string; version: number; promptHash: string } | null;
+};
+
+export type CriticRouteProfilePreview = {
+  profile: CriticRouteProfileRef;
+  candidates: CriticRouteCandidatePreview[];
+  estimatedCostLimitMicrousd: number | null;
+};
+
+export type CriticReviewerSummary = {
+  role: string;
+  status: "completed" | "failed";
+  outputTruncated: boolean;
+  candidateId: string | null;
+  providerId: string | null;
+  modelId: string | null;
+  routeProfile?: CriticRouteProfileRef | null;
+  estimatedCostLimitMicrousd?: number | null;
+  elapsedMs: number | null;
+  errorCode: string | null;
+};
+
+export type CriticRoundSummary = {
+  roundId: string;
+  createdAtMs: number;
+  snapshotSha256: string;
+  objectiveSha256: string;
+  scopeSha256: string;
+  settings: CriticRoundSettings;
+  reviewers: CriticReviewerSummary[];
+};
+
+export type CriticReviewerRecord = CriticReviewerSummary & {
+  output: string | null;
+  stopReason: string | null;
+};
+
+export type CriticRoundRecord = Omit<CriticRoundSummary, "reviewers"> & {
+  reviewers: CriticReviewerRecord[];
+};
+
+export type CriticRole =
+  | "correctness"
+  | "security"
+  | "architecture"
+  | "ui_accessibility"
+  | "performance"
+  | "product";
+
+export type CriticRunParams = {
+  objective: string;
+  scope: string;
+  snapshot: string;
+  roles: CriticRole[];
+  maxOutputTokens: number;
+  timeLimitSeconds: number;
+  thinkingEffort:
+    | "none"
+    | "minimal"
+    | "low"
+    | "medium"
+    | "high"
+    | "xhigh"
+    | "max"
+    | null;
+  routeProfiles: Partial<Record<CriticRole, CriticRouteProfileRef>>;
+  estimatedRoundCostBudgetMicrousd: number | null;
+  coordinatorGuideSha256: string;
+};
+
+export type CriticRunResult = {
+  roundId: string | null;
+  ledgerStatus: "saved" | "not_saved";
+  ledgerErrorCode: string | null;
+  snapshotSha256: string;
+  routeProfiles: Partial<Record<CriticRole, CriticRouteProfileRef>>;
+  execution: string;
+  dataBoundary: string;
+  independence: string;
+  limits: {
+    maximumReviewers: number;
+    outputTokensPerReviewer: number;
+    timeLimitSecondsPerReviewer: number;
+    thinkingEffortRequested: CriticRunParams["thinkingEffort"];
+    thinkingEffortNote: string;
+    estimatedRoundCostBudgetMicrousd: number | null;
+  };
+  reviewers: CriticReviewerRecord[];
+};
+
 /**
  * Composite backward keyset cursor for channel-timeline paging via the bridge
  * (`getChannelMessagesBefore`).
@@ -912,6 +1227,20 @@ export type GlobalAgentConfig = {
   model: string | null;
   /** Preferred ACP runtime for agents without a persona-specific runtime. */
   preferred_runtime: string | null;
+};
+
+/** Device-local process and memory limits for Buzz-managed agents and critics. */
+export type GlobalAgentResourcePolicy = {
+  schemaVersion: 1;
+  /** Hard cap on concurrent Buzz-managed agents and critic reviewers; null is uncapped. */
+  maxRunningAgents: number | null;
+  /** Minimum free system RAM before starting another local process; null disables. */
+  minAvailableMemoryBytes: number | null;
+};
+
+export type DeviceMemorySnapshot = {
+  availableMemoryBytes: number;
+  totalMemoryBytes: number;
 };
 
 /**

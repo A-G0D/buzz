@@ -1,6 +1,14 @@
 import * as React from "react";
+import { useQuery } from "@tanstack/react-query";
 
 import type { CreateChannelManagedAgentInput } from "@/features/agents/channelAgents";
+import {
+  applyProjectAgentRouteProfileDefault,
+  parseProjectAgentResourceDefaultsDraft,
+  toProjectAgentResourceDefaultsDraft,
+  type ProjectAgentResourceDefaults,
+  type ProjectAgentResourceDefaultsDraft,
+} from "@/features/projects/projectAgentProfileDefault";
 import {
   useAvailableAcpRuntimes,
   usePersonasQuery,
@@ -17,6 +25,7 @@ import {
   PROJECT_HOME_CHANNEL_TEMPLATE,
   PROJECT_HOME_TEMPLATE_ID,
 } from "@/features/projects/lib/projectHomeTemplate";
+import { listAgentRouteProfiles } from "@/shared/api/tauriAgentRouteProfiles";
 import type { ProjectListingVisibility } from "@/features/projects/projectCreation";
 import type {
   AcpRuntime,
@@ -29,6 +38,9 @@ import type {
 /** Expand the selected team and persona into deduplicated channel agents. */
 export function buildCreateProjectAgents(input: {
   agentPersonaId: string;
+  executionProfileId?: string;
+  routeProfileId?: string | null;
+  resourceDefaults?: ProjectAgentResourceDefaults | null;
   personas: AgentPersona[];
   runtimes: AcpRuntime[];
   teamId: string;
@@ -57,6 +69,13 @@ export function buildCreateProjectAgents(input: {
       name: persona.displayName,
       personaId: persona.id,
       teamId: selectedTeamId,
+      executionProfileId: input.executionProfileId || undefined,
+      parallelism: input.resourceDefaults?.parallelism,
+      idleTimeoutSeconds: input.resourceDefaults?.idleTimeoutSeconds,
+      maxTurnDurationSeconds: input.resourceDefaults?.maxTurnDurationSeconds,
+      forceNewInstance: Boolean(
+        input.executionProfileId || input.resourceDefaults,
+      ),
       harnessOverride: false,
       systemPrompt: persona.systemPrompt,
       avatarUrl: persona.avatarUrl ?? undefined,
@@ -80,7 +99,10 @@ export function buildCreateProjectAgents(input: {
     if (!persona) throw new Error("Choose an agent that still exists.");
     addPersona(persona);
   }
-  return agents;
+  return applyProjectAgentRouteProfileDefault(
+    agents,
+    input.routeProfileId ?? null,
+  );
 }
 
 export function useCreateProjectFormSettings(
@@ -96,8 +118,19 @@ export function useCreateProjectFormSettings(
   const [projectVisibility, setProjectVisibility] =
     React.useState<ProjectListingVisibility>("listed");
   const [agentPersonaId, setAgentPersonaId] = React.useState("");
+  const [executionProfileId, setExecutionProfileId] = React.useState("");
+  const [routeProfileId, setRouteProfileId] = React.useState("");
+  const [resourceDefaultsDraft, setResourceDefaultsDraft] =
+    React.useState<ProjectAgentResourceDefaultsDraft>(
+      toProjectAgentResourceDefaultsDraft(null),
+    );
   const [teamId, setTeamId] = React.useState("");
   const [templateId, setTemplateId] = React.useState(PROJECT_HOME_TEMPLATE_ID);
+  const routeProfilesQuery = useQuery({
+    queryKey: ["agent-route-profiles"],
+    queryFn: listAgentRouteProfiles,
+    enabled: active && Boolean(agentPersonaId || teamId),
+  });
 
   const personas = React.useMemo(
     () => getActivePersonas(personasQuery.data ?? []),
@@ -122,6 +155,9 @@ export function useCreateProjectFormSettings(
     setChannelVisibility("open");
     setProjectVisibility("listed");
     setAgentPersonaId("");
+    setExecutionProfileId("");
+    setRouteProfileId("");
+    setResourceDefaultsDraft(toProjectAgentResourceDefaultsDraft(null));
     setTeamId("");
     setTemplateId(PROJECT_HOME_TEMPLATE_ID);
   }, [active]);
@@ -140,6 +176,16 @@ export function useCreateProjectFormSettings(
     }
   }, [teamId, teams]);
   React.useEffect(() => {
+    if (!teamId && !agentPersonaId && executionProfileId) {
+      setExecutionProfileId("");
+    }
+  }, [agentPersonaId, executionProfileId, teamId]);
+  React.useEffect(() => {
+    if (!teamId && !agentPersonaId && routeProfileId) {
+      setRouteProfileId("");
+    }
+  }, [agentPersonaId, routeProfileId, teamId]);
+  React.useEffect(() => {
     if (
       templateId &&
       !templates.some((template) => template.id === templateId)
@@ -148,17 +194,63 @@ export function useCreateProjectFormSettings(
     }
   }, [templateId, templates]);
 
+  const getResourceDefaults = React.useCallback(() => {
+    if (!agentPersonaId && !teamId) return null;
+    const parsed = parseProjectAgentResourceDefaultsDraft(
+      resourceDefaultsDraft,
+    );
+    if (!parsed) {
+      throw new Error(
+        "Enter whole numbers of 1 or more. Parallelism can be at most 32.",
+      );
+    }
+    return Object.keys(parsed).length > 0 ? parsed : null;
+  }, [agentPersonaId, resourceDefaultsDraft, teamId]);
+
   const buildAgents = React.useCallback(
-    () =>
+    (
+      resourceDefaults: ProjectAgentResourceDefaults | null,
+      selectedRouteProfileId: string | null,
+    ) =>
       buildCreateProjectAgents({
         agentPersonaId,
+        executionProfileId,
+        routeProfileId: selectedRouteProfileId,
+        resourceDefaults,
         personas,
         runtimes: runtimesQuery.data,
         teamId,
         teams,
       }),
-    [agentPersonaId, personas, runtimesQuery.data, teamId, teams],
+    [
+      agentPersonaId,
+      executionProfileId,
+      personas,
+      runtimesQuery.data,
+      teamId,
+      teams,
+    ],
   );
+
+  const getRouteProfileId = React.useCallback(() => {
+    if (!routeProfileId) return null;
+    if (
+      !routeProfilesQuery.isSuccess ||
+      !routeProfilesQuery.data.some((profile) => profile.id === routeProfileId)
+    ) {
+      throw new Error(
+        routeProfilesQuery.isError
+          ? "Could not verify the selected route profile. Retry loading routes or turn routing off."
+          : "The selected route profile is unavailable. Choose a saved profile or turn routing off.",
+      );
+    }
+    return routeProfileId;
+  }, [
+    routeProfileId,
+    routeProfilesQuery.data,
+    routeProfilesQuery.isError,
+    routeProfilesQuery.isSuccess,
+  ]);
 
   const applyTemplate = React.useCallback(
     (template: ChannelTemplate) => {
@@ -192,8 +284,19 @@ export function useCreateProjectFormSettings(
     handleTemplateChange,
     personas,
     projectVisibility,
+    executionProfileId,
+    routeProfileId,
+    routeProfiles: routeProfilesQuery.data ?? [],
+    routeProfilesError: routeProfilesQuery.isError,
+    routeProfilesLoading: routeProfilesQuery.isLoading,
+    getRouteProfileId,
+    getResourceDefaults,
     runtimesAvailable: runtimesQuery.data.length > 0,
     setAgentPersonaId,
+    setExecutionProfileId,
+    setRouteProfileId,
+    resourceDefaultsDraft,
+    setResourceDefaultsDraft,
     setChannelVisibility,
     setProjectVisibility,
     setTeamId,

@@ -101,6 +101,7 @@ fn record(
         definition_respond_to: None,
         definition_respond_to_allowlist: vec![],
         definition_parallelism: None,
+        execution_profile: None,
     }
 }
 
@@ -219,6 +220,23 @@ fn linked_blank_prompt_means_no_prompt() {
 
     assert_eq!(cfg.system_prompt.value, None);
     assert_eq!(cfg.system_prompt.source, ConfigSource::Definition);
+}
+
+#[test]
+fn linked_archetype_is_composed_as_an_instance_only_prompt_overlay() {
+    let mut rec = record(Some("d1"), Some("stale-model"), None, None);
+    rec.execution_profile =
+        crate::managed_agents::execution_profile::resolve_execution_profile(Some("critic"))
+            .unwrap();
+    let defs = vec![definition("d1", Some("def-model"), None, "persona prompt")];
+    let cfg = resolve_effective_config(&rec, &defs, &global(None, None))
+        .require_resolved()
+        .unwrap();
+
+    let prompt = cfg.system_prompt.value.unwrap();
+    assert!(prompt.starts_with("persona prompt\n\n<agent-archetype id=\"critic\" version=\"1\">"));
+    assert!(prompt.contains("Look for counterexamples"));
+    assert_eq!(cfg.model.value.as_deref(), Some("def-model"));
 }
 
 #[test]

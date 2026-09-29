@@ -15,6 +15,7 @@ import { huddleWindowChannelId } from "@/features/huddle/lib/huddleWindow";
 import { CommunityOnboardingProvider } from "@/features/onboarding/communityOnboarding";
 import { ThemeProvider } from "@/shared/theme/ThemeProvider";
 import { AvatarClipPaths } from "@/shared/ui/AvatarClipPaths";
+import { renderStartupFailure } from "@/app/startupFailure";
 import { EmojiBurstProvider } from "@/shared/ui/EmojiBurstProvider";
 import { PoofBurstProvider } from "@/shared/ui/PoofBurstProvider";
 import { Toaster } from "@/shared/ui/sonner";
@@ -136,4 +137,7 @@ async function bootstrap() {
   renderApp();
 }
 
-void bootstrap();
+void bootstrap().catch((error: unknown) => {
+  console.error("[startup] pre-render initialization failed:", error);
+  renderStartupFailure(document, () => window.location.reload());
+});

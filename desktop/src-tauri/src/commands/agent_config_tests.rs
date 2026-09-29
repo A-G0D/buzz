@@ -60,6 +60,8 @@ fn goose_runtime() -> &'static KnownAcpRuntime {
         max_tokens_env_var: Some("GOOSE_MAX_TOKENS"),
         context_limit_env_var: Some("GOOSE_CONTEXT_LIMIT"),
         max_rounds_env_var: None,
+        summary_model_env_var: None,
+        summary_max_tokens_env_var: None,
         required_normalized_fields: &["model", "provider"],
         login_hint: None,
         auth_probe_args: None,
@@ -127,6 +129,7 @@ fn agent_record() -> ManagedAgentRecord {
         agent_command_override: None,
         persona_source_version: None,
         provider: None,
+        execution_profile: None,
     }
 }
 

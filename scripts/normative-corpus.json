@@ -1,5 +1,53 @@
 [
   {
+    "_group": "DeepSeek provider canonicalization and conservative unknown fallback",
+    "_note": "DeepSeek baseline is grounded in the official thinking-mode documentation; concrete unknown model IDs retain neutral fallback capabilities."
+  },
+  {
+    "id": "deepseek-trimmed-case-provider-blank-baseline",
+    "provider": " DeepSeek ",
+    "raw_model_id": "",
+    "_note": "Probes trim/lowercase provider canonicalization and the provider baseline without inferring a model list.",
+    "expect": {
+      "thinking_mode": "adaptive",
+      "supported_efforts": [
+        "none",
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "default_effort": "high",
+      "databricks_v2_wire_route": "not-applicable",
+      "normalization_policy": "none",
+      "registry_label": null
+    }
+  },
+  {
+    "id": "deepseek-concrete-unknown-neutral-fallback",
+    "provider": "deepseek",
+    "raw_model_id": "unlisted-model-id",
+    "_note": "An unknown model ID must not inherit the provider's documented baseline.",
+    "expect": {
+      "thinking_mode": "none",
+      "supported_efforts": [
+        "none",
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "default_effort": "medium",
+      "databricks_v2_wire_route": "not-applicable",
+      "normalization_policy": "none",
+      "registry_label": null
+    }
+  },
+  {
     "_group": "Anthropic curated family-rule model names"
   },
   {

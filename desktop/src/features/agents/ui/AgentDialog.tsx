@@ -15,6 +15,7 @@ import type { BackendIntent } from "../lib/instanceInputForDefinition";
 import type { AgentCreateIntent } from "./agentCreateIntent";
 import type { EditAgentFocusTarget } from "@/features/agents/openEditAgentEvent";
 import { AgentInstanceEditDialog } from "./AgentInstanceEditDialog";
+import { AgentArchetypeSelect } from "./AgentArchetypeSelect";
 import { createPersonaDialogState } from "./personaDialogState";
 import {
   AgentDefinitionDialog,
@@ -42,6 +43,7 @@ type AgentDialogCreateProps = {
     input: CreatePersonaInput | UpdatePersonaInput,
     intent: AgentCreateIntent,
     backendIntent: BackendIntent | null,
+    executionProfileId?: string,
   ) => Promise<boolean>;
 };
 
@@ -135,6 +137,8 @@ function AgentCreateDialogRouter({
   onSubmitDefinition,
 }: AgentDialogCreateProps) {
   const [runDraft, setRunDraft] = React.useState(emptyWhereToRunDraft);
+  const [executionProfileId, setExecutionProfileId] =
+    React.useState("balanced");
   const initialValues = React.useMemo(
     () => providedInitialValues ?? createPersonaDialogState().initialValues,
     [providedInitialValues],
@@ -148,14 +152,30 @@ function AgentCreateDialogRouter({
     <AgentRunLocationProvider runLocation={runLocationForRunOn(runDraft.runOn)}>
       <AgentDefinitionDialog
         createRunSection={
-          <WhereToRunSection
-            draft={runDraft}
-            isPending={isDefinitionPending}
-            onDraftChange={(nextDraft) => {
-              setRunDraft(nextDraft);
-              onDirtyChange?.(true);
-            }}
-          />
+          <div className="space-y-4">
+            <WhereToRunSection
+              draft={runDraft}
+              isPending={isDefinitionPending}
+              onDraftChange={(nextDraft) => {
+                setRunDraft(nextDraft);
+                onDirtyChange?.(true);
+              }}
+            />
+            {runDraft.runOn === "local" ? (
+              <AgentArchetypeSelect
+                disabled={isDefinitionPending}
+                onChange={(id) => {
+                  setExecutionProfileId(id);
+                  onDirtyChange?.(true);
+                }}
+                value={executionProfileId}
+              />
+            ) : (
+              <p className="text-xs leading-relaxed text-muted-foreground">
+                Starting styles currently apply to agents running locally.
+              </p>
+            )}
+          </div>
         }
         createSubmitBlocked={!canSubmitWhereToRun(runDraft)}
         description={copy.description}
@@ -170,6 +190,7 @@ function AgentCreateDialogRouter({
             input,
             "definition_start",
             resolveBackendIntent(runDraft),
+            runDraft.runOn === "local" ? executionProfileId : undefined,
           );
           if (submitted) {
             onDirtyChange?.(false);

@@ -39,6 +39,15 @@ fn nest_skill_contains_safe_mention_workflow() {
     assert!(BUZZ_CLI_SKILL_MD.contains("no follow-up verification command is needed"));
     assert!(BUZZ_CLI_SKILL_MD.contains("Add membership separately only when authorized"));
     assert!(BUZZ_CLI_SKILL_MD.contains("never changes membership automatically"));
+    assert!(BUZZ_CLI_SKILL_MD.contains("No skill is a valid outcome"));
+    assert!(BUZZ_CLI_SKILL_MD.contains("confirm its stated preconditions"));
+    assert!(BUZZ_CLI_SKILL_MD.contains("propose an edit before adding a duplicate"));
+    assert!(BUZZ_CLI_SKILL_MD
+        .contains("propose a merge only when triggers, preconditions, and steps overlap"));
+    assert!(BUZZ_CLI_SKILL_MD.contains("a split when distinct scopes need distinct triggers"));
+    assert!(BUZZ_CLI_SKILL_MD.contains("until reviewed and explicitly imported"));
+    assert!(BUZZ_CLI_SKILL_MD
+        .contains("Never automatically download, install, or execute skill content"));
 }
 
 #[test]
@@ -92,6 +101,36 @@ fn ensure_nest_creates_all_dirs_and_agents_md() {
             & 0o777;
         assert_eq!(repos_mode, 0o700, "REPOS/ should be 700");
     }
+}
+
+#[test]
+fn ensure_nest_seeds_nested_task_maps_without_overwriting_local_edits() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join(".buzz");
+    ensure_nest_at(&root).unwrap();
+
+    let task_index = fs::read_to_string(root.join("AGENT_GUIDES/AGENTS.md")).unwrap();
+    assert!(task_index.contains("[`CODING.md`](CODING.md)"));
+    assert!(task_index.contains("[`WRITING.md`](WRITING.md)"));
+    assert!(task_index.contains("[`RESEARCH.md`](RESEARCH.md)"));
+    assert!(task_index.contains("[`ORCHESTRATION.md`](ORCHESTRATION.md)"));
+    assert!(task_index.contains("[`CRITICS.md`](CRITICS.md)"));
+    assert!(task_index.contains("no-match is the better answer"));
+
+    for (name, expected) in AGENT_INSTRUCTION_MAPS {
+        let path = root.join("AGENT_GUIDES").join(name);
+        assert_eq!(fs::read_to_string(path).unwrap(), *expected);
+    }
+
+    let local_edit = root.join("AGENT_GUIDES/CODING.md");
+    fs::write(&local_edit, "local coding map").unwrap();
+    fs::remove_file(root.join("AGENT_GUIDES/CRITICS.md")).unwrap();
+    ensure_nest_at(&root).unwrap();
+    assert_eq!(fs::read_to_string(local_edit).unwrap(), "local coding map");
+    assert_eq!(
+        fs::read_to_string(root.join("AGENT_GUIDES/CRITICS.md")).unwrap(),
+        include_str!("../nest_guides/CRITICS.md")
+    );
 }
 
 #[test]
@@ -477,6 +516,7 @@ fn refresh_agents_md_upgrades_attribution_and_preserves_owned_content() {
     assert_eq!(content.matches("## Git Commit Attribution").count(), 1);
     assert!(!content.contains("**Human sign-off (required):**"));
     assert!(content.contains("| Kit | Builder | @Kit |"));
+    assert!(content.contains("AGENT_GUIDES/CRITICS.md"));
     assert!(content.contains("## Local Notes\n\nKeep me."));
 }
 
@@ -553,8 +593,12 @@ fn refresh_skill_overwrites_on_version_bump() {
     let skill_md = root.join(".agents/skills/buzz-cli/SKILL.md");
     fs::write(&skill_md, "stale skill content").unwrap();
 
-    // Remove version file to simulate upgrade.
-    let _ = fs::remove_file(root.join(".agents/skills/buzz-cli/.skill-version"));
+    // Simulate a prior installed prompt version so existing nests refresh.
+    fs::write(
+        root.join(".agents/skills/buzz-cli/.skill-version"),
+        format!("{}\n", NEST_SKILL_VERSION.saturating_sub(1)),
+    )
+    .unwrap();
 
     ensure_nest_at(&root).unwrap();
 
@@ -563,4 +607,6 @@ fn refresh_skill_overwrites_on_version_bump() {
         content, BUZZ_CLI_SKILL_MD,
         "SKILL.md must be refreshed on version bump"
     );
+    let version = fs::read_to_string(root.join(".agents/skills/buzz-cli/.skill-version")).unwrap();
+    assert_eq!(version.trim(), NEST_SKILL_VERSION.to_string());
 }

@@ -84,6 +84,8 @@ export type MessageComposerProps = {
     parentEventId: string | null;
     threadHeadId: string | null;
   } | null;
+  /** Consumes a recognized whole-draft command before normal message preparation. */
+  onConsumeSubmit?: (content: string) => boolean;
   onPrepareSendChannel?: (pubkeys?: string[]) => Promise<string | null>;
   onPreparingMentionSendChange?: (isPreparing: boolean) => void;
   onSend: (
@@ -97,6 +99,7 @@ export type MessageComposerProps = {
     } | null,
     /** Route through the REST publisher even when best-effort enrichment settled empty. */
     forceRest?: boolean,
+    taskClass?: string | null,
   ) => Promise<void>;
   placeholder?: string;
   profiles?: UserProfileLookup;
@@ -108,6 +111,8 @@ export type MessageComposerProps = {
     id: string;
   } | null;
   showTopBorder?: boolean;
+  /** Show the explicit per-message task class control. */
+  showTaskClassPicker?: boolean;
   /** Render the app-wide upload queue above this composer dock. */
   showBackgroundUploadProgress?: boolean;
   toolbarExtraActions?: ReactNode;

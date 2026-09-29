@@ -272,6 +272,21 @@ pub fn load_managed_agents<R: tauri::Runtime>(
     Ok(records)
 }
 
+/// Read non-secret candidates for local coordinator selection without opening
+/// agent key material. A selected candidate still goes through normal runtime
+/// readiness and tenant checks before it can start.
+pub fn active_managed_agent_pubkeys<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+) -> Result<Vec<String>, String> {
+    Ok(load_agent_store(app)?
+        .into_iter()
+        .filter(|record| {
+            !record.pubkey.is_empty() && record.is_active && !record.provider_policy_pending
+        })
+        .map(|record| record.pubkey.to_ascii_lowercase())
+        .collect())
+}
+
 /// Load the key-less agent *definitions* (former personas) from the unified
 /// store. The persona compatibility shim (`load_personas`) presents these in
 /// the legacy shape via `to_definition_view`.

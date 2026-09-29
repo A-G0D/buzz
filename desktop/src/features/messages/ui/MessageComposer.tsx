@@ -85,6 +85,7 @@ function MessageComposerImpl({
   onCancelEdit,
   onCancelReply,
   onCaptureSendContext,
+  onConsumeSubmit,
   onEditLastOwnMessage,
   onEditSave,
   onPrepareSendChannel,
@@ -96,6 +97,7 @@ function MessageComposerImpl({
   replyTarget = null,
   mediaController,
   showBackgroundUploadProgress = true,
+  showTaskClassPicker = false,
   showTopBorder = false,
   toolbarExtraActions,
   typingParentEventId = null,
@@ -117,6 +119,7 @@ function MessageComposerImpl({
   } = useComposerLinkPreviews(previewContent, editTarget == null);
   const [isEmojiPickerOpen, setIsEmojiPickerOpen] = React.useState(false);
   const [isFormattingOpen, setIsFormattingOpen] = React.useState(false);
+  const [taskClass, setTaskClass] = React.useState("");
   const handleFormattingToggle = React.useCallback((pressed: boolean) => {
     if (pressed) setIsEmojiPickerOpen(false);
     setIsFormattingOpen(pressed);
@@ -621,6 +624,10 @@ function MessageComposerImpl({
     ) {
       return;
     }
+    if (!hasMedia && onConsumeSubmit?.(trimmed)) {
+      runComposerUpdate(mentionSendFlow.clearComposer);
+      return;
+    }
     const capturedThreadContext = onCaptureSendContext?.() ?? null;
     if (
       capturedThreadContext !== null &&
@@ -651,6 +658,7 @@ function MessageComposerImpl({
         ),
         recoveryDraftKey: effectiveDraftKey,
         spoileredAttachmentUrls,
+        taskClass: taskClass || null,
         trimmed,
       });
     } finally {
@@ -672,6 +680,7 @@ function MessageComposerImpl({
     media.restoreQueuedAttachments,
     media.setPendingImeta,
     media.setUploadState,
+    mentionSendFlow.clearComposer,
     mentionSendFlow.isPreparingMentionSend,
     mentionSendFlow.sendMessageWithMentionFlow,
     mentions.clearMentions,
@@ -679,11 +688,14 @@ function MessageComposerImpl({
     richText.setContent,
     setComposerContent,
     setSpoileredAttachmentUrls,
+    taskClass,
     spoileredAttachmentUrls,
     syncComposerContentFromEditor,
     onCaptureSendContext,
+    onConsumeSubmit,
     onPreparingMentionSendChange,
     persistentAudience.pubkeys,
+    runComposerUpdate,
     isEditSubmissionLocked,
     effectiveDraftKey,
     mentions.getDraftMentionRefs,
@@ -960,7 +972,34 @@ function MessageComposerImpl({
               layoutMode={layoutMode}
               composerDisabled={composerDisabled}
               editor={richText.editor}
-              extraActions={toolbarExtraActions}
+              extraActions={
+                <>
+                  {showTaskClassPicker && editTarget == null ? (
+                    <label className="flex h-7 items-center gap-1.5 rounded-md border border-border/70 bg-background/60 px-2 text-xs text-muted-foreground">
+                      <span>Task type</span>
+                      <select
+                        aria-label="Task type for this message"
+                        className="max-w-28 bg-transparent text-foreground outline-none"
+                        disabled={composerDisabled}
+                        onChange={(event) => setTaskClass(event.target.value)}
+                        value={taskClass}
+                      >
+                        <option value="">Unspecified</option>
+                        <option value="goal">Goal run</option>
+                        <option value="coding">Coding</option>
+                        <option value="code_review">Code review</option>
+                        <option value="research">Research</option>
+                        <option value="writing">Writing</option>
+                        <option value="analysis">Analysis</option>
+                        <option value="planning">Planning</option>
+                        <option value="summarization">Summarization</option>
+                        <option value="classification">Classification</option>
+                      </select>
+                    </label>
+                  ) : null}
+                  {toolbarExtraActions}
+                </>
+              }
               formattingDisabled={composerDisabled}
               gifMediaController={media}
               isEmojiPickerOpen={isEmojiPickerOpen}

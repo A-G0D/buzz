@@ -5,6 +5,7 @@ import {
   findProjectHomeByChannelId,
   hasAuthoritativeHomeBinding,
   isProjectHomeChannel,
+  resolveMemberProjectHomeChannel,
 } from "./projectHomeChannel.ts";
 
 const OWNER = "a".repeat(64);
@@ -138,4 +139,60 @@ test("findProjectHomeByChannelId prefers the oldest listed authoritative home", 
     { ...base, createdAt: 100, id: "original" },
   ]);
   assert.equal(selected?.id, "original");
+});
+
+test("resolveMemberProjectHomeChannel returns only the signed-in member's authoritative project home", () => {
+  const current = {
+    ...project(),
+    createdAt: 1,
+    id: "project-a",
+    legacy: false,
+    visibility: "listed",
+  };
+  const channel = { id: "channel-a", isMember: true };
+
+  assert.equal(
+    resolveMemberProjectHomeChannel(current, [current], [channel]),
+    channel,
+  );
+  assert.equal(
+    resolveMemberProjectHomeChannel(
+      current,
+      [current],
+      [{ ...channel, isMember: false }],
+    ),
+    null,
+  );
+  assert.equal(resolveMemberProjectHomeChannel(current, [current], []), null);
+});
+
+test("resolveMemberProjectHomeChannel rejects stale or competing home bindings", () => {
+  const current = {
+    ...project(),
+    createdAt: 100,
+    id: "project-new",
+    legacy: false,
+    visibility: "listed",
+  };
+  const olderOwner = {
+    ...project(),
+    createdAt: 50,
+    id: "project-old",
+    legacy: false,
+    visibility: "listed",
+  };
+  const channel = { id: "channel-a", isMember: true };
+
+  assert.equal(
+    resolveMemberProjectHomeChannel(current, [olderOwner, current], [channel]),
+    null,
+  );
+  assert.equal(
+    resolveMemberProjectHomeChannel(
+      current,
+      [current],
+      [{ ...channel, id: "another-channel" }],
+    ),
+    null,
+  );
 });

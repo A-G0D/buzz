@@ -167,6 +167,7 @@ const ProviderFallbacksSchema = z
     databricks: FallbackPairSchema,
     databricks_v2: FallbackPairSchema,
     openrouter: FallbackPairSchema,
+    deepseek: FallbackPairSchema,
     _default: FallbackPairSchema,
   })
   .strict();
@@ -185,6 +186,9 @@ export const ManifestSchema = z
     _comment_label_family_tokens: z.string().optional(),
     _comment_databricks_v2_known_models: z.string().optional(),
     _sources: z.record(z.string(), z.string()).optional(),
+    effort_mappings: z
+      .record(z.string(), z.record(z.string(), z.string()))
+      .optional(),
   })
   .strict();
 

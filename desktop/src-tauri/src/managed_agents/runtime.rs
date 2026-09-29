@@ -56,12 +56,21 @@ fn apply_custom_acp_git_credentials(
     command.env("GIT_CONFIG_VALUE_1", "true");
 }
 
+fn apply_workspace_owner_identity_env(command: &mut std::process::Command, owner_hex: Option<&str>) {
+    if let Some(owner_pubkey) = owner_hex {
+        command.env("BUZZ_WORKSPACE_OWNER_PUBKEY", owner_pubkey);
+    } else {
+        command.env_remove("BUZZ_WORKSPACE_OWNER_PUBKEY");
+    }
+}
+
 pub(crate) use super::access_policy::{build_respond_to_env_with_policy, RespondToEnv};
 
 mod metadata;
 pub(crate) use metadata::{
     apply_agent_display_env, apply_replay_floor_env, child_rust_log_filter, resolve_session_title,
-    runtime_metadata_env_vars, DISPLAY_NAME_ENV_VAR, REPLAY_FLOOR_ENV_VAR, SESSION_TITLE_ENV_VAR,
+    clear_review_only_env, runtime_metadata_env_vars, DISPLAY_NAME_ENV_VAR, REPLAY_FLOOR_ENV_VAR,
+    SESSION_TITLE_ENV_VAR,
 };
 
 mod setup_payload;
@@ -276,18 +285,26 @@ pub fn build_managed_agent_summary(
 
     // The prospective side is computed only for a tracked pair: an unstamped
     // agent has nothing to compare against.
-    let tracked_spawn = pair_key.as_ref().zip(pair_runtime).map(|(key, runtime)| {
-        let current = crate::managed_agents::spawn_snapshot::prospective_spawn_config_snapshot(
+    let mut prompt_profile_resolution_error = None;
+    let tracked_spawn = if let Some((key, runtime)) = pair_key.as_ref().zip(pair_runtime) {
+        match crate::managed_agents::spawn_snapshot::prospective_spawn_config_snapshot(
             record,
             personas,
             teams,
             &key.relay_url,
             global_config,
             super::owner_only_access_build(),
-        );
-        (runtime, current)
-    });
-    let restart_diff = crate::managed_agents::spawn_snapshot::eligible_restart_diff(
+        ) {
+            Ok(current) => Some((runtime, current)),
+            Err(error) => {
+                prompt_profile_resolution_error = Some(error);
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let mut restart_diff = crate::managed_agents::spawn_snapshot::eligible_restart_diff(
         persona_orphaned,
         tracked_spawn.as_ref().map(|(runtime, current)| {
             crate::managed_agents::spawn_snapshot::TrackedSpawnState {
@@ -298,6 +315,15 @@ pub fn build_managed_agent_summary(
             }
         }),
     );
+    if let Some(error) = prompt_profile_resolution_error {
+        restart_diff.push(crate::managed_agents::spawn_snapshot::RestartDiffEntry {
+            field: "prompt_profile_resolution".to_string(),
+            change: crate::managed_agents::spawn_snapshot::diff::RestartChange::Value {
+                before: serde_json::json!("available at last start"),
+                after: serde_json::json!(format!("unavailable: {error}")),
+            },
+        });
+    }
     // One vector is the whole truth: badge on ⟺ there is a diff to show.
     let needs_restart = !restart_diff.is_empty();
 
@@ -371,6 +397,7 @@ pub fn build_managed_agent_summary(
         log_path,
         respond_to: record.respond_to,
         respond_to_allowlist: record.respond_to_allowlist.clone(),
+        execution_profile: record.execution_profile.clone(),
     })
 }
 
@@ -537,7 +564,11 @@ pub fn spawn_agent_child(
                 )
             })?;
     let effective_command = &descriptor.command;
-    let agent_args = &descriptor.args;
+    let mut agent_args = descriptor.args.clone();
+    // Resolve and validate the local route profile before writing a log marker
+    // or opening child-process logs. The profile is pinned for this launch.
+    let route_profile =
+        super::agent_route_profile::resolve_for_spawn(record, effective_command)?;
 
     let log_path = super::managed_agent_runtime_log_path(app, &runtime_key)?;
     append_log_marker(
@@ -612,6 +643,8 @@ pub fn spawn_agent_child(
     command.env("BUZZ_RELAY_URL", &effective_relay_url);
     command.env("BUZZ_ACP_LAZY_POOL", if lazy { "true" } else { "false" });
     command.env("BUZZ_ACP_IDLE_POOL_SLEEP", idle_pool_sleep_env(lazy));
+    // Ordinary agents must not inherit a critic-only mode from the parent.
+    clear_review_only_env(&mut command);
     // Publish-first mention sends hand the harness the send timestamp as a
     // startup replay floor. Strip any ambient value here — before the
     // `descriptor.env` loop — so a floor from the parent environment can never
@@ -679,11 +712,40 @@ pub fn spawn_agent_child(
     // spawn semantics in lock-step (see `EffectiveAgentConfig::relay_mesh_model_id`).
     #[cfg(feature = "mesh-llm")]
     let mesh_model_id = effective_cfg.relay_mesh_model_id();
-    let effective_prompt = effective_cfg.system_prompt.value;
+    let base_prompt = effective_cfg.system_prompt.value;
     let effective_model = effective_cfg.model.value;
     let effective_provider = effective_cfg.provider.value;
+    let prompt_profile = if route_profile.is_some() {
+        None
+    } else {
+        super::agent_prompt_profile::resolve_for_spawn(
+            record,
+            effective_command,
+            &descriptor.env,
+            effective_model.as_deref(),
+        )?
+    };
+    let profile_base_prompt = if route_profile.is_some() {
+        super::config_bridge::effort::get_ci(&descriptor.env, "BUZZ_ACP_SYSTEM_PROMPT")
+            .map(String::as_str)
+            .or(base_prompt.as_deref())
+    } else {
+        prompt_profile
+            .as_ref()
+            .and_then(|resolved| resolved.profile.as_ref())
+            .and_then(|_| {
+                super::config_bridge::effort::get_ci(&descriptor.env, "BUZZ_ACP_SYSTEM_PROMPT")
+            })
+            .map(String::as_str)
+            .or(base_prompt.as_deref())
+    };
+    let effective_prompt = super::agent_prompt_profile::compose_system_prompt(
+        profile_base_prompt,
+        prompt_profile.as_ref(),
+    );
 
-    if let Some(prompt) = &effective_prompt {
+    let is_dsh = runtime_meta.is_some_and(|runtime| runtime.id == "dsh");
+    if let Some(prompt) = effective_prompt.as_ref().filter(|_| !is_dsh) {
         command.env("BUZZ_ACP_SYSTEM_PROMPT", prompt);
     } else {
         command.env_remove("BUZZ_ACP_SYSTEM_PROMPT");
@@ -703,6 +765,11 @@ pub fn spawn_agent_child(
     if let Some(model) = acp_model.as_deref() {
         command.env("BUZZ_ACP_MODEL", model);
     } else {
+        command.env_remove("BUZZ_ACP_MODEL");
+    }
+    // The ACP-level model override bypasses Buzz Agent's per-prompt route
+    // selection, so a routed launch must leave that override unset.
+    if route_profile.is_some() {
         command.env_remove("BUZZ_ACP_MODEL");
     }
     // Session title for the harness to pass out-of-band on `session/new`. The
@@ -779,6 +846,77 @@ pub fn spawn_agent_child(
     for (key, value) in &descriptor.env {
         command.env(key, value);
     }
+    // The store key comes from the workspace identity captured by Desktop,
+    // never an agent definition or an ambient inherited value.
+    apply_workspace_owner_identity_env(&mut command, owner_hex);
+    super::agent_route_profile::apply_route_profile_env(&mut command, route_profile.as_ref());
+    command.env_remove(buzz_agent_pkg::task_fit_evidence::TASK_FIT_REVIEW_PUBLIC_KEY_ENV);
+    if route_profile
+        .as_ref()
+        .is_some_and(|profile| profile.document.uses_task_fit_routing())
+    {
+        if let Some(owner_hex) = owner_hex {
+            command.env(
+                buzz_agent_pkg::task_fit_evidence::TASK_FIT_REVIEW_PUBLIC_KEY_ENV,
+                owner_hex,
+            );
+        }
+    }
+    if route_profile.is_some() {
+        command.env_remove("BUZZ_ACP_MODEL");
+    }
+    if is_dsh {
+        command.env_remove("BUZZ_ACP_SYSTEM_PROMPT");
+    }
+    if let Some(profile) = prompt_profile
+        .as_ref()
+        .filter(|resolved| resolved.dsh)
+        .and_then(|resolved| resolved.profile.as_ref())
+    {
+        let root = super::nest_dir().ok_or("cannot resolve Buzz workspace")?;
+        let path = super::agent_prompt_profile::write_dsh_overlay(
+            &root,
+            profile,
+            effective_prompt
+                .as_deref()
+                .ok_or("DSH prompt profile resolved without composed prompt")?,
+        )?;
+        if path.to_string_lossy().contains(',') {
+            return Err("DSH overlay path cannot contain a comma in ACP argument transport".into());
+        }
+        agent_args.extend(["--patch".to_string(), path.to_string_lossy().into_owned()]);
+        command.env("BUZZ_ACP_AGENT_ARGS", agent_args.join(","));
+    }
+    if !is_dsh
+        && prompt_profile
+            .as_ref()
+            .is_some_and(|resolved| resolved.profile.is_some())
+    {
+        if let Some(prompt) = effective_prompt.as_deref() {
+            command.env("BUZZ_ACP_SYSTEM_PROMPT", prompt);
+        }
+    }
+    super::agent_prompt_profile::apply_provenance_env(&mut command, prompt_profile.as_ref());
+    // Profile provenance is stamped after user env layering so the journal
+    // records the resolved managed-agent settings, not an env override.
+    super::execution_profile::apply_profile_provenance_env(
+        &mut command,
+        record.execution_profile.as_ref(),
+    );
+    // Provider provenance agrees with the same effective provider chosen by
+    // spawn preflight, not an environment override.
+    if is_dsh || route_profile.is_some() {
+        command.env_remove("BUZZ_ACP_PROVIDER");
+    } else if let Some(provider) = prompt_profile
+        .as_ref()
+        .filter(|resolved| !resolved.dsh)
+        .and_then(|resolved| resolved.provider_id.as_deref())
+        .or(effective_provider.as_deref())
+    {
+        command.env("BUZZ_ACP_PROVIDER", provider);
+    } else {
+        command.env_remove("BUZZ_ACP_PROVIDER");
+    }
     // Resolve once and stamp the same value onto the environment and snapshot.
     let acp_session_policy = super::effective_acp_session_policy(record, &personas);
     super::apply_acp_session_policy_env(&mut command, acp_session_policy);
@@ -820,6 +958,15 @@ pub fn spawn_agent_child(
         .env("BUZZ_MANAGED_AGENT", current_instance_id(app))
         .env("BUZZ_MANAGED_AGENT_START_NONCE", &start_nonce);
 
+    // Keep local journals in the exact prod/dev nest selected by Desktop.
+    // This is stamped after descriptor.env so an agent definition cannot
+    // redirect Buzz-owned control-plane state.
+    if let Some(nest_dir) = crate::managed_agents::nest_dir() {
+        command.env("BUZZ_NEST_DIR", nest_dir);
+    } else {
+        command.env_remove("BUZZ_NEST_DIR");
+    }
+
     // Stamp spawn config from values above, BEFORE spawning — a post-spawn
     // re-resolve races config edits and would stamp the wrong values.
     let spawn_config = super::spawn_snapshot::SpawnConfigSnapshot::from_inputs(
@@ -831,6 +978,7 @@ pub fn spawn_agent_child(
             system_prompt: effective_prompt.as_deref(),
             model: effective_model.as_deref(),
             provider: effective_provider.as_deref(),
+            route_profile: route_profile.as_ref().map(|resolved| &resolved.identity),
             enforced_owner_only: super::owner_only_access_build(),
             session_policy: acp_session_policy,
         },
@@ -852,13 +1000,21 @@ pub fn spawn_agent_child(
         command.creation_flags(CREATE_NO_WINDOW);
     }
 
-    let child = spawn_with_effort_proof(&mut command, effort).map_err(|error| {
-        format!(
-            "failed to spawn `{}` for agent {}: {error}",
-            resolved_acp_command.display(),
-            record.name
-        )
-    })?;
+    let state = app.state::<crate::app_state::AppState>();
+    let child = super::with_memory_admission(
+        &state.managed_agent_memory_admission,
+        || super::load_global_agent_resource_policy(app),
+        || super::device_memory_snapshot().available_memory_bytes,
+        || {
+            spawn_with_effort_proof(&mut command, effort).map_err(|error| {
+                format!(
+                    "failed to spawn `{}` for agent {}: {error}",
+                    resolved_acp_command.display(),
+                    record.name
+                )
+            })
+        },
+    )?;
 
     // Codex: stamp adapter availability for the Phase-2 badge drift check.
     // Cold cache returns `None` → drift check skipped until discovery warms it.
@@ -922,6 +1078,8 @@ pub fn start_managed_agent_process(
         super::remove_agent_runtime_receipt(app, &key);
     }
 
+    let _start_reservation = super::reserve_managed_agent_start(app, runtimes, &key)?;
+
     // Scalar PIDs are migration-only and never establish pair liveness.
     record.runtime_pid = None;
 
@@ -939,6 +1097,7 @@ pub fn start_managed_agent_process(
         pid: process.child.id(),
         desktop_instance_id: current_instance_id(app),
         started_at: now.clone(),
+        start_nonce: Some(process.start_nonce.clone()),
     };
     if let Err(error) = super::write_agent_runtime_receipt(app, &receipt) {
         let _ = terminate_process(process.child.id());

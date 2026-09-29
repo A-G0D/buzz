@@ -1076,11 +1076,15 @@ dependencies = [
  "async-trait",
  "axum",
  "base64 0.22.1",
+ "buzz-run-journal",
+ "chrono",
  "dirs",
  "fs2",
  "getrandom 0.4.3",
  "hex",
+ "hmac 0.13.0",
  "nix 0.31.3",
+ "nostr 0.44.7",
  "reqwest 0.13.4",
  "rmcp 1.8.0",
  "serde",
@@ -1131,6 +1135,7 @@ dependencies = [
  "buzz-core",
  "buzz-media",
  "buzz-persona",
+ "buzz-run-journal",
  "buzz-sdk",
  "buzz-terminal",
  "buzz-voice",
@@ -1158,6 +1163,7 @@ dependencies = [
  "mesh-llm-sdk",
  "mesh-llm-system",
  "neteq",
+ "nix 0.31.3",
  "nostr 0.44.7",
  "notify-rust",
  "objc2",
@@ -1182,6 +1188,7 @@ dependencies = [
  "sha2 0.11.0",
  "sherpa-onnx",
  "strip-ansi-escapes",
+ "sysinfo 0.37.2",
  "tar",
  "tauri",
  "tauri-build",
@@ -1250,6 +1257,21 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "buzz-run-journal"
+version = "0.1.0"
+dependencies = [
+ "dirs",
+ "hex",
+ "nostr 0.44.7",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "url",
+ "uuid",
 ]
 
 [[package]]

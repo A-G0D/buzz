@@ -44,6 +44,7 @@ path = "tests/bin/auth_worker.rs"
 
 [dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-std", "io-util", "sync", "process", "time", "net"] }
+chrono = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
@@ -58,11 +59,14 @@ async-trait = "0.1"
 axum = { workspace = true }
 base64 = "0.22"
 hex = { workspace = true }
+hmac = "0.13"
 sha2 = { workspace = true }
+nostr.workspace = true
 url = { workspace = true }
 urlencoding = "2"
 webbrowser = "1"
 dirs = "6"
+buzz-run-journal = { path = "../buzz-run-journal" }
 # Cross-process advisory file lock (flock on Unix, LockFileEx on Windows) for
 # the auth coordinator's single-flight. Kept off std's `File::try_lock` so the
 # crate stays buildable on the repo's declared 1.88 MSRV (those std APIs are

@@ -4,6 +4,7 @@ import {
   PROJECT_TASK_CATEGORIES,
   type ProjectTaskCategory,
 } from "@/features/projects/projectTaskCategories";
+import { projectIssueContentWithAcceptanceCriteria } from "@/features/projects/projectIssues.mjs";
 import { cn } from "@/shared/lib/cn";
 import { Button } from "@/shared/ui/button";
 import { ChooserDialogContent } from "@/shared/ui/chooser-dialog-content";
@@ -49,6 +50,7 @@ export function CreateProjectWorkItemDialog({
 }) {
   const [workItemTitle, setWorkItemTitle] = React.useState("");
   const [body, setBody] = React.useState("");
+  const [acceptanceCriteria, setAcceptanceCriteria] = React.useState("");
   const [category, setCategory] = React.useState<ProjectTaskCategory>("issue");
   const [errorMessage, setErrorMessage] = React.useState<string | null>(null);
   const titleInputRef = React.useRef<HTMLInputElement>(null);
@@ -60,6 +62,7 @@ export function CreateProjectWorkItemDialog({
     if (!open) return;
     setWorkItemTitle("");
     setBody("");
+    setAcceptanceCriteria("");
     setCategory("issue");
     setErrorMessage(null);
     const timerId = globalThis.setTimeout(
@@ -79,7 +82,13 @@ export function CreateProjectWorkItemDialog({
     try {
       await onCreate({
         title: trimmedTitle,
-        body: body.trim(),
+        body:
+          itemName === "issue"
+            ? projectIssueContentWithAcceptanceCriteria(
+                body,
+                acceptanceCriteria,
+              )
+            : body.trim(),
         ...(itemName === "issue" ? { category } : {}),
       });
       onOpenChange(false);
@@ -221,6 +230,36 @@ export function CreateProjectWorkItemDialog({
               />
             </div>
           </div>
+          {itemName === "issue" ? (
+            <div className="space-y-1.5">
+              <label
+                className="text-sm font-medium text-foreground"
+                htmlFor={`${testIdPrefix}-acceptance-criteria`}
+              >
+                Acceptance criteria
+                <span className="ml-1 text-xs font-normal text-muted-foreground/50">
+                  Optional
+                </span>
+              </label>
+              <div className={FIELD_SHELL_CLASS}>
+                <Textarea
+                  className={cn(
+                    "min-h-24 resize-y px-3 py-3",
+                    FIELD_CONTROL_CLASS,
+                  )}
+                  data-testid={`${testIdPrefix}-acceptance-criteria`}
+                  disabled={isCreating}
+                  id={`${testIdPrefix}-acceptance-criteria`}
+                  onChange={(event) => {
+                    setAcceptanceCriteria(event.target.value);
+                    setErrorMessage(null);
+                  }}
+                  placeholder="How will you verify this task is done?"
+                  value={acceptanceCriteria}
+                />
+              </div>
+            </div>
+          ) : null}
           {errorMessage ? (
             <p className="text-sm text-destructive">{errorMessage}</p>
           ) : null}

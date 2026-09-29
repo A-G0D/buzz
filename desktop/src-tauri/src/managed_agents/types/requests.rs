@@ -179,6 +179,9 @@ pub struct CreateManagedAgentRequest {
     pub idle_timeout_seconds: Option<u64>,
     pub max_turn_duration_seconds: Option<u64>,
     pub parallelism: Option<u32>,
+    /// Local archetype preset selected for this managed instance.
+    #[serde(default)]
+    pub execution_profile_id: Option<String>,
     pub system_prompt: Option<String>,
     pub avatar_url: Option<String>,
     pub model: Option<String>,

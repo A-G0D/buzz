@@ -308,6 +308,7 @@ export function useChannelPaneHandlers({
         threadHeadId: string | null;
       } | null,
       forceRest?: boolean,
+      taskClass?: string | null,
     ) => {
       await sendMutateRef.current({
         content,
@@ -315,6 +316,7 @@ export function useChannelPaneHandlers({
         mediaTags,
         channelId: channelId ?? undefined,
         forceRest,
+        taskClass,
       });
     },
     [],
@@ -353,6 +355,7 @@ export function useChannelPaneHandlers({
         threadHeadId: string | null;
       } | null,
       forceRest?: boolean,
+      taskClass?: string | null,
     ) => {
       // Resolve target using captured submit-time context (race-free) or live
       // refs (legacy path). When threadContext is supplied, no live-ref reads
@@ -386,6 +389,7 @@ export function useChannelPaneHandlers({
         mediaTags,
         channelId: channelId ?? undefined,
         forceRest,
+        taskClass,
       });
 
       // Only update thread UI state if the user is still viewing the same

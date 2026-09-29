@@ -6,7 +6,10 @@ import {
   deriveNumericDescriptors,
   structuredEnvKeys,
 } from "./agentConfigCore.ts";
-import { NUMERIC_KIND_MIN } from "../ui/buzzAgentModelTuningFields.tsx";
+import {
+  NUMERIC_KIND_MAX,
+  NUMERIC_KIND_MIN,
+} from "../ui/buzzAgentModelTuningFields.tsx";
 
 const config = {
   env_vars: { BUZZ_AGENT_THINKING_EFFORT: "high" },
@@ -31,6 +34,8 @@ function runtime(id, metadata = {}) {
     maxTokensEnvVar: null,
     contextLimitEnvVar: null,
     maxRoundsEnvVar: null,
+    summaryModelEnvVar: null,
+    summaryMaxTokensEnvVar: null,
     installHint: "",
     installInstructionsUrl: "",
     canAutoInstall: false,
@@ -324,6 +329,56 @@ test("Goose derives two numeric descriptors and no maxRounds", () => {
     kind: "envVar",
     key: "GOOSE_CONTEXT_LIMIT",
   });
+});
+
+test("Buzz Agent exposes a catalog-backed status-summary model and token budget", () => {
+  const runtimeEntry = runtime("buzz-agent", {
+    summaryModelEnvVar: "BUZZ_AGENT_SUMMARY_MODEL",
+    summaryMaxTokensEnvVar: "BUZZ_AGENT_SUMMARY_MAX_OUTPUT_TOKENS",
+  });
+  const model = deriveAgentConfigFieldModel({
+    config: {
+      ...config,
+      env_vars: {
+        ...config.env_vars,
+        BUZZ_AGENT_SUMMARY_MODEL: "summary-model",
+      },
+    },
+    runtime: runtimeEntry,
+    scope: "global",
+  });
+
+  const summaryModel = field(model, "summaryModel");
+  assert.equal(summaryModel.value, "summary-model");
+  assert.equal(summaryModel.optionSource, "acpModels");
+  assert.deepEqual(summaryModel.currentPersistence, {
+    kind: "envVar",
+    key: "BUZZ_AGENT_SUMMARY_MODEL",
+  });
+  assert.deepEqual(summaryModel.targetApplication, {
+    kind: "envVar",
+    key: "BUZZ_AGENT_SUMMARY_MODEL",
+  });
+
+  const summaryBudget = field(model, "summaryMaxOutputTokens");
+  assert.deepEqual(summaryBudget.currentPersistence, {
+    kind: "envVar",
+    key: "BUZZ_AGENT_SUMMARY_MAX_OUTPUT_TOKENS",
+  });
+  assert.deepEqual(structuredEnvKeys([summaryModel, summaryBudget]), [
+    "BUZZ_AGENT_SUMMARY_MODEL",
+    "BUZZ_AGENT_SUMMARY_MAX_OUTPUT_TOKENS",
+  ]);
+});
+
+test("runtimes without summary metadata do not derive summary controls", () => {
+  const model = deriveAgentConfigFieldModel({
+    config,
+    runtime: runtime("goose"),
+    scope: "global",
+  });
+  assert.equal(field(model, "summaryModel"), undefined);
+  assert.equal(field(model, "summaryMaxOutputTokens"), undefined);
 });
 
 test("Claude derives no numeric descriptors", () => {
@@ -633,6 +688,11 @@ test("NUMERIC_KIND_MIN_contextLimit_is_1", () => {
 
 test("NUMERIC_KIND_MIN_maxRounds_is_0", () => {
   assert.equal(NUMERIC_KIND_MIN.maxRounds, 0);
+});
+
+test("status-summary output budget is capped at the runtime's 4096-token limit", () => {
+  assert.equal(NUMERIC_KIND_MIN.summaryMaxOutputTokens, 1);
+  assert.equal(NUMERIC_KIND_MAX.summaryMaxOutputTokens, 4096);
 });
 
 // ── P2 regression: Goose optionSource + isHarnessNativeEffort guard ───────────

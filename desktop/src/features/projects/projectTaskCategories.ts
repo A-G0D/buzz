@@ -1,4 +1,5 @@
 export const PROJECT_TASK_CATEGORIES = [
+  { label: "Epic", value: "epic" },
   { label: "Issue", value: "issue" },
   { label: "Change request", value: "change-request" },
   { label: "Improvement", value: "improvement" },

@@ -36,6 +36,69 @@ pub struct ModelEntry {
     pub name: String,
 }
 
+/// Discover models from the authenticated DeepSeek `GET /models` endpoint.
+pub async fn discover_deepseek_models(cfg: &Config) -> Result<Vec<ModelEntry>, AgentError> {
+    if cfg.provider != Provider::DeepSeek {
+        return Err(AgentError::InvalidParams(
+            "discover_deepseek_models called for non-DeepSeek provider".into(),
+        ));
+    }
+    let http = Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| AgentError::Llm(format!("http: {e}")))?;
+    discover_deepseek_models_with_client(cfg, &http).await
+}
+
+async fn discover_deepseek_models_with_client(
+    cfg: &Config,
+    http: &Client,
+) -> Result<Vec<ModelEntry>, AgentError> {
+    let token = build_token_source(cfg)?.bearer_no_browser().await?;
+    fetch_deepseek_models(http, cfg.base_url.trim_end_matches('/'), &token).await
+}
+
+async fn fetch_deepseek_models(
+    http: &Client,
+    host: &str,
+    token: &str,
+) -> Result<Vec<ModelEntry>, AgentError> {
+    let url = format!("{host}/models");
+    let json = fetch_catalog_page(
+        http,
+        &url,
+        "DeepSeek model catalog",
+        token,
+        DEFAULT_CATALOG_REQUEST_POLICY,
+    )
+    .await
+    .map_err(classify_deepseek_catalog_error)?;
+    let models = json.get("data").and_then(Value::as_array).ok_or_else(|| {
+        AgentError::Llm(
+            "DeepSeek model discovery: unexpected response (missing 'data' array)".into(),
+        )
+    })?;
+    Ok(models
+        .iter()
+        .filter_map(|m| m.get("id").and_then(Value::as_str))
+        .map(|id| ModelEntry {
+            id: id.to_owned(),
+            name: id.to_owned(),
+        })
+        .collect())
+}
+
+pub(crate) fn classify_deepseek_catalog_error(error: AgentError) -> AgentError {
+    match error {
+        AgentError::Llm(message)
+            if message.starts_with("DeepSeek model catalog failed HTTP 403") =>
+        {
+            AgentError::LlmAuth("DeepSeek model catalog HTTP 403".into())
+        }
+        other => other,
+    }
+}
+
 const AUTHENTICATED_EMPTY_CATALOG_SUFFIX: &str = " (default catalog)";
 const MAX_CATALOG_PAGES: usize = 20;
 const MAX_CATALOG_ERROR_BODY_BYTES: usize = 4 * 1024;
@@ -933,6 +996,35 @@ mod tests {
             max_retries,
             retry_backoff: Duration::ZERO,
         }
+    }
+
+    #[tokio::test]
+    async fn deepseek_catalog_uses_authenticated_bounded_models_endpoint() {
+        use axum::http::HeaderMap;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let host = format!("http://{}", listener.local_addr().unwrap());
+        let seen = Arc::new(AtomicUsize::new(0));
+        let seen_route = seen.clone();
+        let app = Router::new().route("/models", get(move |headers: HeaderMap| {
+            let seen = seen_route.clone();
+            async move {
+                if headers.get("authorization").and_then(|h| h.to_str().ok()) == Some("Bearer test-key") {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                }
+                Json(serde_json::json!({"data":[{"id":"deepseek-chat"},{"id":"deepseek-reasoner"}]}))
+            }
+        }));
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let models = fetch_deepseek_models(&Client::new(), &host, "test-key")
+            .await
+            .unwrap();
+        assert_eq!(seen.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["deepseek-chat", "deepseek-reasoner"]
+        );
     }
 
     struct RefreshingTestTokenSource {

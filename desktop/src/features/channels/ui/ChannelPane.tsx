@@ -6,6 +6,7 @@ import { useMediaUpload } from "@/features/messages/lib/useMediaUpload";
 import { ComposerDockBackdrop } from "@/features/messages/ui/ComposerDockBackdrop";
 import { ComposerUploadProgressOverlay } from "@/features/messages/ui/ComposerUploadProgressOverlay";
 import { MessageComposer } from "@/features/messages/ui/MessageComposer";
+import { GoalRunActivity } from "@/features/messages/ui/GoalRunActivity";
 import { ComposerTimeoutBanner } from "@/features/moderation/ui/ComposerTimeoutBanner";
 import { useTimeoutActive } from "@/features/moderation/lib/timeoutStore";
 import { isModerationDm } from "@/features/moderation/lib/moderationDm";
@@ -291,6 +292,7 @@ export const ChannelPane = React.memo(function ChannelPane({
         threadHeadId: string | null;
       } | null,
       forceRest?: boolean,
+      taskClass?: string | null,
     ) => {
       const shouldCompleteWelcomeBanner =
         isActiveWelcomeChannel &&
@@ -304,6 +306,7 @@ export const ChannelPane = React.memo(function ChannelPane({
         channelId,
         threadContext,
         forceRest,
+        taskClass,
       );
       if (
         channelId &&
@@ -749,6 +752,10 @@ export const ChannelPane = React.memo(function ChannelPane({
                   ) : null}
                   {timeoutActive ? <ComposerTimeoutBanner /> : null}
                   <ComposerDockBackdrop gutterClassName="inset-x-5" />
+                  <GoalRunActivity
+                    channelId={activeChannel?.id ?? null}
+                    messages={messages}
+                  />
                   <MessageComposer
                     channelId={activeChannel?.id ?? null}
                     channelName={activeChannel?.name ?? "channel"}
@@ -772,6 +779,7 @@ export const ChannelPane = React.memo(function ChannelPane({
                         : undefined
                     }
                     onSend={handleSendMessage}
+                    showTaskClassPicker
                     {...{ profiles, recentMentionPubkeys: recentMentions }}
                     showBackgroundUploadProgress={false}
                     placeholder={

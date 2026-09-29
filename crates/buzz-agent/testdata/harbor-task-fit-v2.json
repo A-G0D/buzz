@@ -1,0 +1,95 @@
+{
+  "candidate": {
+    "condition_id": "fixture-solo-v1",
+    "condition_sha256": "1f0eca642553dd0822cd0aee2434667695977ccaa70f577ae5e9738e1b58977b",
+    "endpoint_config_sha256": "29a4e0796926519f92cbb595e12276478cb90800a26b0b305448a1f45bc3c09a",
+    "endpoint_id": "fixture-endpoint",
+    "generation": {
+      "max_output_tokens": 128,
+      "temperature": 0
+    },
+    "model_id": "fixture-model-r1",
+    "model_identity_source": "harbor_trial_result",
+    "observed_model_ids": [
+      "fixture-model-r1"
+    ],
+    "prompt_sha256": "a90194ccdf4f7649edb5756d32d61411041ecdd62bdb1ef6ecc09bb68fd0913f",
+    "provider_id": "openai",
+    "runtime_binary_sha256": {
+      "buzz-agent": "ba8e308cc1b265c9db93bc31e64c58173d602d4b65bd06c76d5c3c58581430ac"
+    }
+  },
+  "created_at_utc": "2026-09-26T09:38:18.195339+00:00",
+  "evaluation": {
+    "attempts_per_task": 2,
+    "case_set_sha256": "5adb8c3d42601f14dc3c467830d23dcc75ffae17236d02c6bb26c6e31b1c3c8e",
+    "finished_at": "2026-09-26T00:01:00+00:00",
+    "mean_reward": 1.0,
+    "pass_threshold": 1.0,
+    "policy_version": "task-fit-outcomes-v1",
+    "sample_count": 4,
+    "started_at": "2026-09-26T00:00:00+00:00",
+    "task_checksums": [
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    ],
+    "task_count": 1,
+    "task_name_count": 2,
+    "task_success_count": 1,
+    "task_success_rate": 1.0,
+    "task_success_rule": "all_repeats_for_unique_checksum_meet_threshold",
+    "task_wilson_lower_bound_95": 0.269866,
+    "trial_success_count": 4,
+    "trial_success_rate": 1.0,
+    "trial_success_rule": "reward_at_or_above_threshold",
+    "trials": [
+      {
+        "reward": 1.0,
+        "task_checksum": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "task_name": "task-alias-a",
+        "trial_name": "task-alias-a__rep-1"
+      },
+      {
+        "reward": 1.0,
+        "task_checksum": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "task_name": "task-alias-a",
+        "trial_name": "task-alias-a__rep-2"
+      },
+      {
+        "reward": 1.0,
+        "task_checksum": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "task_name": "task-alias-b",
+        "trial_name": "task-alias-b__rep-1"
+      },
+      {
+        "reward": 1.0,
+        "task_checksum": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "task_name": "task-alias-b",
+        "trial_name": "task-alias-b__rep-2"
+      }
+    ]
+  },
+  "evaluator": {
+    "name": "harbor_canonical_verifier_reward",
+    "reward_key": "verifier_result.rewards.reward",
+    "version": "0.16.1"
+  },
+  "evidence_kind": "harbor_verifier_outcomes",
+  "evidence_scope": "exact_single_agent_benchmark_condition",
+  "routing_status": {
+    "eligible_for_routing": false,
+    "reason": "report is advisory until Buzz enforces exact task, prompt, runtime, freshness, and sample requirements"
+  },
+  "schema_version": 2,
+  "source": {
+    "dataset": "fixture/same-content-aliases",
+    "harness": "Harbor",
+    "job_id": "fixture-job-v2",
+    "job_result_sha256": "cb9731026e7181d335263e5f2df83f315861334b5907ff3018af85fec32e181f",
+    "version": "0.16.1"
+  },
+  "task_class": {
+    "classification_source": "operator_annotation",
+    "id": "coding",
+    "taxonomy_version": "operator-defined-v1"
+  }
+}

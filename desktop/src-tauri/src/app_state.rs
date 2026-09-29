@@ -1,8 +1,8 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io::Write,
     sync::{
-        atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicU8},
+        atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicU8},
         Arc, Mutex,
     },
 };
@@ -10,6 +10,7 @@ use std::{
 use nostr::{Keys, ToBech32};
 use tauri::{AppHandle, Manager};
 use tokio::sync::Mutex as AsyncMutex;
+use tokio_util::sync::CancellationToken;
 
 use crate::huddle::HuddleState;
 pub(crate) use crate::identity_storage::{IdentityStorage, RecoveryState, ResolvedIdentity};
@@ -50,7 +51,19 @@ pub struct AppState {
     pub managed_agents_store_lock: Mutex<()>,
     pub channel_templates_store_lock: Mutex<()>,
     pub managed_agent_processes: Mutex<HashMap<ManagedAgentRuntimeKey, ManagedAgentPairRuntime>>,
+    /// In-flight managed-agent starts that passed the global resource cap but
+    /// have not yet been inserted into `managed_agent_processes`.
+    pub managed_agent_start_reservations: Mutex<HashSet<ManagedAgentRuntimeKey>>,
+    /// Reviewer process slots reserved by active critic rounds. These consume
+    /// the same global local-agent capacity as managed runtime starts.
+    pub critic_worker_process_reservations: AtomicU32,
+    /// Serializes the final memory check and OS child creation so parallel
+    /// restore workers do not all pass against one RAM sample.
+    pub managed_agent_memory_admission: Mutex<()>,
     pub provider_deploy_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Explicit native critic requests. One round at a time keeps each
+    /// request's three-reviewer ceiling meaningful across all app windows.
+    pub active_critic_rounds: Mutex<HashMap<String, CancellationToken>>,
     pub huddle_state: Mutex<HuddleState>,
     pub huddle_audio: crate::huddle::tts_settings::HuddleAudioSettingsState,
     /// Tauri app handle — stored after setup so huddle commands can emit
@@ -227,7 +240,11 @@ pub fn build_app_state() -> AppState {
         managed_agents_store_lock: Mutex::new(()),
         channel_templates_store_lock: Mutex::new(()),
         managed_agent_processes: Mutex::new(HashMap::new()),
+        managed_agent_start_reservations: Mutex::new(HashSet::new()),
+        critic_worker_process_reservations: AtomicU32::new(0),
+        managed_agent_memory_admission: Mutex::new(()),
         provider_deploy_locks: Mutex::new(HashMap::new()),
+        active_critic_rounds: Mutex::new(HashMap::new()),
         session_config_cache: Mutex::new(HashMap::new()),
         huddle_state: Mutex::new(HuddleState::default()),
         huddle_audio: Default::default(),

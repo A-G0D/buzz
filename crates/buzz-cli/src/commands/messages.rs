@@ -1,5 +1,5 @@
 use buzz_sdk::{DeleteMessageOptions, DiffMeta, ThreadRef, VoteDirection};
-use nostr::PublicKey;
+use nostr::{PublicKey, Tag};
 use uuid::Uuid;
 
 use crate::client::{normalize_events, normalize_write_response, BuzzClient};
@@ -426,6 +426,30 @@ pub async fn cmd_get_thread(
     depth_limit: Option<u32>,
     format: &crate::OutputFormat,
 ) -> Result<(), CliError> {
+    let (_, events) = load_thread_events(
+        client,
+        channel_id,
+        event_id,
+        expected_root_id,
+        limit,
+        depth_limit,
+        None,
+    )
+    .await?;
+    let normalized = normalize_events(&events);
+    println!("{}", format_events(&normalized, format));
+    Ok(())
+}
+
+pub(crate) async fn load_thread_events(
+    client: &BuzzClient,
+    channel_id: &str,
+    event_id: &str,
+    expected_root_id: Option<&str>,
+    limit: Option<u32>,
+    depth_limit: Option<u32>,
+    cursor: Option<(i64, &str)>,
+) -> Result<(String, Vec<serde_json::Value>), CliError> {
     let expected_channel_id = parse_uuid(channel_id)?;
     validate_hex64(event_id)?;
     let selected_event = fetch_event(client, event_id).await?;
@@ -435,32 +459,185 @@ pub async fn cmd_get_thread(
         expected_root_id,
         &selected_event,
     )?;
-    let limit = limit.unwrap_or(100).min(500);
+    if let Some((_, cursor_event_id)) = cursor {
+        let cursor_event = fetch_event(client, cursor_event_id).await?;
+        resolve_thread_target(
+            expected_channel_id,
+            cursor_event_id,
+            Some(&root_event_id),
+            &cursor_event,
+        )?;
+    }
+    let limit = limit.unwrap_or(100).clamp(1, 500);
 
     let mut reply_filter = serde_json::json!({
-        "kinds": [9, 40002, 40003, 40008, 45003],
+        "kinds": buzz_core::thread_brief::THREAD_BRIEF_KINDS,
         "#h": [channel_id],
         "#e": [root_event_id.as_str()],
-        "limit": limit
+        "limit": limit,
+        "include_aux": true,
     });
-    if let Some(d) = depth_limit {
-        reply_filter["depth_limit"] = serde_json::json!(d);
+    if let Some(depth) = depth_limit {
+        reply_filter["depth_limit"] = serde_json::json!(depth);
+    }
+    if let Some((created_at, event_id)) = cursor {
+        reply_filter["thread_cursor"] = serde_json::json!(created_at);
+        reply_filter["thread_cursor_id"] = serde_json::json!(event_id);
     }
     let root_filter = serde_json::json!({
         "ids": [root_event_id.as_str()],
+        "kinds": buzz_core::thread_brief::THREAD_BRIEF_KINDS,
         "#h": [channel_id],
         "limit": 1
     });
-    let resp = client.query_multi(&[reply_filter, root_filter]).await?;
-    let mut events: Vec<serde_json::Value> = serde_json::from_str(&resp).unwrap_or_default();
-    events.sort_by_key(|event| {
-        event
-            .get("created_at")
-            .and_then(|value| value.as_u64())
-            .unwrap_or(0)
+    let response = client.query_multi(&[reply_filter, root_filter]).await?;
+    let mut events: Vec<serde_json::Value> = serde_json::from_str(&response)
+        .map_err(|error| CliError::Other(format!("failed to parse thread response: {error}")))?;
+    events.sort_by(|left, right| {
+        left.get("created_at")
+            .and_then(serde_json::Value::as_u64)
+            .cmp(&right.get("created_at").and_then(serde_json::Value::as_u64))
+            .then_with(|| {
+                left.get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .cmp(&right.get("id").and_then(serde_json::Value::as_str))
+            })
     });
-    let normalized = normalize_events(&events);
-    println!("{}", format_events(&normalized, format));
+    if !events.iter().any(|event| {
+        event.get("id").and_then(serde_json::Value::as_str) == Some(root_event_id.as_str())
+    }) {
+        return Err(CliError::NotFound(format!(
+            "thread root {root_event_id} not found"
+        )));
+    }
+    Ok((root_event_id, events))
+}
+
+#[allow(clippy::too_many_arguments)] // mirrors the independently optional CLI flags
+pub async fn cmd_get_thread_brief(
+    client: &BuzzClient,
+    channel_id: &str,
+    event_id: &str,
+    expected_root_id: Option<&str>,
+    limit: Option<u32>,
+    depth_limit: Option<u32>,
+    cursor_created_at: Option<i64>,
+    cursor_event_id: Option<&str>,
+    workflow_id: Option<&str>,
+    workflow_pages: Option<u32>,
+    include_managed_turns: bool,
+) -> Result<(), CliError> {
+    if let Some(workflow_id) = workflow_id {
+        validate_uuid(workflow_id)?;
+        if workflow_pages.is_some_and(|pages| !(1..=50).contains(&pages)) {
+            return Err(CliError::Usage(
+                "--workflow-pages must be between 1 and 50".into(),
+            ));
+        }
+    }
+    let limit = limit.unwrap_or(100).clamp(1, 500);
+    let applied_depth_limit = depth_limit.unwrap_or(64);
+    if applied_depth_limit > i32::MAX as u32 {
+        return Err(CliError::Usage(format!(
+            "--depth-limit must not exceed {}",
+            i32::MAX
+        )));
+    }
+    let cursor = match (cursor_created_at, cursor_event_id) {
+        (Some(created_at), Some(event_id)) => {
+            if created_at < 0 {
+                return Err(CliError::Usage(
+                    "--cursor-created-at must be a nonnegative Unix timestamp".into(),
+                ));
+            }
+            validate_hex64(event_id)?;
+            Some((created_at, event_id))
+        }
+        (None, None) => None,
+        _ => {
+            return Err(CliError::Usage(
+                "--cursor-created-at and --cursor-event-id must be supplied together".into(),
+            ));
+        }
+    };
+    let (root_event_id, events) = load_thread_events(
+        client,
+        channel_id,
+        event_id,
+        expected_root_id,
+        Some(limit),
+        Some(applied_depth_limit),
+        cursor,
+    )
+    .await?;
+    let mut brief =
+        buzz_core::thread_brief::make_thread_brief(&root_event_id, &events, limit, depth_limit)
+            .map_err(CliError::Other)?;
+    if include_managed_turns {
+        let source_event_ids = events
+            .iter()
+            .filter_map(|event| event.get("id").and_then(serde_json::Value::as_str))
+            .map(str::to_ascii_lowercase)
+            .collect::<Vec<_>>();
+        let owner_pubkey = client.keys().public_key().to_hex();
+        let journal = buzz_run_journal::RunJournal::open_scoped(
+            buzz_run_journal::nest_dir_from_env_or_default().map_err(CliError::Other)?,
+            client.relay_url(),
+            &owner_pubkey,
+        )
+        .map_err(CliError::Other)?;
+        let history = journal
+            .thread_attempt_history(channel_id, &root_event_id, &source_event_ids)
+            .map_err(CliError::Other)?;
+        let run_history = journal
+            .thread_coordinator_runs(channel_id, &root_event_id, &source_event_ids)
+            .map_err(CliError::Other)?;
+        buzz_core::thread_brief::add_managed_turn_history(
+            &mut brief,
+            serde_json::to_value(history.managed_turns)
+                .map_err(|error| CliError::Other(error.to_string()))?,
+            history.has_more_turns,
+            history.capture_gap_count,
+        );
+        buzz_core::thread_brief::add_coordinator_run_history(
+            &mut brief,
+            serde_json::to_value(run_history.runs)
+                .map_err(|error| CliError::Other(error.to_string()))?,
+            run_history.has_more_runs,
+            run_history.capture_gap_count,
+        );
+    }
+    if let Some(workflow_id) = workflow_id {
+        let mut trigger_event_ids = brief["source_event_ids"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        trigger_event_ids.push(event_id.to_ascii_lowercase());
+        let lookup = crate::commands::workflows::find_runs_by_trigger_events(
+            client,
+            workflow_id,
+            &trigger_event_ids,
+            workflow_pages.unwrap_or(10),
+        )
+        .await?;
+        brief["status"]["workflow_runs"] = serde_json::json!(lookup.runs);
+        brief["status"]["workflow_lookup"] = serde_json::json!({
+            "workflow_id": workflow_id,
+            "matched_count": lookup.matched_count,
+            "pages_checked": lookup.pages_checked,
+            "history_truncated": lookup.history_truncated,
+            "matches_truncated": lookup.matches_truncated,
+        });
+    }
+    let observed_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis().min(u64::MAX as u128) as u64)
+        .unwrap_or_default();
+    buzz_core::thread_brief::add_observed_at(&mut brief, observed_at_ms);
+    println!("{brief}");
     Ok(())
 }
 
@@ -606,12 +783,49 @@ pub struct SendMessageParams {
     pub broadcast: bool,
     pub files: Vec<String>,
     pub mentions: Vec<String>,
+    pub task_class: Option<String>,
+}
+
+const SUPPORTED_TASK_CLASSES: &[&str] = &[
+    "coding",
+    "code_review",
+    "research",
+    "writing",
+    "analysis",
+    "planning",
+    "summarization",
+    "classification",
+];
+
+fn validate_explicit_task_class(
+    task_class: Option<&str>,
+    kind: Option<u16>,
+) -> Result<(), CliError> {
+    let Some(task_class) = task_class else {
+        return Ok(());
+    };
+    if !SUPPORTED_TASK_CLASSES.contains(&task_class) {
+        return Err(CliError::Usage(format!(
+            "unsupported --task-class {task_class:?} (supported: {})",
+            SUPPORTED_TASK_CLASSES.join(", ")
+        )));
+    }
+    if kind.is_some_and(|kind| kind != 9) {
+        return Err(CliError::Usage(
+            "--task-class is supported only for kind 9 messages".into(),
+        ));
+    }
+    Ok(())
 }
 
 pub async fn cmd_send_message(
     client: &BuzzClient,
     mut p: SendMessageParams,
 ) -> Result<(), CliError> {
+    // Reject invalid metadata before stdin reads, relay queries, file uploads,
+    // signing, or submission. The explicit flag is the sole CLI classifier.
+    validate_explicit_task_class(p.task_class.as_deref(), p.kind)?;
+
     // Allow '-' to read content from stdin. This keeps callers from having to
     // jam shell-metacharacter-heavy text (backticks, $vars, etc.) through argv
     // quoting — the source of countless self-inflicted command-substitution
@@ -680,7 +894,7 @@ pub async fn cmd_send_message(
 
     let mention_refs: Vec<&str> = mention_pubkeys.iter().map(String::as_str).collect();
 
-    let builder = match p.kind {
+    let mut builder = match p.kind {
         Some(45001) => {
             buzz_sdk::build_forum_post(channel_uuid, &final_content, &mention_refs, &media_tags)
                 .map_err(|e| CliError::Other(format!("build_forum_post failed: {e}")))?
@@ -741,6 +955,19 @@ pub async fn cmd_send_message(
             )))
         }
     };
+
+    if let Some(task_class) = p.task_class.as_deref() {
+        builder = builder.tag(
+            Tag::parse([
+                "buzz:task-class",
+                "1",
+                "operator-defined-v1",
+                "cli_explicit",
+                task_class,
+            ])
+            .map_err(|error| CliError::Other(format!("build task-class tag failed: {error}")))?,
+        );
+    }
 
     let event = client.sign_event(builder)?;
     let emitted_mentions = event_mention_pubkeys(&event);
@@ -945,6 +1172,7 @@ pub async fn dispatch(
             broadcast,
             files,
             mentions,
+            task_class,
         } => {
             cmd_send_message(
                 client,
@@ -956,6 +1184,7 @@ pub async fn dispatch(
                     broadcast,
                     files,
                     mentions,
+                    task_class,
                 },
             )
             .await
@@ -1056,6 +1285,48 @@ pub async fn dispatch(
                 limit,
                 depth_limit,
                 format,
+            )
+            .await
+        }
+        MessagesCmd::Brief {
+            channel,
+            event,
+            link,
+            limit,
+            depth_limit,
+            cursor_created_at,
+            cursor_event_id,
+            workflow,
+            workflow_pages,
+            managed_turns,
+        } => {
+            let (channel, event, expected_root) = match link {
+                Some(link) => {
+                    let parsed = crate::links::parse_message_link(&link)?;
+                    (parsed.channel_id, parsed.message_id, parsed.thread_root_id)
+                }
+                None => match (channel, event) {
+                    (Some(channel), Some(event)) => (channel, event, None),
+                    _ => {
+                        return Err(CliError::Usage(
+                            "messages brief requires either --link or both --channel and --event"
+                                .into(),
+                        ));
+                    }
+                },
+            };
+            cmd_get_thread_brief(
+                client,
+                &channel,
+                &event,
+                expected_root.as_deref(),
+                limit,
+                depth_limit,
+                cursor_created_at,
+                cursor_event_id.as_deref(),
+                workflow.as_deref(),
+                workflow_pages,
+                managed_turns,
             )
             .await
         }
@@ -1717,6 +1988,7 @@ mod tests {
             broadcast: false,
             files: vec![],
             mentions: vec![],
+            task_class: None,
         }
     }
 
@@ -1753,6 +2025,9 @@ mod tests {
                     .collect()
             })
             .collect();
+        assert!(tags
+            .iter()
+            .all(|tag| tag.first().map(String::as_str) != Some("buzz:task-class")));
         let emoji_tags: Vec<&Vec<String>> = tags
             .iter()
             .filter(|t| t.first().map(|s| s.as_str()) == Some("emoji"))
@@ -1813,6 +2088,68 @@ mod tests {
             emoji_tags.is_empty(),
             "no-colon content must produce no emoji tags, got: {emoji_tags:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn cmd_send_message_signs_explicit_task_class_source_tag() {
+        let (url, query_count, captured_event) = fake_send_relay("[]".into()).await;
+        let keys = Keys::generate();
+        let owner = keys.public_key();
+        let client = BuzzClient::new(url, keys, None, None).unwrap();
+        let mut params = send_params("plain task");
+        params.task_class = Some("code_review".into());
+
+        cmd_send_message(&client, params).await.unwrap();
+
+        assert_eq!(query_count.load(Ordering::Relaxed), 0);
+        let raw = captured_event.lock().unwrap();
+        let event: nostr::Event =
+            serde_json::from_str(&raw.as_ref().expect("event submitted").body)
+                .expect("signed event JSON");
+        event
+            .verify()
+            .expect("CLI task-class tag remains owner-signed");
+        assert_eq!(event.pubkey, owner);
+        assert!(event.tags.iter().any(|tag| {
+            tag.as_slice().iter().map(String::as_str).eq([
+                "buzz:task-class",
+                "1",
+                "operator-defined-v1",
+                "cli_explicit",
+                "code_review",
+            ])
+        }));
+    }
+
+    #[tokio::test]
+    async fn invalid_task_class_fails_before_relay_reads_uploads_or_submission() {
+        let (url, query_count, captured_event) = fake_send_relay("[]".into()).await;
+        let client = BuzzClient::new(url, Keys::generate(), None, None).unwrap();
+        let mut params = send_params("plain task");
+        params.task_class = Some("unregistered".into());
+        params.files = vec!["/path/that/must/not/be/read".into()];
+
+        let error = cmd_send_message(&client, params).await.unwrap_err();
+
+        assert!(matches!(error, CliError::Usage(_)));
+        assert_eq!(query_count.load(Ordering::Relaxed), 0);
+        assert!(captured_event.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn task_class_on_non_kind_9_fails_before_relay_reads_uploads_or_submission() {
+        let (url, query_count, captured_event) = fake_send_relay("[]".into()).await;
+        let client = BuzzClient::new(url, Keys::generate(), None, None).unwrap();
+        let mut params = send_params("plain task");
+        params.kind = Some(45001);
+        params.task_class = Some("coding".into());
+        params.files = vec!["/path/that-must-not-be-read".into()];
+
+        let error = cmd_send_message(&client, params).await.unwrap_err();
+
+        assert!(matches!(error, CliError::Usage(_)));
+        assert_eq!(query_count.load(Ordering::Relaxed), 0);
+        assert!(captured_event.lock().unwrap().is_none());
     }
 
     #[tokio::test]

@@ -56,6 +56,7 @@ import {
 import {
   EffortSelectField,
   NumericTuningFields,
+  isNumericTuningValueValid,
   useEffortAutoClear,
   type NumericDescriptor,
 } from "@/features/agents/ui/buzzAgentModelTuningFields";
@@ -74,6 +75,8 @@ export const EMPTY_GLOBAL_CONFIG: GlobalAgentConfig = {
 const BAKED_STRUCTURED_KEYS = new Set([
   "BUZZ_AGENT_PROVIDER",
   "BUZZ_AGENT_MODEL",
+  "BUZZ_AGENT_SUMMARY_MODEL",
+  "BUZZ_AGENT_SUMMARY_MAX_OUTPUT_TOKENS",
   BUZZ_AGENT_THINKING_EFFORT,
 ]);
 
@@ -251,6 +254,15 @@ export function AgentConfigFields({
     [config, disclosure, selectedRuntime],
   );
   const effortField = getRenderableEffortField(fieldModel);
+  const summaryModelField = fieldModel.fields.find(
+    (field) => field.kind === "summaryModel" && field.render === "control",
+  );
+  const summaryModelKey =
+    summaryModelField?.currentPersistence.kind === "envVar"
+      ? summaryModelField.currentPersistence.key
+      : null;
+  const [isSummaryModelCustomEditing, setIsSummaryModelCustomEditing] =
+    React.useState(false);
   const effortPersistenceKey =
     effortField?.currentPersistence.kind === "envVar"
       ? effortField.currentPersistence.key
@@ -265,14 +277,18 @@ export function AgentConfigFields({
     (d): d is NumericDescriptor =>
       (d.kind === "maxOutputTokens" ||
         d.kind === "contextLimit" ||
-        d.kind === "maxRounds") &&
+        d.kind === "maxRounds" ||
+        d.kind === "summaryMaxOutputTokens") &&
       d.render === "control",
   );
   const allStructuredKeys = structuredEnvKeys([
     ...(effortField ? [effortField] : []),
+    ...(summaryModelField ? [summaryModelField] : []),
     ...numericDescriptors,
   ]);
   const bakedEnvMap = Object.fromEntries(bakedEnv.map((e) => [e.key, e.value]));
+  const bakedSummaryModel =
+    bakedEnv.find((e) => e.key === "BUZZ_AGENT_SUMMARY_MODEL")?.value ?? null;
   const bakedProvider = React.useMemo(
     () => bakedEnv.find((e) => e.key === "BUZZ_AGENT_PROVIDER")?.value ?? null,
     [bakedEnv],
@@ -298,6 +314,16 @@ export function AgentConfigFields({
     modelIsOptional ||
     (config.model?.trim().length ?? 0) > 0 ||
     fallbackModel !== null;
+  const summaryBudgetDescriptor = numericDescriptors.find(
+    (descriptor) => descriptor.kind === "summaryMaxOutputTokens",
+  );
+  const summaryBudgetValue = summaryBudgetDescriptor
+    ? (config.env_vars[summaryBudgetDescriptor.currentPersistence.key] ?? "")
+    : "";
+  const summaryBudgetIsValid =
+    !showAdvancedFields ||
+    !summaryBudgetDescriptor ||
+    isNumericTuningValueValid("summaryMaxOutputTokens", summaryBudgetValue);
   const bakedEffort = React.useMemo(
     () =>
       bakedEnv.find((e) => e.key === BUZZ_AGENT_THINKING_EFFORT)?.value ?? null,
@@ -357,7 +383,10 @@ export function AgentConfigFields({
     runtimeId: credentialRuntimeId,
   });
   const configIsValid =
-    selectedRuntimeId.length > 0 && modelIsValid && credentialsValid;
+    selectedRuntimeId.length > 0 &&
+    modelIsValid &&
+    credentialsValid &&
+    summaryBudgetIsValid;
   React.useEffect(() => {
     onValidityChange?.(configIsValid);
   }, [configIsValid, onValidityChange]);
@@ -793,6 +822,49 @@ export function AgentConfigFields({
           inheritedEnvVars={bakedEnvMap}
           onEnvVarChange={handleNumericEnvVarChange}
         />
+      ) : null}
+      {summaryModelField && summaryModelKey ? (
+        <div className="space-y-1.5">
+          <AgentModelField
+            allowDefaultModel
+            defaultModelLabel={
+              bakedSummaryModel
+                ? `Default summary model (${resolveModelLabel(bakedSummaryModel, undefined, effectiveProvider || undefined)})`
+                : "Disabled"
+            }
+            disabled={dependentFieldsDisabled}
+            discoveredModelOptions={
+              dependentFieldsDisabled ? null : discoveredModelOptions
+            }
+            disableSelectDuringDiscovery={disableModelSelectDuringDiscovery}
+            globalModel={bakedSummaryModel ?? undefined}
+            id="global-agent-summary-model"
+            isCustomModelEditing={isSummaryModelCustomEditing}
+            isRequired={false}
+            label="Status summary model"
+            model={config.env_vars[summaryModelKey] ?? ""}
+            modelDiscoveryLoading={
+              dependentFieldsDisabled ? false : modelDiscoveryLoading
+            }
+            modelDiscoveryStatus={
+              dependentFieldsDisabled ? null : modelDiscoveryStatus
+            }
+            onIsCustomModelEditingChange={setIsSummaryModelCustomEditing}
+            onModelChange={(value) =>
+              handleNumericEnvVarChange(summaryModelKey, value)
+            }
+            provider={effectiveProvider || undefined}
+            showStatusMessage={false}
+            testId="global-agent-summary-model"
+            useChevronIcon={useChevronSelectIcon}
+            useCustomSelect={useCustomSelect}
+          />
+          <p className="text-xs text-muted-foreground">
+            Optional. The summary uses this agent’s configured provider,
+            endpoint, and credentials. Thread evidence is sent only when the
+            status-summary tool is called.
+          </p>
+        </div>
       ) : null}
     </>
   );

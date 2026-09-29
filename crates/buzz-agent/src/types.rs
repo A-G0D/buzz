@@ -211,12 +211,14 @@ pub struct LlmResponse {
     ///
     /// - Responses API: concatenated `summary[].text` from `type == "reasoning"` output items.
     /// - Anthropic: concatenated `thinking` from `type == "thinking"` content blocks.
-    /// - OpenAI chat/completions: not exposed; always empty.
+    /// - DeepSeek Chat Completions: `reasoning_content`.
+    /// - Standard OpenAI chat/completions: empty.
     ///
     /// Empty string when the provider returned no reasoning content.
     pub reasoning: String,
     /// Provider-owned replay state: OpenRouter's raw `reasoning_details` array,
-    /// or an `anthropic_content` object holding ordered native content blocks.
+    /// DeepSeek's `deepseek_reasoning_content` value, or an `anthropic_content`
+    /// object holding ordered native content blocks.
     /// Kept opaque so signed thinking survives tool-result continuation. Each
     /// serializer consumes only its own shape, including after model switches.
     pub reasoning_details: Option<Value>,

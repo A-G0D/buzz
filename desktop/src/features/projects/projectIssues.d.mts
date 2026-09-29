@@ -8,7 +8,11 @@ export type ProjectIssueStatus =
   | "Done"
   | "Closed";
 
-export type ProjectTaskCategory = "issue" | "change-request" | "improvement";
+export type ProjectTaskCategory =
+  | "epic"
+  | "issue"
+  | "change-request"
+  | "improvement";
 
 export type ProjectIssueComment = {
   id: string;
@@ -26,6 +30,7 @@ export type ProjectIssue = {
   author: string;
   createdAt: number;
   repoAddress: string | null;
+  parentIssueId: string | null;
   channelId: string | null;
   originAgentName: string | null;
   labels: string[];
@@ -64,13 +69,26 @@ export function projectIssueEventsToIssues(
   statusEvents?: RelayEvent[],
   commentEvents?: RelayEvent[],
 ): ProjectIssue[];
+export function projectIssueHierarchy(issues: ProjectIssue[]): {
+  childrenByParentId: Map<string, ProjectIssue[]>;
+  invalidParentByIssueId: Map<
+    string,
+    "self" | "missing" | "different-repository" | "not-root-epic"
+  >;
+  parentByChildId: Map<string, string>;
+};
 export function nextProjectIssueCommentCreatedAt(
   issue: ProjectIssue,
   now: number,
   author: string,
 ): number;
+export function projectIssueContentWithAcceptanceCriteria(
+  description: string,
+  acceptanceCriteria: string,
+): string;
 export function buildGitIssueTags(input: {
   repoAddress: string;
+  parentIssueId?: string | null;
   repoOwner: string;
   title: string;
   labels?: string[];

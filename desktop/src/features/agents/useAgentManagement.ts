@@ -156,6 +156,7 @@ export function useAgentManagement() {
     input: CreatePersonaInput | UpdatePersonaInput,
     intent: AgentCreateIntent,
     backendIntent: BackendIntent | null,
+    executionProfileId?: string,
   ): Promise<boolean> {
     if (request?.action !== "create" || "id" in input) {
       return false;
@@ -188,6 +189,7 @@ export function useAgentManagement() {
             runtime,
             undefined,
             backendIntent ?? undefined,
+            executionProfileId,
           ),
         );
         if (created.spawnError) throw new Error(created.spawnError);

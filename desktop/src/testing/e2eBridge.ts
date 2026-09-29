@@ -209,6 +209,20 @@ type MockHuddleSeed = {
 type E2eConfig = {
   mode?: "mock" | "relay";
   mock?: {
+    /** Seed for the test-only local Agent Skills command bridge. */
+    agentSkills?: Array<{
+      name: string;
+      description: string;
+      content: string;
+      contentHash: string;
+      validationError?: string | null;
+      runtimeCompatibility?: Array<{
+        runtimeId: string;
+        runtimeLabel: string;
+        skillDirectory: string;
+        status: "linked" | "missing" | "conflict" | "blocked";
+      }>;
+    }>;
     /** Tauri window label exposed to the app. Defaults to the main window. */
     windowLabel?: string;
     ttsSettings?: {
@@ -247,7 +261,7 @@ type E2eConfig = {
     builderlabBindError?: { code?: string; message?: string };
     /** Communities owned by the mocked Builderlab account. */
     builderlabCommunities?: Array<{
-      id?: string;
+      id: string;
       name?: string;
       slug?: string;
       normalized_host?: string;
@@ -1356,6 +1370,7 @@ declare global {
     __BUZZ_E2E_SIGNED_EVENTS__?: Array<{
       content: string;
       createdAt?: number;
+      id?: string;
       kind: number;
       tags: string[][];
     }>;
@@ -8489,6 +8504,18 @@ function withMockRuntimeConfigMetadata(
         : runtime.id === "buzz-agent"
           ? "BUZZ_AGENT_MAX_ROUNDS"
           : null,
+    summary_model_env_var:
+      "summary_model_env_var" in runtime
+        ? runtime.summary_model_env_var
+        : runtime.id === "buzz-agent"
+          ? "BUZZ_AGENT_SUMMARY_MODEL"
+          : null,
+    summary_max_tokens_env_var:
+      "summary_max_tokens_env_var" in runtime
+        ? runtime.summary_max_tokens_env_var
+        : runtime.id === "buzz-agent"
+          ? "BUZZ_AGENT_SUMMARY_MAX_OUTPUT_TOKENS"
+          : null,
   };
 }
 
@@ -12004,6 +12031,37 @@ export function maybeInstallE2eTauriMocks() {
       sourceUrl: null;
     };
   }> = [];
+  type MockAgentSkill = NonNullable<
+    NonNullable<E2eConfig["mock"]>["agentSkills"]
+  >[number];
+  let mockAgentSkills: MockAgentSkill[] | null = null;
+  const getMockAgentSkills = (activeConfig: E2eConfig | undefined) => {
+    mockAgentSkills ??= structuredClone(activeConfig?.mock?.agentSkills ?? []);
+    return mockAgentSkills;
+  };
+  const mockSkillHash = (content: string) =>
+    Array.from(content)
+      .reduce(
+        (hash, character) => (hash * 33 + character.charCodeAt(0)) >>> 0,
+        5381,
+      )
+      .toString(16)
+      .padStart(8, "0")
+      .repeat(8);
+  const mockSkillDetails = (skill: MockAgentSkill) => ({
+    name: skill.name,
+    description: skill.description,
+    content: skill.content,
+    contentHash: skill.contentHash,
+    validationError: skill.validationError ?? null,
+    runtimeCompatibility: skill.runtimeCompatibility ?? [],
+  });
+  const mockSkillSummary = (skill: MockAgentSkill) => ({
+    name: skill.name,
+    description: skill.description,
+    contentHash: skill.contentHash,
+    validationError: skill.validationError ?? null,
+  });
   const handleMockCommand = async (
     command: string,
     payload: unknown,
@@ -12028,6 +12086,195 @@ export function maybeInstallE2eTauriMocks() {
     window.__BUZZ_E2E_COMMAND_LOG__?.push({ command, payload });
 
     switch (command) {
+      case "is_shared_identity":
+        return false;
+      case "preview_critic_coordinator_guide":
+        return {
+          path: "AGENT_GUIDES/CRITICS.md",
+          sha256: "c".repeat(64),
+          byteLength: 36,
+          text: "Review as the human coordinator.\n",
+        };
+      case "list_agent_route_profiles":
+        return [
+          {
+            id: "e2e-local-critic",
+            name: "E2E local critic",
+            version: 1,
+            dataPolicy: "local-only",
+            candidateCount: 2,
+            documentHash: "a".repeat(64),
+            updatedAt: "2026-09-26T00:00:00Z",
+          },
+        ];
+      case "read_agent_route_profile": {
+        const { id } = payload as { id: string };
+        if (id !== "e2e-local-critic") {
+          throw new Error("Unknown mock route profile.");
+        }
+        return {
+          schemaVersion: 1,
+          id: "e2e-local-critic",
+          name: "E2E local critic",
+          version: 1,
+          dataPolicy: "local-only",
+          documentHash: "a".repeat(64),
+          updatedAt: "2026-09-26T00:00:00Z",
+          document: {
+            version: 1,
+            data_policy: "local-only",
+            preference_order: ["loopback"],
+            candidates: [
+              {
+                id: "loopback",
+                provider: "openai",
+                model: "e2e-local-model",
+                data_location: "local",
+                prompt_addendum: "",
+              },
+              {
+                id: "local-backup",
+                provider: "openai",
+                model: "e2e-local-backup",
+                data_location: "local",
+                prompt_addendum: "",
+              },
+            ],
+          },
+        };
+      }
+      case "preview_critic_route_profile": {
+        const { profileId } = payload as { profileId: string };
+        if (profileId !== "e2e-local-critic") {
+          throw new Error("Unknown mock critic route profile.");
+        }
+        return {
+          profile: {
+            id: "e2e-local-critic",
+            version: 1,
+            hash: "b".repeat(64),
+          },
+          candidates: [
+            {
+              id: "loopback",
+              provider: "openai",
+              model: "e2e-local-model",
+              configured: true,
+              costPricingAvailable: true,
+              promptProfile: null,
+            },
+          ],
+          estimatedCostLimitMicrousd: null,
+        };
+      }
+      case "list_agent_skills":
+        return getMockAgentSkills(activeConfig).map(mockSkillSummary);
+      case "read_agent_skill": {
+        const { name } = payload as { name: string };
+        const skill = getMockAgentSkills(activeConfig).find(
+          (candidate) => candidate.name === name,
+        );
+        if (!skill) throw new Error(`Skill not found: ${name}`);
+        return mockSkillDetails(skill);
+      }
+      case "save_agent_skill": {
+        const { name, content, expectedContentHash } = payload as {
+          name: string;
+          content: string;
+          expectedContentHash: string | null;
+        };
+        const skills = getMockAgentSkills(activeConfig);
+        const existingIndex = skills.findIndex((skill) => skill.name === name);
+        if (expectedContentHash === null && existingIndex !== -1) {
+          throw new Error(`Skill already exists: ${name}`);
+        }
+        if (
+          expectedContentHash !== null &&
+          (existingIndex === -1 ||
+            skills[existingIndex].contentHash !== expectedContentHash)
+        ) {
+          throw new Error("Skill changed on disk. Review it before saving.");
+        }
+        const description =
+          content.match(/^description:\s*["']?(.+?)["']?\s*$/m)?.[1] ??
+          "Saved from the mock skill library";
+        const skill: MockAgentSkill = {
+          name,
+          description,
+          content,
+          contentHash: mockSkillHash(content),
+          validationError: null,
+          runtimeCompatibility: [],
+        };
+        if (existingIndex === -1) skills.push(skill);
+        else skills[existingIndex] = skill;
+        return mockSkillDetails(skill);
+      }
+      case "export_agent_skill_pack":
+        return true;
+      case "preview_agent_skill_pack": {
+        const skills = getMockAgentSkills(activeConfig);
+        const existing = skills.find((skill) => skill.name === "review-notes");
+        const previewSkill = {
+          name: "review-notes",
+          description: "Imported duplicate for collision review",
+          license: "MIT",
+          content:
+            "---\nname: review-notes\ndescription: Imported duplicate\n---\nReview carefully.\n",
+          contentHash: "d".repeat(64),
+          alreadyInstalled: existing !== undefined,
+        };
+        const additionalPreviewSkill = {
+          name: "new-from-pack",
+          description: "A second skill in this v2 pack",
+          license: "MIT",
+          content:
+            "---\nname: new-from-pack\ndescription: A second skill in this v2 pack\n---\nSummarize the requested work.\n",
+          contentHash: "e".repeat(64),
+          alreadyInstalled: skills.some(
+            (skill) => skill.name === "new-from-pack",
+          ),
+        };
+        return {
+          version: 2,
+          exportedFrom: "Mock Skill Library fixture",
+          skills: [previewSkill, additionalPreviewSkill],
+          // Keep the old single-skill projection while the view is migrating
+          // to the multi-skill pack contract.
+          ...previewSkill,
+        };
+      }
+      case "install_agent_skill_pack": {
+        const { expectedName, expectedSkills, fileBytes } = payload as {
+          expectedName?: string;
+          expectedSkills?: Array<{ name: string; contentHash: string }>;
+          fileBytes: number[];
+        };
+        const skills = getMockAgentSkills(activeConfig);
+        const names = expectedSkills?.map((skill) => skill.name) ?? [
+          expectedName,
+        ];
+        for (const name of names) {
+          if (name && skills.some((skill) => skill.name === name)) {
+            throw new Error(`Skill already exists: ${name}`);
+          }
+        }
+        const content = new TextDecoder().decode(new Uint8Array(fileBytes));
+        const installed = names.flatMap((name) => {
+          if (!name) return [];
+          const skill: MockAgentSkill = {
+            name,
+            description: "Installed from a mock pack",
+            content,
+            contentHash: mockSkillHash(content),
+            validationError: null,
+            runtimeCompatibility: [],
+          };
+          skills.push(skill);
+          return [mockSkillDetails(skill)];
+        });
+        return expectedSkills ? installed : (installed[0] ?? null);
+      }
       case "get_huddle_state": {
         const snapshot = mockHuddle ? structuredClone(mockHuddle.state) : null;
         const delayMs = activeConfig?.mock?.huddleStateReadDelayMs ?? 0;
@@ -13671,6 +13918,38 @@ export function maybeInstallE2eTauriMocks() {
       }
       case "list_personas":
         return handleListPersonas();
+      case "list_agent_archetypes":
+        // Focused UI fixture set: the project-create smoke checks the empty
+        // state and one fully described profile preview.
+        return [
+          {
+            id: "balanced",
+            name: "Balanced",
+            description:
+              "Use the selected agent's normal behavior and Buzz limits.",
+            snapshot: {
+              id: "balanced",
+              version: 1,
+              name: "Balanced",
+            },
+          },
+          {
+            id: "critic",
+            name: "Critic",
+            description:
+              "Check assumptions and cite concrete evidence for findings.",
+            snapshot: {
+              id: "critic",
+              version: 1,
+              name: "Critic",
+              promptAddendum:
+                "Review claims against the available evidence. Look for counterexamples, missing cases, and concrete regressions. Separate confirmed findings from uncertainty, and cite the exact evidence for each finding. Do not treat agreement or confidence as proof. Keep the review within the user's stated scope.",
+              parallelism: 1,
+              idleTimeoutSeconds: 300,
+              maxTurnDurationSeconds: 1800,
+            },
+          },
+        ];
       case "create_persona":
         return handleCreatePersona(
           payload as Parameters<typeof handleCreatePersona>[0],
@@ -14637,33 +14916,30 @@ export function maybeInstallE2eTauriMocks() {
               ) as RelayEvent,
           ),
         );
-      case "sign_event":
-        window.__BUZZ_E2E_SIGNED_EVENTS__?.push({
-          content: (payload as { content: string }).content,
-          createdAt: (payload as { createdAt?: number }).createdAt,
-          kind: (payload as { kind: number }).kind,
-          tags: (payload as { tags: string[][] }).tags,
-        });
-        if (identity) {
-          return JSON.stringify(
-            await signWithIdentity(identity, {
+      case "sign_event": {
+        const signedEvent = identity
+          ? await signWithIdentity(identity, {
               kind: (payload as { kind: number }).kind,
               content: (payload as { content: string }).content,
               createdAt: (payload as { createdAt?: number }).createdAt,
               tags: (payload as { tags: string[][] }).tags,
-            }),
-          );
-        }
-
-        return JSON.stringify(
-          createMockEvent(
-            (payload as { kind: number }).kind,
-            (payload as { content: string }).content,
-            (payload as { tags: string[][] }).tags,
-            DEFAULT_MOCK_IDENTITY.pubkey,
-            (payload as { createdAt?: number }).createdAt,
-          ),
-        );
+            })
+          : createMockEvent(
+              (payload as { kind: number }).kind,
+              (payload as { content: string }).content,
+              (payload as { tags: string[][] }).tags,
+              DEFAULT_MOCK_IDENTITY.pubkey,
+              (payload as { createdAt?: number }).createdAt,
+            );
+        window.__BUZZ_E2E_SIGNED_EVENTS__?.push({
+          content: signedEvent.content,
+          createdAt: signedEvent.created_at,
+          id: signedEvent.id,
+          kind: signedEvent.kind,
+          tags: signedEvent.tags,
+        });
+        return JSON.stringify(signedEvent);
+      }
       case "nip44_encrypt_to_self":
         return (payload as { plaintext: string }).plaintext;
       case "nip44_decrypt_from_self":

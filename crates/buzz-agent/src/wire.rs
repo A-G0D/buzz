@@ -5,6 +5,17 @@ use tokio::sync::mpsc;
 
 use crate::types::{ContentBlock, McpServerStdio};
 
+const SUPPORTED_TASK_CLASSES: &[&str] = &[
+    "coding",
+    "code_review",
+    "research",
+    "writing",
+    "analysis",
+    "planning",
+    "summarization",
+    "classification",
+];
+
 pub const PARSE_ERROR: i32 = -32700;
 pub const INVALID_REQUEST: i32 = -32600;
 pub const METHOD_NOT_FOUND: i32 = -32601;
@@ -70,6 +81,35 @@ pub struct SessionNewParams {
 pub struct SessionPromptParams {
     pub session_id: String,
     pub prompt: Vec<ContentBlock>,
+    #[serde(default, rename = "_meta")]
+    pub meta: Option<Value>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TaskClassMetadata {
+    pub version: u32,
+    pub task_class: String,
+    pub taxonomy_version: String,
+    pub source: String,
+}
+
+impl TaskClassMetadata {
+    pub fn validate(&self) -> bool {
+        self.version == 1
+            && self.taxonomy_version == "operator-defined-v1"
+            && matches!(self.source.as_str(), "desktop_ui" | "cli_explicit")
+            && SUPPORTED_TASK_CLASSES.contains(&self.task_class.as_str())
+    }
+}
+
+impl SessionPromptParams {
+    /// Missing or malformed extension metadata is unknown, not a decode error.
+    pub fn task_class_metadata(&self) -> Option<TaskClassMetadata> {
+        let value = self.meta.as_ref()?.pointer("/buzz/taskClass")?.clone();
+        let metadata = serde_json::from_value::<TaskClassMetadata>(value).ok()?;
+        metadata.validate().then_some(metadata)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -357,8 +397,15 @@ pub fn usage_update_payload(
 /// `_meta` is nested inside the `update` object (per the ACP `SessionInfoUpdate`
 /// schema), not alongside it at the params level.
 pub fn session_update_with_goose_meta(sid: &str, update: Value, goose_meta: Value) -> Value {
+    session_update_with_meta(sid, update, json!({ "goose": goose_meta }))
+}
+
+/// A `session/update` notification with ACP extension metadata on the update.
+/// The ACP schema treats `_meta` as opaque, so unrelated consumers may ignore
+/// Buzz's namespaced route-decision extension.
+pub fn session_update_with_meta(sid: &str, update: Value, meta: Value) -> Value {
     let mut update = update;
-    update["_meta"] = json!({ "goose": goose_meta });
+    update["_meta"] = meta;
     json!({
         "jsonrpc": "2.0",
         "method": "session/update",
@@ -367,6 +414,19 @@ pub fn session_update_with_goose_meta(sid: &str, update: Value, goose_meta: Valu
             "update": update,
         },
     })
+}
+
+/// ACP extension carrying one successful route throughput observation. The
+/// active run ID and sample share a single notification for an exact join.
+pub fn session_update_with_route_throughput(sid: &str, run_id: &str, sample: Value) -> Value {
+    session_update_with_meta(
+        sid,
+        json!({ "sessionUpdate": "session_info_update" }),
+        json!({
+            "goose": { "activeRunId": run_id },
+            "buzz": { "routeThroughputSampleV1": sample }
+        }),
+    )
 }
 
 pub async fn send(wire: &WireSender, msg: Value) {
@@ -423,7 +483,7 @@ pub async fn read_bounded_line<R: AsyncBufRead + Unpin>(
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         "io: frame contains invalid UTF-8",
-                    ))
+                    ));
                 }
             }
         }
@@ -518,6 +578,107 @@ mod tests {
         });
         let params: SessionNewParams = serde_json::from_value(json).unwrap();
         assert_eq!(params.system_prompt, Some(String::new()));
+    }
+
+    #[test]
+    fn task_class_metadata_defaults_to_unknown_and_accepts_exact_known_sources() {
+        let missing: SessionPromptParams = serde_json::from_value(serde_json::json!({
+            "sessionId": "session-1",
+            "prompt": []
+        }))
+        .expect("legacy prompt still decodes");
+        assert!(missing.task_class_metadata().is_none());
+
+        let valid: SessionPromptParams = serde_json::from_value(serde_json::json!({
+            "sessionId": "session-1",
+            "prompt": [],
+            "_meta": { "buzz": { "taskClass": {
+                "version": 1,
+                "taskClass": "coding",
+                "taxonomyVersion": "operator-defined-v1",
+                "source": "desktop_ui"
+            } } }
+        }))
+        .expect("metadata is opaque to the ACP decoder");
+        assert_eq!(
+            valid
+                .task_class_metadata()
+                .as_ref()
+                .map(|metadata| metadata.task_class.as_str()),
+            Some("coding")
+        );
+
+        let underscore_class: SessionPromptParams = serde_json::from_value(serde_json::json!({
+            "sessionId": "session-1",
+            "prompt": [],
+            "_meta": { "buzz": { "taskClass": {
+                "version": 1,
+                "taskClass": "code_review",
+                "taxonomyVersion": "operator-defined-v1",
+                "source": "desktop_ui"
+            } } }
+        }))
+        .expect("metadata is opaque to the ACP decoder");
+        assert_eq!(
+            underscore_class
+                .task_class_metadata()
+                .as_ref()
+                .map(|metadata| metadata.task_class.as_str()),
+            Some("code_review")
+        );
+
+        let cli_explicit: SessionPromptParams = serde_json::from_value(serde_json::json!({
+            "sessionId": "session-1",
+            "prompt": [],
+            "_meta": { "buzz": { "taskClass": {
+                "version": 1,
+                "taskClass": "coding",
+                "taxonomyVersion": "operator-defined-v1",
+                "source": "cli_explicit"
+            } } }
+        }))
+        .expect("metadata is opaque to the ACP decoder");
+        assert_eq!(
+            cli_explicit
+                .task_class_metadata()
+                .as_ref()
+                .map(|metadata| metadata.source.as_str()),
+            Some("cli_explicit")
+        );
+
+        for malformed in [
+            serde_json::json!({ "version": 2, "taskClass": "coding", "taxonomyVersion": "operator-defined-v1", "source": "desktop_ui" }),
+            serde_json::json!({ "version": 1, "taskClass": "coding", "taxonomyVersion": "operator-defined-v1", "source": "unknown_source" }),
+            serde_json::json!({ "version": 1, "taskClass": "coding", "taxonomyVersion": "operator-defined-v2", "source": "desktop_ui" }),
+            serde_json::json!({ "version": 1, "taskClass": "UPPER", "taxonomyVersion": "operator-defined-v1", "source": "desktop_ui" }),
+            serde_json::json!({ "version": 1, "taskClass": "unknown", "taxonomyVersion": "operator-defined-v1", "source": "desktop_ui" }),
+            serde_json::json!({ "version": 1, "taskClass": "operator_custom_class", "taxonomyVersion": "operator-defined-v1", "source": "desktop_ui" }),
+            serde_json::json!({ "version": 1, "taskClass": "coding", "taxonomyVersion": "operator-defined-v1", "source": "desktop_ui", "extra": true }),
+        ] {
+            let params: SessionPromptParams = serde_json::from_value(serde_json::json!({
+                "sessionId": "session-1",
+                "prompt": [],
+                "_meta": { "buzz": { "taskClass": malformed } }
+            }))
+            .expect("invalid optional extension must not break legacy decoding");
+            assert!(params.task_class_metadata().is_none());
+        }
+    }
+
+    #[test]
+    fn route_throughput_update_joins_sample_to_active_run_in_same_notice() {
+        let sample = serde_json::json!({"requestSequence": 2});
+        let notice = session_update_with_route_throughput("session-1", "run_attempt-2", sample);
+        assert_eq!(notice["method"], "session/update");
+        assert_eq!(
+            notice["params"]["update"]["_meta"]["goose"]["activeRunId"],
+            "run_attempt-2"
+        );
+        assert_eq!(
+            notice["params"]["update"]["_meta"]["buzz"]["routeThroughputSampleV1"]
+                ["requestSequence"],
+            2
+        );
     }
 
     // ── usage_update_payload: pricingIdentity emission ───────────────────────

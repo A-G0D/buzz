@@ -1,4 +1,5 @@
 use super::*;
+use crate::managed_agents::agent_route_profile::AgentRouteProfileIdentity;
 use std::collections::{BTreeMap, BTreeSet};
 
 const SECRET: &str = "sk-live-SENTINEL-0000";
@@ -21,6 +22,7 @@ fn base() -> SpawnConfigSnapshot {
         system_prompt: Some("You are a test agent.".into()),
         model: Some("gpt-5".into()),
         provider: Some("openai".into()),
+        route_profile: None,
         session_title: Some("Fizz".into()),
         auth_tag: Some("tag-abcdefgh".into()),
         respond_to: "owner-only".into(),
@@ -63,6 +65,13 @@ fn mutations() -> Vec<Mutation> {
         ("system_prompt", |s| s.system_prompt = None),
         ("model", |s| s.model = None),
         ("provider", |s| s.provider = None),
+        ("route_profile", |s| {
+            s.route_profile = Some(AgentRouteProfileIdentity {
+                id: "local-first".into(),
+                version: 3,
+                hash: "a".repeat(64),
+            })
+        }),
         ("session_title", |s| s.session_title = None),
         ("auth_tag", |s| s.auth_tag = None),
         ("respond_to", |s| s.respond_to = "anyone".into()),

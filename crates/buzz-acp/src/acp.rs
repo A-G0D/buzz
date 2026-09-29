@@ -13,7 +13,10 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio_util::codec::{FramedRead, LinesCodec, LinesCodecError};
 
+use buzz_run_journal::{RouteDecisionRecord, RouteThroughputSample};
+
 use crate::observer::{ObserverContext, ObserverHandle};
+use crate::task_class::TaskClassMetadata;
 use crate::usage::{
     PromptResponseUsage, StandardAdapterKind, StandardUsageTracker, TurnUsage, UsageTracker,
 };
@@ -21,6 +24,133 @@ use crate::usage::{
 /// Maximum allowed size of a single NDJSON line from the agent's stdout.
 /// Lines exceeding this limit are rejected to prevent OOM from rogue agents.
 const MAX_LINE_SIZE: usize = 10_000_000; // 10 MB
+
+/// Evidence that one exact ACP adapter-child generation was observed exited.
+/// The UUID identifies the spawn generation; PID is diagnostic only because
+/// operating systems may reuse it. This does not prove that the managed worker
+/// or any descendants have exited, or that logical turns were settled.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AcpChildExitReceipt {
+    pub generation_id: uuid::Uuid,
+    pub pid: Option<u32>,
+    pub exit_code: Option<i32>,
+    pub signal: Option<i32>,
+    pub success: bool,
+}
+
+/// Result of requesting shutdown and waiting for an ACP child process.
+/// Timeout and wait failure never count as confirmed exit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AcpShutdownOutcome {
+    Exited(AcpChildExitReceipt),
+    TimedOut {
+        generation_id: uuid::Uuid,
+        pid: Option<u32>,
+        kill_error: Option<String>,
+    },
+    WaitFailed {
+        generation_id: uuid::Uuid,
+        pid: Option<u32>,
+        kill_error: Option<String>,
+        wait_error: String,
+    },
+}
+
+async fn wait_for_child_exit_receipt(
+    child: &mut Child,
+    generation_id: uuid::Uuid,
+    pid: Option<u32>,
+    timeout: std::time::Duration,
+    kill_error: Option<String>,
+) -> AcpShutdownOutcome {
+    match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(Ok(status)) => AcpShutdownOutcome::Exited(AcpChildExitReceipt {
+            generation_id,
+            pid,
+            exit_code: status.code(),
+            signal: exit_signal(&status),
+            success: status.success(),
+        }),
+        Ok(Err(error)) => AcpShutdownOutcome::WaitFailed {
+            generation_id,
+            pid,
+            kill_error,
+            wait_error: error.to_string(),
+        },
+        Err(_) => AcpShutdownOutcome::TimedOut {
+            generation_id,
+            pid,
+            kill_error,
+        },
+    }
+}
+
+fn exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        status.signal()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = status;
+        None
+    }
+}
+
+/// Validate route-decision metadata against the ACP session and the active
+/// run ID from the same `session_info_update`. The journal adds the managed
+/// turn/profile checks before persisting it.
+fn parse_route_decision_notification(
+    msg: &serde_json::Value,
+    route_meta: &serde_json::Value,
+    context: &ObserverContext,
+    active_run_id: Option<&str>,
+) -> Option<RouteDecisionRecord> {
+    context.channel_id.as_ref()?;
+    let turn_id = context.turn_id.as_deref()?;
+    if turn_id.is_empty() {
+        return None;
+    }
+    let session_id = context.session_id.as_deref()?;
+    if msg["params"]["sessionId"].as_str()? != session_id {
+        return None;
+    }
+    let update_run_id = msg["params"]["update"]["_meta"]["goose"]["activeRunId"].as_str()?;
+    if active_run_id != Some(update_run_id) {
+        return None;
+    }
+    let decision: RouteDecisionRecord = serde_json::from_value(route_meta.clone()).ok()?;
+    decision.validate().ok()?;
+    if decision.session_id != session_id || update_run_id != decision.attempt_id {
+        return None;
+    }
+    Some(decision)
+}
+
+fn parse_route_throughput_notification(
+    msg: &serde_json::Value,
+    sample_meta: &serde_json::Value,
+    context: &ObserverContext,
+    active_run_id: Option<&str>,
+) -> Option<RouteThroughputSample> {
+    context.channel_id.as_ref()?;
+    let _turn_id = context.turn_id.as_deref()?;
+    let session_id = context.session_id.as_deref()?;
+    if msg["params"]["sessionId"].as_str()? != session_id {
+        return None;
+    }
+    let update_run_id = msg["params"]["update"]["_meta"]["goose"]["activeRunId"].as_str()?;
+    if active_run_id != Some(update_run_id) {
+        return None;
+    }
+    let sample: RouteThroughputSample = serde_json::from_value(sample_meta.clone()).ok()?;
+    sample.validate().ok()?;
+    if sample.session_id != session_id || update_run_id != sample.attempt_id {
+        return None;
+    }
+    Some(sample)
+}
 
 /// Package and binary name used by Buzz's Pi ACP fork.
 pub(crate) const BUZZ_PI_ACP_NAME: &str = "buzz-pi-acp";
@@ -109,6 +239,14 @@ pub enum AcpError {
     #[error("Protocol error: {0}")]
     Protocol(String),
 
+    #[error("Agent did not negotiate {capability} version {version}")]
+    UnsupportedCapability {
+        capability: &'static str,
+        version: u32,
+    },
+    #[error("Agent requires operator task-class metadata version {version}")]
+    TaskClassMetadataRequired { version: u32 },
+
     #[error("Agent reported error (code {code}): {message}")]
     AgentError { code: i64, message: String },
 }
@@ -144,6 +282,10 @@ fn build_initialize_params() -> serde_json::Value {
 pub struct AcpClient {
     /// The agent child process (kept alive to prevent zombie).
     child: Child,
+    /// Unique identity for this exact child spawn, independent of the OS PID.
+    child_generation_id: uuid::Uuid,
+    /// PID captured at spawn for diagnostics after `Child::wait` reaps it.
+    child_pid: Option<u32>,
     /// Write end of the agent's stdin pipe.
     stdin: ChildStdin,
     /// Framed reader over the agent's stdout pipe (line-oriented, bounded).
@@ -203,6 +345,20 @@ pub struct AcpClient {
     /// a JSON-RPC *success*, not `-32601` — which the main loop would read as
     /// a delivered steer and drop the user's message from the queue.
     steering_supported: bool,
+    /// Whether the exact Buzz task-class extension version was advertised by
+    /// the agent's initialize response. Metadata is never sent speculatively.
+    task_class_metadata_supported: bool,
+    /// Whether the peer requires explicit metadata on every prompt.
+    task_class_metadata_required: bool,
+    /// Whether initialize's self-reported `agentInfo.name` identified this
+    /// peer as Buzz Agent. ACP does not authenticate that claim; strict routing
+    /// also requires the exact task-class capability. A command basename is
+    /// insufficient because wrappers can be renamed or launch another adapter.
+    buzz_agent_identity_confirmed: bool,
+    /// The effective launch profile requires task-fit evidence. This is
+    /// resolved from the same environment precedence used for the child, so a
+    /// wrapper cannot evade the gate by changing its executable name.
+    strict_task_class_required: bool,
     /// Per-turn channel for receiving goose-native non-cancelling steer
     /// requests from the main loop. Installed by
     /// [`install_steer_rx`](Self::install_steer_rx) at dispatch and
@@ -217,6 +373,66 @@ pub struct AcpClient {
     standard_usage: StandardUsageTracker,
     /// Known adapter identity for prompt-response usage mapping.
     standard_adapter: Option<StandardAdapterKind>,
+    /// Whether this client owns the child process group. Local critic workers
+    /// deliberately share the coordinator group so outer cancellation can
+    /// retire the whole worker tree.
+    owns_process_group: bool,
+}
+
+/// Return the launch-time environment value using ACP child precedence:
+/// authoritative launch overrides, removals, inherited values, then persona
+/// environment entries. `Some(None)` means the value exists but is not UTF-8.
+fn effective_child_env_value(
+    key: &str,
+    extra_env: &[(String, String)],
+    launch_env: &[(String, String)],
+    clear_env: &[&str],
+) -> Option<Option<String>> {
+    if let Some((_, value)) = launch_env.iter().rev().find(|(name, _)| name == key) {
+        return Some(Some(value.clone()));
+    }
+    if clear_env.contains(&key) {
+        return None;
+    }
+    if let Some(value) = std::env::var_os(key) {
+        return Some(value.into_string().ok());
+    }
+    extra_env
+        .iter()
+        .rev()
+        .find(|(name, _)| name == key)
+        .map(|(_, value)| Some(value.clone()))
+}
+
+/// Be conservative when a declared profile is missing, malformed, or its
+/// task-fit setting cannot be inspected. An ID-only profile claim therefore
+/// activates the gate. No profile, or a known non-strict version-1 profile,
+/// does not impose it.
+fn launch_requires_task_class(
+    extra_env: &[(String, String)],
+    launch_env: &[(String, String)],
+    clear_env: &[&str],
+) -> bool {
+    let profile = effective_child_env_value(
+        "BUZZ_AGENT_ROUTE_PROFILE_JSON",
+        extra_env,
+        launch_env,
+        clear_env,
+    );
+    match profile {
+        Some(Some(raw)) => match serde_json::from_str::<serde_json::Value>(&raw) {
+            Ok(value) if value.get("version").and_then(serde_json::Value::as_u64) == Some(1) => {
+                value
+                    .get("task_fit_policy")
+                    .is_some_and(|policy| !policy.is_null())
+            }
+            _ => true,
+        },
+        Some(None) => true,
+        None => ["BUZZ_AGENT_ROUTE_PROFILE_ID", "BUZZ_ACP_ROUTE_PROFILE_ID"]
+            .iter()
+            .any(|key| effective_child_env_value(key, extra_env, launch_env, clear_env).is_some()),
+    }
 }
 
 /// Recursively merge `overlay` into `base`, with `overlay` winning on scalar/shape
@@ -408,6 +624,9 @@ fn build_client_capabilities() -> serde_json::Value {
             "goose": {
                 "customNotifications": true
             },
+            "buzz": {
+                "taskClass": { "version": 1 }
+            },
             // Non-standard extension used by claude-agent-acp to advertise the
             // exact terminal login argv for subscription auth. Unknown `_meta`
             // keys are ignored by other adapters.
@@ -417,33 +636,58 @@ fn build_client_capabilities() -> serde_json::Value {
 }
 
 impl AcpClient {
+    /// Return the unique identity assigned to this exact child spawn.
+    pub fn child_generation_id(&self) -> uuid::Uuid {
+        self.child_generation_id
+    }
+
     /// Kill the agent subprocess and wait for it to exit (no zombies).
     ///
     /// `Drop` only calls `start_kill()` (sends SIGKILL but doesn't reap).
     /// Call this when you need guaranteed cleanup — e.g., in `run_models`
     /// before process exit.
-    pub async fn shutdown(&mut self) {
-        // Kill the entire process group when possible. The child was spawned
-        // with process_group(0), so its PID == its PGID. Killing the group
-        // ensures subprocesses (MCP servers, tool processes) are cleaned up
-        // rather than orphaned to init.
-        //
-        // Falls back to start_kill() (direct child only) on non-Unix or if
-        // the child has been polled to completion (id() returns None).
-        match self.child.id() {
-            Some(pid) if kill_process_group(pid) => {}
-            _ => {
-                let _ = self.child.start_kill();
-            }
-        }
+    pub async fn shutdown(&mut self) -> AcpShutdownOutcome {
+        // Kill the entire process group when this client owns it. A local
+        // review worker shares its coordinator's group, so it kills only its
+        // direct child here and leaves tree-wide cancellation to the parent.
+        let kill_error = match self.child.id() {
+            Some(pid) if self.owns_process_group && kill_process_group(pid) => None,
+            _ => self.child.start_kill().err().map(|error| error.to_string()),
+        };
         // Bounded wait: if the child doesn't exit within 5s after SIGKILL,
         // give up and let Drop/OS handle it. An unbounded wait here would
         // wedge the harness during respawn or shutdown if a child is stuck.
-        match tokio::time::timeout(std::time::Duration::from_secs(5), self.child.wait()).await {
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => tracing::debug!("child wait error after kill: {e}"),
-            Err(_) => tracing::warn!("child did not exit within 5s after SIGKILL — abandoning"),
+        let outcome = wait_for_child_exit_receipt(
+            &mut self.child,
+            self.child_generation_id,
+            self.child_pid,
+            std::time::Duration::from_secs(5),
+            kill_error,
+        )
+        .await;
+        match &outcome {
+            AcpShutdownOutcome::Exited(receipt) => tracing::debug!(
+                child_generation_id = %receipt.generation_id,
+                child_pid = ?receipt.pid,
+                exit_code = ?receipt.exit_code,
+                signal = ?receipt.signal,
+                success = receipt.success,
+                "ACP child exit confirmed"
+            ),
+            AcpShutdownOutcome::TimedOut { generation_id, .. } => tracing::warn!(
+                child_generation_id = %generation_id,
+                "ACP child did not exit within 5s after SIGKILL — abandoning"
+            ),
+            AcpShutdownOutcome::WaitFailed {
+                generation_id,
+                wait_error,
+                ..
+            } => tracing::debug!(
+                child_generation_id = %generation_id,
+                "child wait error after kill: {wait_error}"
+            ),
         }
+        outcome
     }
 
     /// Spawn the agent binary as a subprocess and connect to its stdio pipes.
@@ -472,8 +716,60 @@ impl AcpClient {
         has_generated_codex_config: bool,
         launch_env: &[(String, String)],
     ) -> Result<Self, AcpError> {
+        Self::spawn_with_env_policy(
+            command,
+            args,
+            extra_env,
+            has_generated_codex_config,
+            launch_env,
+            &[],
+            true,
+        )
+        .await
+    }
+
+    /// Spawn Buzz Agent for a local, tool-free review. Relay identity, MCP hook
+    /// configuration, and ambient system prompts are removed from the child.
+    /// The child remains in the coordinator's process group for cancellation.
+    pub(crate) async fn spawn_for_local_review(
+        command: &str,
+        launch_env: &[(String, String)],
+    ) -> Result<Self, AcpError> {
+        Self::spawn_with_env_policy(
+            command,
+            &[],
+            &[],
+            false,
+            launch_env,
+            &[
+                "BUZZ_PRIVATE_KEY",
+                "BUZZ_ACP_PRIVATE_KEY",
+                "NOSTR_PRIVATE_KEY",
+                "BUZZ_RELAY_URL",
+                "BUZZ_AUTH_TAG",
+                "MCP_HOOK_SERVERS",
+                "BUZZ_AGENT_SYSTEM_PROMPT",
+                "BUZZ_AGENT_SYSTEM_PROMPT_FILE",
+                "BUZZ_AGENT_SUMMARY_MODEL",
+            ],
+            false,
+        )
+        .await
+    }
+
+    async fn spawn_with_env_policy(
+        command: &str,
+        args: &[String],
+        extra_env: &[(String, String)],
+        has_generated_codex_config: bool,
+        launch_env: &[(String, String)],
+        clear_env: &[&str],
+        owns_process_group: bool,
+    ) -> Result<Self, AcpError> {
         use std::process::Stdio;
 
+        let strict_task_class_required =
+            launch_requires_task_class(extra_env, launch_env, clear_env);
         let mut cmd = tokio::process::Command::new(command);
         cmd.args(args);
         if crate::config::normalize_agent_command_identity(command) == BUZZ_PI_ACP_NAME {
@@ -570,7 +866,9 @@ impl AcpClient {
         // to the harness's own process group on Unix.
         // tokio::process::Command::process_group is a stable tokio API (no extra imports needed).
         #[cfg(unix)]
-        cmd.process_group(0);
+        if owns_process_group {
+            cmd.process_group(0);
+        }
 
         // Suppress the console window that Windows otherwise allocates for every
         // console-subsystem child process spawned from a GUI/non-console parent.
@@ -584,8 +882,13 @@ impl AcpClient {
                 "codex" | "codex-acp" => Some(StandardAdapterKind::Codex),
                 _ => None,
             };
+        for key in clear_env {
+            cmd.env_remove(key);
+        }
         cmd.envs(launch_env.iter().cloned());
         let mut child = cmd.spawn()?;
+        let child_generation_id = uuid::Uuid::new_v4();
+        let child_pid = child.id();
 
         let stdin = child
             .stdin
@@ -598,6 +901,8 @@ impl AcpClient {
 
         Ok(Self {
             child,
+            child_generation_id,
+            child_pid,
             stdin,
             reader: FramedRead::new(stdout, LinesCodec::new_with_max_length(MAX_LINE_SIZE)),
             next_id: 0,
@@ -610,10 +915,15 @@ impl AcpClient {
             observer_context: ObserverContext::default(),
             active_run_id: None,
             steering_supported: false,
+            task_class_metadata_supported: false,
+            task_class_metadata_required: false,
+            buzz_agent_identity_confirmed: false,
+            strict_task_class_required,
             steer_rx: None,
             goose_usage: UsageTracker::default(),
             standard_usage: StandardUsageTracker::default(),
             standard_adapter,
+            owns_process_group,
         })
     }
 
@@ -668,6 +978,21 @@ impl AcpClient {
             .pointer("/_meta/steering/supported")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        self.task_class_metadata_supported = result
+            .pointer("/_meta/buzz/taskClass/version")
+            .and_then(serde_json::Value::as_u64)
+            == Some(u64::from(crate::task_class::METADATA_VERSION));
+        self.task_class_metadata_required = result
+            .pointer("/_meta/buzz/taskClass/required")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        self.strict_task_class_required |= self.task_class_metadata_required;
+        // This peer identity is self-reported by ACP agentInfo; it is not
+        // cryptographic attestation. Strict mode also requires exact v1.
+        self.buzz_agent_identity_confirmed = result
+            .pointer("/agentInfo/name")
+            .and_then(serde_json::Value::as_str)
+            == Some("buzz-agent");
         tracing::debug!(target: "acp::init", "initialize response: {result}");
         Ok(result)
     }
@@ -837,7 +1162,55 @@ impl AcpClient {
         idle_timeout: std::time::Duration,
         max_duration: std::time::Duration,
     ) -> Result<StopReason, AcpError> {
-        let params = build_prompt_params(session_id, prompt_blocks);
+        self.session_prompt_blocks_with_task_class_metadata(
+            session_id,
+            prompt_blocks,
+            idle_timeout,
+            max_duration,
+            None,
+        )
+        .await
+    }
+
+    /// Send a prompt with optional Buzz task-class metadata. It is added only
+    /// after exact capability negotiation. Strict task-fit profiles abstain
+    /// before writing to unknown or legacy peers.
+    pub async fn session_prompt_blocks_with_task_class_metadata(
+        &mut self,
+        session_id: &str,
+        prompt_blocks: &[&str],
+        idle_timeout: std::time::Duration,
+        max_duration: std::time::Duration,
+        task_class: Option<&TaskClassMetadata>,
+    ) -> Result<StopReason, AcpError> {
+        if task_class.is_none() && self.task_class_metadata_required {
+            return Err(AcpError::TaskClassMetadataRequired {
+                version: crate::task_class::METADATA_VERSION,
+            });
+        }
+        if self.strict_task_class_required && !self.buzz_agent_identity_confirmed {
+            return Err(AcpError::UnsupportedCapability {
+                capability: "identifiable Buzz Agent task-class metadata peer",
+                version: crate::task_class::METADATA_VERSION,
+            });
+        }
+        if self.strict_task_class_required && !self.task_class_metadata_supported {
+            return Err(AcpError::UnsupportedCapability {
+                capability: "Buzz task-class metadata",
+                version: crate::task_class::METADATA_VERSION,
+            });
+        }
+        if self.strict_task_class_required && task_class.is_none() {
+            return Err(AcpError::TaskClassMetadataRequired {
+                version: crate::task_class::METADATA_VERSION,
+            });
+        }
+        let negotiated_task_class = if self.task_class_metadata_supported {
+            task_class
+        } else {
+            None
+        };
+        let params = build_prompt_params(session_id, prompt_blocks, negotiated_task_class);
         let hard_deadline = tokio::time::Instant::now() + max_duration;
         self.current_hard_deadline = Some(hard_deadline);
 
@@ -935,6 +1308,18 @@ impl AcpClient {
     /// for the supervisor's post-initialize log line.
     pub fn steering_supported(&self) -> bool {
         self.steering_supported
+    }
+
+    /// Whether this peer negotiated exact Buzz task-class metadata v1.
+    #[cfg(test)]
+    pub fn task_class_metadata_supported(&self) -> bool {
+        self.task_class_metadata_supported
+    }
+
+    /// Whether this peer requires task-class metadata for each prompt.
+    #[cfg(test)]
+    pub fn task_class_metadata_required(&self) -> bool {
+        self.task_class_metadata_required
     }
 
     /// Consume per-turn usage for NIP-AM publishing. Goose/buzz-agent is an
@@ -1802,6 +2187,36 @@ impl AcpClient {
     /// leave it `None` and are steered via `_session/steering` instead, which
     /// needs no run id.
     fn handle_session_update(&mut self, msg: &serde_json::Value) -> bool {
+        self.handle_session_update_with_route_sinks(
+            msg,
+            |turn_id, decision| {
+                crate::run_journal::record_route_decision(turn_id, decision);
+            },
+            |turn_id, sample| {
+                crate::run_journal::record_route_throughput_sample(turn_id, sample);
+            },
+        )
+    }
+
+    /// Process a session update with an injectable route-decision sink. The
+    /// production wrapper above uses the durable local journal; tests inject a
+    /// temporary journal so they exercise the same ACP parsing and dispatch
+    /// path without environment variables or global state.
+    #[cfg(test)]
+    fn handle_session_update_with_route_sink(
+        &mut self,
+        msg: &serde_json::Value,
+        record_route_decision: impl FnMut(&str, RouteDecisionRecord),
+    ) -> bool {
+        self.handle_session_update_with_route_sinks(msg, record_route_decision, |_, _| {})
+    }
+
+    fn handle_session_update_with_route_sinks(
+        &mut self,
+        msg: &serde_json::Value,
+        mut record_route_decision: impl FnMut(&str, RouteDecisionRecord),
+        mut record_route_throughput: impl FnMut(&str, RouteThroughputSample),
+    ) -> bool {
         let update = &msg["params"]["update"];
         let update_type = update
             .get("sessionUpdate")
@@ -1893,6 +2308,48 @@ impl AcpClient {
                         }
                         // Missing or non-string/null — leave state untouched.
                         _ => {}
+                    }
+                }
+                let route_meta = update
+                    .get("_meta")
+                    .and_then(|meta| meta.get("buzz"))
+                    .and_then(|meta| meta.get("routeDecisionV1"));
+                if let Some(route_meta) = route_meta {
+                    if let Some(decision) = parse_route_decision_notification(
+                        msg,
+                        route_meta,
+                        &self.observer_context,
+                        self.active_run_id.as_deref(),
+                    ) {
+                        if let Some(turn_id) = self.observer_context.turn_id.as_deref() {
+                            record_route_decision(turn_id, decision);
+                        }
+                    } else {
+                        tracing::warn!(
+                            target: "acp::update",
+                            "ignored invalid or unjoinable Buzz route decision metadata"
+                        );
+                    }
+                }
+                let throughput_meta = update
+                    .get("_meta")
+                    .and_then(|meta| meta.get("buzz"))
+                    .and_then(|meta| meta.get("routeThroughputSampleV1"));
+                if let Some(throughput_meta) = throughput_meta {
+                    if let Some(sample) = parse_route_throughput_notification(
+                        msg,
+                        throughput_meta,
+                        &self.observer_context,
+                        self.active_run_id.as_deref(),
+                    ) {
+                        if let Some(turn_id) = self.observer_context.turn_id.as_deref() {
+                            record_route_throughput(turn_id, sample);
+                        }
+                    } else {
+                        tracing::warn!(
+                            target: "acp::update",
+                            "ignored invalid or unjoinable Buzz route throughput metadata"
+                        );
                     }
                 }
                 false
@@ -2097,15 +2554,28 @@ impl AcpClient {
 }
 
 /// Build `session/prompt` params from one or more text content blocks.
-fn build_prompt_params(session_id: &str, prompt_blocks: &[&str]) -> serde_json::Value {
+fn build_prompt_params(
+    session_id: &str,
+    prompt_blocks: &[&str],
+    task_class: Option<&TaskClassMetadata>,
+) -> serde_json::Value {
     let blocks: Vec<serde_json::Value> = prompt_blocks
         .iter()
         .map(|text| serde_json::json!({ "type": "text", "text": text }))
         .collect();
-    serde_json::json!({
+    let mut params = serde_json::json!({
         "sessionId": session_id,
         "prompt": blocks,
-    })
+    });
+    if let Some(task_class) = task_class {
+        params["_meta"]["buzz"]["taskClass"] = serde_json::json!({
+            "version": task_class.version,
+            "taskClass": task_class.task_class,
+            "taxonomyVersion": task_class.taxonomy_version,
+            "source": task_class.source,
+        });
+    }
+    params
 }
 
 /// Build `_goose/unstable/session/steer` params from one or more text
@@ -2354,11 +2824,12 @@ pub fn model_in_catalog(
 
 impl Drop for AcpClient {
     fn drop(&mut self) {
-        // Best-effort SIGKILL + reap. We cannot `await` in Drop (sync context).
-        // Kill the process group when possible so subprocesses don't leak.
+        // Best-effort kill + reap. We cannot `await` in Drop (sync context).
+        // Only kill a process group this client created; shared-group callers
+        // own tree-wide cleanup themselves.
         // Callers SHOULD still call `shutdown().await` for guaranteed reaping.
         match self.child.id() {
-            Some(pid) if kill_process_group(pid) => {}
+            Some(pid) if self.owns_process_group && kill_process_group(pid) => {}
             _ => {
                 let _ = self.child.start_kill();
             }
@@ -2409,6 +2880,108 @@ fn configure_no_window(cmd: &mut tokio::process::Command) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn acp_shutdown_returns_a_receipt_for_its_spawned_child() {
+        let args = vec![String::from("-c"), String::from("exec sleep 30")];
+        let mut client = AcpClient::spawn("/bin/sh", &args, &[], false)
+            .await
+            .expect("spawn fake ACP child");
+        let generation_id = client.child_generation_id;
+        let pid = client.child_pid;
+
+        let outcome = client.shutdown().await;
+        let AcpShutdownOutcome::Exited(receipt) = outcome else {
+            panic!("shutdown should confirm the child exit: {outcome:?}");
+        };
+        assert_eq!(receipt.generation_id, generation_id);
+        assert_eq!(receipt.pid, pid);
+        assert!(!receipt.success);
+        assert_eq!(receipt.exit_code, None);
+        assert!(receipt.signal.is_some());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exit_receipt_records_the_exact_spawn_and_nonzero_status() {
+        let mut child = tokio::process::Command::new("/bin/sh")
+            .args(["-c", "exit 7"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn fake ACP child");
+        let generation_id = uuid::Uuid::new_v4();
+        let pid = child.id();
+
+        let outcome = wait_for_child_exit_receipt(
+            &mut child,
+            generation_id,
+            pid,
+            std::time::Duration::from_secs(1),
+            Some("kill request failed".into()),
+        )
+        .await;
+
+        let AcpShutdownOutcome::Exited(receipt) = outcome else {
+            panic!("wait should confirm the child exit: {outcome:?}");
+        };
+        assert_eq!(receipt.generation_id, generation_id);
+        assert_eq!(receipt.pid, pid);
+        assert_eq!(receipt.exit_code, Some(7));
+        assert_eq!(receipt.signal, None);
+        assert!(!receipt.success);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_is_not_an_exit_receipt_but_a_later_wait_is() {
+        let mut child = tokio::process::Command::new("/bin/sh")
+            .args(["-c", "exec sleep 30"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn fake ACP child");
+        let generation_id = uuid::Uuid::new_v4();
+        let pid = child.id();
+
+        let timed_out = wait_for_child_exit_receipt(
+            &mut child,
+            generation_id,
+            pid,
+            std::time::Duration::from_millis(10),
+            None,
+        )
+        .await;
+        assert!(matches!(
+            timed_out,
+            AcpShutdownOutcome::TimedOut {
+                generation_id: actual_id,
+                pid: actual_pid,
+                ..
+            } if actual_id == generation_id && actual_pid == pid
+        ));
+
+        child.start_kill().expect("kill fake ACP child");
+        let exited = wait_for_child_exit_receipt(
+            &mut child,
+            generation_id,
+            pid,
+            std::time::Duration::from_secs(1),
+            None,
+        )
+        .await;
+        let AcpShutdownOutcome::Exited(receipt) = exited else {
+            panic!("later wait should confirm the child exit: {exited:?}");
+        };
+        assert_eq!(receipt.generation_id, generation_id);
+        assert_eq!(receipt.pid, pid);
+        assert!(!receipt.success);
+        assert_eq!(receipt.exit_code, None);
+        assert!(receipt.signal.is_some());
+    }
 
     #[test]
     fn stop_reason_parses_all_known_values() {
@@ -2577,6 +3150,10 @@ mod tests {
             Some(true),
             "goose customNotifications capability must be advertised"
         );
+        assert_eq!(
+            msg["params"]["clientCapabilities"]["_meta"]["buzz"]["taskClass"]["version"], 1,
+            "the exact Buzz task-class extension version must be advertised"
+        );
     }
 
     #[test]
@@ -2643,6 +3220,7 @@ mod tests {
                 "/goal ship it",
                 "[Buzz event: @mention]\nContent: @Eva /goal ship it",
             ],
+            None,
         );
         let prompt = params["prompt"].as_array().unwrap();
         assert_eq!(prompt.len(), 2);
@@ -2650,6 +3228,21 @@ mod tests {
         assert_eq!(prompt[0]["text"].as_str(), Some("/goal ship it"));
         assert!(prompt[0]["text"].as_str().unwrap().starts_with('/'));
         assert_eq!(prompt[1]["type"].as_str(), Some("text"));
+    }
+
+    #[test]
+    fn task_class_metadata_is_namespaced_in_prompt_meta() {
+        let metadata = TaskClassMetadata {
+            version: 1,
+            task_class: "coding".into(),
+            taxonomy_version: "operator-defined-v1".into(),
+            source: "desktop_ui".into(),
+        };
+        let params = build_prompt_params("session-1", &["task"], Some(&metadata));
+        assert_eq!(params["_meta"]["buzz"]["taskClass"]["version"], 1);
+        assert_eq!(params["_meta"]["buzz"]["taskClass"]["taskClass"], "coding");
+        assert_eq!(params["_meta"]["buzz"]["taskClass"]["source"], "desktop_ui");
+        assert!(params.get("taskClass").is_none());
     }
 
     #[test]
@@ -3702,6 +4295,976 @@ mod tests {
         assert_eq!(client.active_run_id(), Some("run-abc-123"));
     }
 
+    #[test]
+    fn route_decision_notification_requires_matching_session_attempt_and_schema() {
+        let context = ObserverContext {
+            channel_id: Some("channel-1".into()),
+            session_id: Some("session-1".into()),
+            turn_id: Some("123e4567-e89b-12d3-a456-426614174000".into()),
+            started_at: None,
+        };
+        let decision = serde_json::json!({
+            "sessionId": "session-1",
+            "attemptId": "run_attempt-1",
+            "profileId": "local-first",
+            "profileVersion": 3,
+            "profileHash": "a".repeat(64),
+            "outcome": "selected",
+            "candidateId": "local-fast",
+            "providerId": "openai",
+            "modelId": "gpt-test",
+            "reasonCode": null,
+            "contextFit": {
+                "estimateMethod": "utf8_bytes_plus_framing_and_output_reserve_v1",
+                "capacitySource": "operator_declared",
+                "inputTokensUpperBound": 512,
+                "capacityTokens": 2048
+            }
+        });
+        let message = serde_json::json!({
+            "params": {
+                "sessionId": "session-1",
+                "update": {
+                    "_meta": {"goose": {"activeRunId": "run_attempt-1"}}
+                }
+            }
+        });
+        let parsed =
+            parse_route_decision_notification(&message, &decision, &context, Some("run_attempt-1"))
+                .expect("valid joined route record is accepted");
+        assert_eq!(parsed.attempt_id, "run_attempt-1");
+        assert_eq!(parsed.candidate_id.as_deref(), Some("local-fast"));
+
+        assert!(parse_route_decision_notification(
+            &message,
+            &decision,
+            &context,
+            Some("run_another-attempt"),
+        )
+        .is_none());
+        let wrong_session = serde_json::json!({"params": {"sessionId": "other-session"}});
+        assert!(parse_route_decision_notification(
+            &wrong_session,
+            &decision,
+            &context,
+            Some("run_attempt-1"),
+        )
+        .is_none());
+        let no_same_update_run_id = serde_json::json!({
+            "params": {
+                "sessionId": "session-1",
+                "update": {"_meta": {"buzz": {}}}
+            }
+        });
+        assert!(parse_route_decision_notification(
+            &no_same_update_run_id,
+            &decision,
+            &context,
+            Some("run_attempt-1"),
+        )
+        .is_none());
+        let mut extra = decision;
+        extra["prompt"] = serde_json::json!("must never be accepted");
+        assert!(parse_route_decision_notification(
+            &message,
+            &extra,
+            &context,
+            Some("run_attempt-1"),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn route_throughput_notification_requires_same_active_run_and_known_fields() {
+        let context = ObserverContext {
+            channel_id: Some("channel-1".into()),
+            session_id: Some("session-1".into()),
+            turn_id: Some("123e4567-e89b-12d3-a456-426614174000".into()),
+            started_at: None,
+        };
+        let sample = serde_json::json!({
+            "sessionId": "session-1",
+            "attemptId": "run_attempt-1",
+            "profileId": "local-first",
+            "profileVersion": 3,
+            "profileHash": "a".repeat(64),
+            "endpointHash": "b".repeat(64),
+            "candidateId": "local-fast",
+            "providerId": "openai",
+            "modelId": "gpt-test",
+            "thinkingEffort": "default",
+            "requestSequence": 1,
+            "inputTokens": 100,
+            "outputTokens": 50,
+            "elapsedMs": 1_000,
+            "effectiveOutputTokensPerSecondMilli": 50_000
+        });
+        let message = serde_json::json!({
+            "params": {
+                "sessionId": "session-1",
+                "update": {
+                    "_meta": {"goose": {"activeRunId": "run_attempt-1"}}
+                }
+            }
+        });
+        let parsed =
+            parse_route_throughput_notification(&message, &sample, &context, Some("run_attempt-1"))
+                .expect("valid joined sample is accepted");
+        assert_eq!(parsed.request_sequence, 1);
+        assert_eq!(parsed.effective_output_tokens_per_second_milli, 50_000);
+        assert!(parse_route_throughput_notification(
+            &message,
+            &sample,
+            &context,
+            Some("run_another-attempt"),
+        )
+        .is_none());
+        let mut extra = sample;
+        extra["completion"] = serde_json::json!("must not be accepted");
+        assert!(parse_route_throughput_notification(
+            &message,
+            &extra,
+            &context,
+            Some("run_attempt-1"),
+        )
+        .is_none());
+    }
+
+    #[tokio::test]
+    async fn buzz_agent_route_decision_session_update_reaches_managed_turn_journal() {
+        use buzz_run_journal::{AgentProfileSnapshot, RunJournal, StartRecord};
+
+        let temp = tempfile::tempdir().unwrap();
+        let turn_id = "123e4567-e89b-12d3-a456-426614174000";
+        let session_id = "buzz-agent-session";
+        let journal =
+            RunJournal::open_scoped(temp.path(), "ws://localhost:3000", &"d".repeat(64)).unwrap();
+        journal
+            .record_started(&StartRecord {
+                turn_id: turn_id.into(),
+                managed_worker_generation_nonce: None,
+                adapter_child_generation_id: None,
+                channel_id: Some("123e4567-e89b-12d3-a456-426614174001".into()),
+                session_scope: "thread".into(),
+                thread_root_event_id: Some("a".repeat(64)),
+                batch_trigger_event_ids: vec!["b".repeat(64)],
+                merged_cancelled_event_ids: Vec::new(),
+                agent_index: 0,
+                configured_worker_pool_slots: 1,
+                idle_timeout_secs: 60,
+                max_turn_duration_secs: 120,
+                agent_profile: AgentProfileSnapshot {
+                    harness_id: "buzz-agent".into(),
+                    provider_id: Some("openai".into()),
+                    model_id: Some("gpt-test".into()),
+                    agent_prompt_sha256: None,
+                    execution_profile_id: None,
+                    execution_profile_version: None,
+                    prompt_profile_id: None,
+                    prompt_profile_version: None,
+                    prompt_profile_hash: None,
+                    route_profile_id: Some("local-first".into()),
+                    route_profile_version: Some(3),
+                    route_profile_hash: Some("a".repeat(64)),
+                },
+            })
+            .unwrap();
+        journal
+            .record_session_resolved(turn_id, session_id)
+            .unwrap();
+
+        let decision = serde_json::json!({
+            "sessionId": session_id,
+            "attemptId": "run_attempt-1",
+            "profileId": "local-first",
+            "profileVersion": 3,
+            "profileHash": "a".repeat(64),
+            "outcome": "selected",
+            "candidateId": "local-fast",
+            "providerId": "openai",
+            "modelId": "gpt-test",
+            "reasonCode": null,
+            "contextFit": {
+                "estimateMethod": "utf8_bytes_plus_framing_and_output_reserve_v1",
+                "capacitySource": "operator_declared",
+                "inputTokensUpperBound": 512,
+                "capacityTokens": 2048
+            }
+        });
+        // This is the exact envelope emitted by buzz-agent's
+        // `session_update_with_meta`: activeRunId and routeDecisionV1 share
+        // the ACP session_info_update's nested `_meta` object.
+        let notification = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": session_id,
+                "update": {
+                    "sessionUpdate": "session_info_update",
+                    "_meta": {
+                        "goose": {"activeRunId": "run_attempt-1"},
+                        "buzz": {"routeDecisionV1": decision}
+                    }
+                }
+            }
+        });
+
+        let mut client = spawn_inert_client().await;
+        client.set_observer_context(ObserverContext {
+            channel_id: Some("123e4567-e89b-12d3-a456-426614174001".into()),
+            session_id: Some(session_id.into()),
+            turn_id: Some(turn_id.into()),
+            started_at: None,
+        });
+        let persist = |turn_id: &str, decision: RouteDecisionRecord| {
+            journal.record_route_decision(turn_id, &decision).unwrap();
+        };
+        assert!(!client.handle_session_update_with_route_sink(&notification, persist));
+
+        let events = journal.events(turn_id, 100).unwrap();
+        let decisions: Vec<_> = events
+            .iter()
+            .filter(|event| event.kind == "route_decision_v1")
+            .collect();
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].details["sessionId"], session_id);
+        assert_eq!(decisions[0].details["attemptId"], "run_attempt-1");
+        assert_eq!(decisions[0].details["candidateId"], "local-fast");
+        assert_eq!(decisions[0].details["modelId"], "gpt-test");
+        assert_eq!(
+            decisions[0].details["contextFit"]["inputTokensUpperBound"],
+            512
+        );
+        assert_eq!(
+            decisions[0].details["contextFit"]["capacitySource"],
+            "operator_declared"
+        );
+
+        // ACP can replay a notification; the journal keeps one event.
+        let persist = |turn_id: &str, decision: RouteDecisionRecord| {
+            journal.record_route_decision(turn_id, &decision).unwrap();
+        };
+        client.handle_session_update_with_route_sink(&notification, persist);
+        assert_eq!(
+            journal
+                .events(turn_id, 100)
+                .unwrap()
+                .iter()
+                .filter(|event| event.kind == "route_decision_v1")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "run through `just test-unit`, which builds the Buzz Agent ACP child first"]
+    async fn production_route_journal_bridge_accepts_real_buzz_agent_channel_turn() {
+        use axum::{extract::State, routing::post, Json, Router};
+        use buzz_run_journal::{AgentProfileSnapshot, RunJournal, StartRecord};
+        use nostr::Keys;
+        use std::path::PathBuf;
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        use std::time::Duration;
+
+        const TURN_ID: &str = "123e4567-e89b-12d3-a456-426614174000";
+        const CHANNEL_ID: &str = "123e4567-e89b-12d3-a456-426614174001";
+        const RELAY_URL: &str = "ws://127.0.0.1:3000";
+        const PRIVATE_KEY: &str =
+            "0000000000000000000000000000000000000000000000000000000000000001";
+        const PROFILE_ID: &str = "local-loopback-route";
+        const PROFILE_VERSION: u32 = 7;
+        const PROFILE_HASH: &str =
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const PROMPT_CANARY: &str = "PRIVATE_PROMPT_CANARY_DO_NOT_JOURNAL";
+        const COMPLETION_CANARY: &str = "LOCAL_COMPLETION_CANARY_DO_NOT_JOURNAL";
+        const API_KEY_CANARY: &str = "LOCAL_FAKE_KEY_DO_NOT_JOURNAL";
+
+        // `just test-unit` builds this sibling executable and invokes this
+        // exact ignored test alone to isolate the bridge's process-global
+        // journal from the rest of the ACP unit suite.
+        let test_exe = std::env::current_exe().expect("current test executable");
+        let agent_bin = test_exe
+            .parent()
+            .and_then(std::path::Path::parent)
+            .map(|dir| {
+                dir.join(if cfg!(windows) {
+                    "buzz-agent.exe"
+                } else {
+                    "buzz-agent"
+                })
+            })
+            .filter(|path| path.is_file())
+            .unwrap_or_else(|| {
+                let target = std::env::var_os("CARGO_TARGET_DIR")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| {
+                        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target")
+                    });
+                target.join("debug").join(if cfg!(windows) {
+                    "buzz-agent.exe"
+                } else {
+                    "buzz-agent"
+                })
+            });
+        assert!(
+            agent_bin.is_file(),
+            "real Buzz Agent test child is missing at {}; `just test-unit` builds it before invoking this test",
+            agent_bin.display()
+        );
+
+        async fn local_completion(
+            State(requests): State<Arc<AtomicUsize>>,
+        ) -> Json<serde_json::Value> {
+            requests.fetch_add(1, Ordering::SeqCst);
+            Json(serde_json::json!({
+                "id": "local-route-test",
+                "object": "chat.completion",
+                "model": "fake-model",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": COMPLETION_CANARY},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}
+            }))
+        }
+
+        let temp = tempfile::tempdir().expect("temporary managed-agent nest");
+        std::env::set_var("BUZZ_NEST_DIR", temp.path());
+        std::env::set_var("BUZZ_RELAY_URL", RELAY_URL);
+        std::env::set_var("BUZZ_PRIVATE_KEY", PRIVATE_KEY);
+
+        // The managed channel/turn identity is synthetic here: this isolates
+        // the production ACP journal bridge, not relay dispatch or scheduling.
+        let keys = Keys::parse(PRIVATE_KEY).expect("valid test-only local Nostr key");
+        let journal = RunJournal::open_scoped(temp.path(), RELAY_URL, &keys.public_key().to_hex())
+            .expect("open isolated managed run journal");
+        journal
+            .record_started(&StartRecord {
+                turn_id: TURN_ID.into(),
+                managed_worker_generation_nonce: None,
+                adapter_child_generation_id: None,
+                channel_id: Some(CHANNEL_ID.into()),
+                session_scope: "conversation".into(),
+                thread_root_event_id: None,
+                batch_trigger_event_ids: vec!["b".repeat(64)],
+                merged_cancelled_event_ids: Vec::new(),
+                agent_index: 0,
+                configured_worker_pool_slots: 1,
+                idle_timeout_secs: 60,
+                max_turn_duration_secs: 120,
+                agent_profile: AgentProfileSnapshot {
+                    harness_id: "buzz-agent".into(),
+                    provider_id: Some("openai".into()),
+                    model_id: Some("fake-model".into()),
+                    agent_prompt_sha256: None,
+                    execution_profile_id: None,
+                    execution_profile_version: None,
+                    prompt_profile_id: None,
+                    prompt_profile_version: None,
+                    prompt_profile_hash: None,
+                    route_profile_id: Some(PROFILE_ID.into()),
+                    route_profile_version: Some(PROFILE_VERSION),
+                    route_profile_hash: Some(PROFILE_HASH.into()),
+                },
+            })
+            .expect("seed channel-scoped managed turn");
+
+        let requests = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/v1/chat/completions", post(local_completion))
+            .with_state(Arc::clone(&requests));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback-only fake provider");
+        let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let (server_stop_tx, server_stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let server_task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = server_stop_rx.await;
+                })
+                .await
+                .expect("serve fake provider");
+        });
+
+        let profile = serde_json::json!({
+            "version": 1,
+            "preference_order": ["local-fast"],
+            "max_turn_cost_microusd": 1_000_000,
+            "candidates": [{
+                "id": "local-fast",
+                "provider": "openai",
+                "model": "fake-model",
+                "data_location": "local",
+                "input_cost_microusd_per_million_tokens": 1_000_000,
+                "output_cost_microusd_per_million_tokens": 1_000_000
+            }],
+            "profile_id": PROFILE_ID,
+            "profile_version": PROFILE_VERSION,
+            "profile_hash": PROFILE_HASH
+        });
+        let launch_env = vec![
+            ("BUZZ_AGENT_PROVIDER".into(), "openai".into()),
+            ("OPENAI_COMPAT_API_KEY".into(), API_KEY_CANARY.into()),
+            ("OPENAI_COMPAT_MODEL".into(), "fake-model".into()),
+            ("OPENAI_COMPAT_BASE_URL".into(), base_url),
+            (
+                "BUZZ_AGENT_ROUTE_PROFILE_JSON".into(),
+                serde_json::to_string(&profile).unwrap(),
+            ),
+            ("BUZZ_ACP_ROUTE_PROFILE_ID".into(), PROFILE_ID.into()),
+            (
+                "BUZZ_ACP_ROUTE_PROFILE_VERSION".into(),
+                PROFILE_VERSION.to_string(),
+            ),
+            ("BUZZ_ACP_ROUTE_PROFILE_HASH".into(), PROFILE_HASH.into()),
+            ("BUZZ_AGENT_LLM_TIMEOUT_SECS".into(), "5".into()),
+            ("BUZZ_AGENT_MAX_ROUNDS".into(), "2".into()),
+            ("NO_PROXY".into(), "127.0.0.1,localhost".into()),
+            ("no_proxy".into(), "127.0.0.1,localhost".into()),
+            ("RUST_LOG".into(), "off".into()),
+        ];
+        let agent_bin = agent_bin.to_string_lossy().into_owned();
+        let mut client = AcpClient::spawn_with_env(&agent_bin, &[], &[], false, &launch_env)
+            .await
+            .expect("spawn real buzz-agent ACP child");
+        let observer = crate::observer::ObserverHandle::in_process();
+        client.set_observer(Some(observer.clone()), 0);
+
+        let session_id = tokio::time::timeout(Duration::from_secs(10), async {
+            client
+                .initialize()
+                .await
+                .expect("initialize real buzz-agent");
+            let session = client
+                .session_new(
+                    &std::env::current_dir().unwrap().to_string_lossy(),
+                    Vec::new(),
+                    None,
+                    None,
+                )
+                .await
+                .expect("create Buzz Agent ACP session");
+            journal
+                .record_session_resolved(TURN_ID, &session)
+                .expect("join ACP session to managed channel turn");
+            client.set_observer_context(ObserverContext {
+                channel_id: Some(CHANNEL_ID.into()),
+                session_id: Some(session.clone()),
+                turn_id: Some(TURN_ID.into()),
+                started_at: None,
+            });
+            let stop = client
+                .session_prompt_with_idle_timeout(
+                    &session,
+                    PROMPT_CANARY,
+                    Duration::from_secs(5),
+                    Duration::from_secs(15),
+                )
+                .await
+                .expect("run prompt against loopback fake provider");
+            Ok::<_, String>((session, stop))
+        })
+        .await;
+        client.shutdown().await;
+        let _ = server_stop_tx.send(());
+        tokio::time::timeout(Duration::from_secs(3), server_task)
+            .await
+            .expect("fake provider shutdown is bounded")
+            .expect("fake provider task joins");
+        let (session_id, stop) = session_id
+            .expect("initialize/session/prompt exceeded 10 seconds")
+            .expect("real Buzz Agent ACP turn failed");
+        assert_eq!(stop, StopReason::EndTurn);
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "only loopback provider was called"
+        );
+
+        let route_frames: Vec<_> = observer
+            .snapshot()
+            .into_iter()
+            .filter(|event| {
+                event.kind == "acp_read"
+                    && event.payload["method"] == "session/update"
+                    && event.payload["params"]["update"]["_meta"]["buzz"]["routeDecisionV1"]
+                        .is_object()
+            })
+            .collect();
+        assert_eq!(route_frames.len(), 1, "real child emits one route decision");
+        let route_frame = &route_frames[0].payload;
+        let notice = &route_frame["params"]["update"]["_meta"]["buzz"]["routeDecisionV1"];
+        let attempt_id = route_frame["params"]["update"]["_meta"]["goose"]["activeRunId"]
+            .as_str()
+            .expect("route update carries same-event activeRunId");
+        assert_eq!(notice["attemptId"], attempt_id);
+
+        let summary = journal
+            .get(TURN_ID)
+            .expect("read managed turn")
+            .expect("managed channel turn exists");
+        assert_eq!(summary.channel_id.as_deref(), Some(CHANNEL_ID));
+        assert_eq!(summary.session_scope, "conversation");
+        assert_eq!(summary.acp_session_id.as_deref(), Some(session_id.as_str()));
+        let events = journal
+            .events(TURN_ID, 100)
+            .expect("read route journal events");
+        let decisions: Vec<_> = events
+            .iter()
+            .filter(|event| event.kind == "route_decision_v1")
+            .collect();
+        assert_eq!(
+            decisions.len(),
+            1,
+            "production bridge persisted one decision"
+        );
+        let details = &decisions[0].details;
+        assert_eq!(details["sessionId"], session_id);
+        assert_eq!(details["attemptId"], attempt_id);
+        assert_eq!(details["profileId"], PROFILE_ID);
+        assert_eq!(details["profileVersion"], PROFILE_VERSION);
+        assert_eq!(details["profileHash"], PROFILE_HASH);
+        assert_eq!(details["outcome"], "selected");
+        assert_eq!(details["candidateId"], "local-fast");
+        assert_eq!(details["providerId"], "openai");
+        assert_eq!(details["modelId"], "fake-model");
+        let measurement_frames: Vec<_> = observer
+            .snapshot()
+            .into_iter()
+            .filter(|event| {
+                event.kind == "acp_read"
+                    && event.payload["method"] == "session/update"
+                    && event.payload["params"]["update"]["_meta"]["buzz"]["routeThroughputSampleV1"]
+                        .is_object()
+            })
+            .collect();
+        assert_eq!(measurement_frames.len(), 1);
+        let measurement_frame = &measurement_frames[0].payload;
+        let measurement =
+            &measurement_frame["params"]["update"]["_meta"]["buzz"]["routeThroughputSampleV1"];
+        assert_eq!(
+            measurement_frame["params"]["update"]["_meta"]["goose"]["activeRunId"],
+            attempt_id
+        );
+        assert_eq!(measurement["attemptId"], attempt_id);
+        assert_eq!(measurement["candidateId"], "local-fast");
+        assert_eq!(measurement["inputTokens"], 7);
+        assert_eq!(measurement["outputTokens"], 3);
+        let endpoint_hash = measurement["endpointHash"]
+            .as_str()
+            .expect("sample carries a keyed endpoint fingerprint");
+        assert_eq!(endpoint_hash.len(), 64);
+        assert!(!measurement.to_string().contains("127.0.0.1"));
+        assert!(measurement["elapsedMs"]
+            .as_u64()
+            .is_some_and(|value| value > 0));
+        assert!(measurement["effectiveOutputTokensPerSecondMilli"]
+            .as_u64()
+            .is_some_and(|value| value > 0));
+        let summary = journal
+            .route_throughput_summary(&buzz_run_journal::RouteThroughputQuery {
+                profile_hash: PROFILE_HASH.into(),
+                endpoint_hash: endpoint_hash.into(),
+                candidate_id: "local-fast".into(),
+                provider_id: "openai".into(),
+                model_id: "fake-model".into(),
+                thinking_effort: "default".into(),
+                input_tokens: 7,
+            })
+            .expect("read local route throughput summary");
+        assert_eq!(summary.fresh_sample_count, 1);
+        assert_eq!(
+            summary.effective_output_tokens_per_second_milli, None,
+            "one fresh sample is not enough to guide automatic routing"
+        );
+        let serialized_events = serde_json::to_string(&events).unwrap();
+        for forbidden in [PROMPT_CANARY, COMPLETION_CANARY, API_KEY_CANARY] {
+            assert!(
+                !serialized_events.contains(forbidden),
+                "managed journal stored forbidden content {forbidden:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "run after building the Buzz Agent child; uses only signed fixtures and loopback"]
+    async fn signed_owner_task_class_crosses_acp_into_strict_buzz_agent_route() {
+        use axum::{extract::State, routing::post, Json, Router};
+        use nostr::{EventBuilder, Keys, Kind, Tag};
+        use sha2::{Digest, Sha256};
+        use std::path::PathBuf;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        const CHANNEL_ID: &str = "123e4567-e89b-12d3-a456-426614174002";
+        const PROFILE_ID: &str = "coding-route";
+        const PROFILE_VERSION: u32 = 2;
+        const CANDIDATE_ID: &str = "openai";
+        const MODEL_ID: &str = "fixture-model-r1";
+
+        async fn local_completion(
+            State(requests): State<Arc<tokio::sync::Mutex<Vec<serde_json::Value>>>>,
+            Json(request): Json<serde_json::Value>,
+        ) -> Json<serde_json::Value> {
+            requests.lock().await.push(request);
+            Json(serde_json::json!({
+                "id": "signed-task-class-route-test",
+                "object": "chat.completion",
+                "model": "fixture-model-r1",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "{\"findings\":[],\"summary\":\"Fixture review complete.\"}"
+                    },
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}
+            }))
+        }
+
+        let owner = Keys::generate();
+        let channel_id = uuid::Uuid::parse_str(CHANNEL_ID).expect("test channel UUID");
+        let metadata_from_signed_event = |task_class: Option<&str>, source: &str| {
+            let mut tags = vec![Tag::parse(["h", CHANNEL_ID]).expect("channel tag")];
+            if let Some(task_class) = task_class {
+                tags.push(
+                    Tag::parse([
+                        "buzz:task-class",
+                        "1",
+                        "operator-defined-v1",
+                        source,
+                        task_class,
+                    ])
+                    .expect("task-class tag"),
+                );
+            }
+            let event = EventBuilder::new(Kind::Custom(9), "synthetic test prompt")
+                .tags(tags)
+                .sign_with_keys(&owner)
+                .expect("sign synthetic owner event");
+            let batch = crate::queue::FlushBatch {
+                channel_id,
+                scope: crate::scope::SessionScope::Conversation { channel_id },
+                events: vec![crate::queue::BatchEvent {
+                    event,
+                    prompt_tag: "@mention".into(),
+                    received_at: std::time::Instant::now(),
+                }],
+                cancelled_events: Vec::new(),
+                cancel_reason: None,
+            };
+            crate::task_class::from_batch(Some(&batch), Some(&owner.public_key()))
+        };
+
+        let profile = serde_json::json!({
+            "version": 1,
+            "data_policy": "local-only",
+            "preference_order": [CANDIDATE_ID],
+            "task_fit_policy": {
+                "taskClass": "coding",
+                "taskClassTaxonomyVersion": "operator-defined-v1",
+                "evaluationPolicyVersion": "task-fit-outcomes-v1",
+                "minimumDistinctTasks": 1,
+                "minimumWilsonLowerBound95": 0.2,
+                "maximumAgeSeconds": 31536000,
+                "requireObservedModelIdentity": true
+            },
+            "candidates": [{
+                "id": CANDIDATE_ID,
+                "provider": "openai",
+                "model": MODEL_ID,
+                "data_location": "local",
+                "prompt_addendum": "Fixture route selected for the coding task."
+            }],
+            "profile_id": PROFILE_ID,
+            "profile_version": PROFILE_VERSION,
+            "profile_hash": "7777777777777777777777777777777777777777777777777777777777777777"
+        });
+        let profile_json = serde_json::to_string(&profile).expect("serialize route profile");
+        let profile_hash = hex::encode(Sha256::digest(profile_json.as_bytes()));
+
+        // This synthetic report and test-only local attestation satisfy the
+        // existing strict route gate; they are fixtures, not quality evidence.
+        let report_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../buzz-agent/testdata/harbor-task-fit-v2.json");
+        let report_bytes = std::fs::read(report_path).expect("read synthetic task-fit fixture");
+        let report_hash = hex::encode(Sha256::digest(&report_bytes));
+        let nest_dir = tempfile::tempdir().expect("temporary test nest");
+        let evidence_dir = nest_dir.path().join(".agents/task-fit-evidence");
+        std::fs::create_dir_all(&evidence_dir).expect("create task-fit evidence directory");
+        std::fs::write(
+            evidence_dir.join(format!("{report_hash}.json")),
+            report_bytes,
+        )
+        .expect("write task-fit fixture");
+
+        let reviewer = Keys::generate();
+        let reviewer_pubkey = reviewer.public_key().to_hex();
+        let attestation = serde_json::json!({
+            "schemaVersion": 1,
+            "reportSha256": report_hash,
+            "action": "reviewed_for_local_route_candidate",
+            "taskClass": "coding",
+            "taskClassTaxonomyVersion": "operator-defined-v1",
+            "binding": {
+                "reportSha256": report_hash,
+                "profileId": PROFILE_ID,
+                "profileVersion": PROFILE_VERSION,
+                "profileHash": profile_hash,
+                "candidateId": CANDIDATE_ID
+            }
+        });
+        let attestation_event = EventBuilder::new(
+            Kind::Custom(30078),
+            serde_json::to_string(&attestation).expect("serialize fixture attestation"),
+        )
+        .sign_with_keys(&reviewer)
+        .expect("sign fixture route attestation");
+        let attestation_dir = evidence_dir.join("attestations/routes").join(&report_hash);
+        std::fs::create_dir_all(&attestation_dir).expect("create route-attestation directory");
+        std::fs::write(
+            attestation_dir.join(format!(
+                "{PROFILE_ID}-v{PROFILE_VERSION}-{profile_hash}-{CANDIDATE_ID}-{reviewer_pubkey}.json"
+            )),
+            serde_json::to_vec(&attestation_event).expect("serialize signed attestation event"),
+        )
+        .expect("write signed route attestation");
+
+        let requests = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let app = Router::new()
+            .route("/v1/chat/completions", post(local_completion))
+            .with_state(Arc::clone(&requests));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback-only fake provider");
+        let base_url = format!(
+            "http://{}/v1",
+            listener.local_addr().expect("listener address")
+        );
+        let (server_stop_tx, server_stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let server_task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = server_stop_rx.await;
+                })
+                .await
+                .expect("serve loopback fake provider");
+        });
+
+        let test_exe = std::env::current_exe().expect("current test executable");
+        let agent_bin = test_exe
+            .parent()
+            .and_then(std::path::Path::parent)
+            .map(|dir| {
+                dir.join(if cfg!(windows) {
+                    "buzz-agent.exe"
+                } else {
+                    "buzz-agent"
+                })
+            })
+            .filter(|path| path.is_file())
+            .unwrap_or_else(|| {
+                let target = std::env::var_os("CARGO_TARGET_DIR")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| {
+                        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target")
+                    });
+                target.join("debug").join(if cfg!(windows) {
+                    "buzz-agent.exe"
+                } else {
+                    "buzz-agent"
+                })
+            });
+        assert!(
+            agent_bin.is_file(),
+            "build the Buzz Agent test child first; expected {}",
+            agent_bin.display()
+        );
+        let launch_env = vec![
+            ("BUZZ_AGENT_PROVIDER".into(), "openai".into()),
+            ("BUZZ_AGENT_REVIEW_ONLY".into(), "1".into()),
+            ("OPENAI_COMPAT_API_KEY".into(), "LOCAL_TEST_ONLY".into()),
+            ("OPENAI_COMPAT_MODEL".into(), "fallback-model".into()),
+            ("OPENAI_COMPAT_BASE_URL".into(), base_url),
+            ("BUZZ_AGENT_ROUTE_PROFILE_JSON".into(), profile_json),
+            (
+                "BUZZ_NEST_DIR".into(),
+                nest_dir.path().to_string_lossy().into_owned(),
+            ),
+            (
+                "BUZZ_AGENT_TASK_FIT_REVIEW_PUBLIC_KEY".into(),
+                reviewer_pubkey,
+            ),
+            ("BUZZ_ACP_ROUTE_PROFILE_ID".into(), PROFILE_ID.into()),
+            (
+                "BUZZ_ACP_ROUTE_PROFILE_VERSION".into(),
+                PROFILE_VERSION.to_string(),
+            ),
+            ("BUZZ_ACP_ROUTE_PROFILE_HASH".into(), profile_hash.clone()),
+            ("BUZZ_AGENT_LLM_TIMEOUT_SECS".into(), "5".into()),
+            ("BUZZ_AGENT_MAX_ROUNDS".into(), "2".into()),
+            ("NO_PROXY".into(), "127.0.0.1,localhost".into()),
+            ("no_proxy".into(), "127.0.0.1,localhost".into()),
+            ("RUST_LOG".into(), "off".into()),
+        ];
+        let mut client =
+            AcpClient::spawn_for_local_review(&agent_bin.to_string_lossy(), &launch_env)
+                .await
+                .expect("spawn real Buzz Agent ACP child with loopback-only config");
+        let observer = crate::observer::ObserverHandle::in_process();
+        client.set_observer(Some(observer.clone()), 0);
+        let init = tokio::time::timeout(Duration::from_secs(10), client.initialize())
+            .await
+            .expect("Buzz Agent initialize is bounded")
+            .expect("initialize strict Buzz Agent");
+        assert!(client.task_class_metadata_supported());
+        assert!(client.task_class_metadata_required());
+        assert!(client.buzz_agent_identity_confirmed);
+        assert_eq!(init["_meta"]["buzz"]["taskClass"]["version"], 1);
+
+        let cwd = std::env::current_dir().expect("current directory");
+        let cwd = cwd.to_string_lossy();
+        let session_id = client
+            .session_new(cwd.as_ref(), Vec::new(), None, None)
+            .await
+            .expect("create strict Buzz Agent session");
+
+        let unknown = metadata_from_signed_event(None, crate::task_class::DESKTOP_SOURCE);
+        assert!(unknown.is_none(), "untagged signed event remains unknown");
+        let unknown_error = client
+            .session_prompt_blocks_with_task_class_metadata(
+                &session_id,
+                &["synthetic unknown-class prompt"],
+                Duration::from_secs(5),
+                Duration::from_secs(15),
+                unknown.as_ref(),
+            )
+            .await
+            .expect_err("strict ACP negotiation must reject an unknown class");
+        assert!(matches!(
+            unknown_error,
+            AcpError::TaskClassMetadataRequired { version: 1 }
+        ));
+        assert!(
+            requests.lock().await.is_empty(),
+            "unknown class made no provider request"
+        );
+        let prompt_writes: Vec<_> = observer
+            .snapshot()
+            .into_iter()
+            .filter(|event| {
+                event.kind == "acp_write" && event.payload["method"] == "session/prompt"
+            })
+            .collect();
+        assert!(
+            prompt_writes.is_empty(),
+            "unknown metadata must be rejected by the ACP client before writing session/prompt"
+        );
+
+        let mismatch =
+            metadata_from_signed_event(Some("code_review"), crate::task_class::DESKTOP_SOURCE)
+                .expect("verified owner event yields mismatch metadata");
+        assert_eq!(mismatch.task_class, "code_review");
+        let mismatch_error = client
+            .session_prompt_blocks_with_task_class_metadata(
+                &session_id,
+                &["synthetic mismatched-class prompt"],
+                Duration::from_secs(5),
+                Duration::from_secs(15),
+                Some(&mismatch),
+            )
+            .await
+            .expect_err("Buzz Agent strict route gate must reject mismatched class");
+        assert!(matches!(
+            mismatch_error,
+            AcpError::AgentError { message, .. }
+                if message.contains("strict_task_fit_task_class_mismatch")
+        ));
+        assert!(
+            requests.lock().await.is_empty(),
+            "mismatched class made no provider request"
+        );
+        let prompt_writes: Vec<_> = observer
+            .snapshot()
+            .into_iter()
+            .filter(|event| {
+                event.kind == "acp_write" && event.payload["method"] == "session/prompt"
+            })
+            .collect();
+        assert_eq!(
+            prompt_writes.len(),
+            1,
+            "a known but mismatched class reaches Buzz Agent before its pre-dispatch rejection"
+        );
+
+        let desktop_coding =
+            metadata_from_signed_event(Some("coding"), crate::task_class::DESKTOP_SOURCE)
+                .expect("verified Desktop event yields accepted metadata");
+        let cli_coding = metadata_from_signed_event(Some("coding"), crate::task_class::CLI_SOURCE)
+            .expect("verified CLI event yields accepted metadata");
+        assert_eq!(desktop_coding.source, crate::task_class::DESKTOP_SOURCE);
+        assert_eq!(cli_coding.source, crate::task_class::CLI_SOURCE);
+        let stop = client
+            .session_prompt_blocks_with_task_class_metadata(
+                &session_id,
+                &["synthetic coding prompt"],
+                Duration::from_secs(5),
+                Duration::from_secs(15),
+                Some(&cli_coding),
+            )
+            .await
+            .expect("negotiated strict CLI coding request reaches loopback route");
+        assert_eq!(stop, StopReason::EndTurn);
+
+        let route_updates: Vec<_> = observer
+            .snapshot()
+            .into_iter()
+            .filter(|event| {
+                event.kind == "acp_read"
+                    && event.payload["method"] == "session/update"
+                    && event.payload["params"]["update"]["_meta"]["buzz"]["routeDecisionV1"]
+                        .is_object()
+            })
+            .collect();
+        assert_eq!(route_updates.len(), 1, "the valid route emits one decision");
+        let route_update = &route_updates[0].payload;
+        let update_meta = &route_update["params"]["update"]["_meta"];
+        let notice = &update_meta["buzz"]["routeDecisionV1"];
+        let attempt_id = update_meta["goose"]["activeRunId"]
+            .as_str()
+            .expect("route decision update carries its active attempt ID");
+        assert_eq!(route_update["params"]["sessionId"], session_id);
+        assert_eq!(notice["sessionId"], session_id);
+        assert_eq!(notice["attemptId"], attempt_id);
+        assert_eq!(notice["profileId"], PROFILE_ID);
+        assert_eq!(notice["profileVersion"], PROFILE_VERSION);
+        assert_eq!(notice["profileHash"], profile_hash);
+        assert_eq!(notice["outcome"], "selected");
+        assert_eq!(notice["candidateId"], CANDIDATE_ID);
+        assert_eq!(notice["providerId"], "openai");
+        assert_eq!(notice["modelId"], MODEL_ID);
+
+        client.shutdown().await;
+        let _ = server_stop_tx.send(());
+        tokio::time::timeout(Duration::from_secs(3), server_task)
+            .await
+            .expect("fake provider shutdown is bounded")
+            .expect("fake provider task joins");
+        let requests = requests.lock().await;
+        assert_eq!(
+            requests.len(),
+            1,
+            "only the valid class reaches the provider"
+        );
+        assert_eq!(requests[0]["model"], MODEL_ID);
+    }
+
     #[tokio::test]
     async fn active_run_id_clears_on_null() {
         let mut client = spawn_inert_client().await;
@@ -4060,6 +5623,343 @@ mod tests {
             .await
             .expect("initialize should succeed");
         client.steering_supported()
+    }
+
+    async fn task_class_prompt_client(
+        name: &str,
+        initialize_result: &str,
+        route_profile_json: Option<&str>,
+    ) -> (AcpClient, std::path::PathBuf) {
+        let capture = capture_path(name);
+        let script = r#"
+read -r _initialize
+printf '{"jsonrpc":"2.0","id":0,"result":%s}\n' "$BUZZ_TEST_INIT_RESULT"
+read -r prompt
+printf '%s\n' "$prompt" > "$BUZZ_TEST_PROMPT_CAPTURE"
+prompt_id=$(printf '%s\n' "$prompt" | sed -E 's/.*"id":([0-9]+).*/\1/')
+printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$prompt_id"
+sleep 5
+"#;
+        let mut launch_env = vec![
+            ("BUZZ_TEST_INIT_RESULT".into(), initialize_result.to_owned()),
+            (
+                "BUZZ_TEST_PROMPT_CAPTURE".into(),
+                capture.to_string_lossy().into_owned(),
+            ),
+        ];
+        if let Some(profile) = route_profile_json {
+            launch_env.push(("BUZZ_AGENT_ROUTE_PROFILE_JSON".into(), profile.into()));
+        } else {
+            launch_env.push((
+                "BUZZ_AGENT_ROUTE_PROFILE_JSON".into(),
+                r#"{"version":1,"task_fit_policy":null}"#.into(),
+            ));
+        }
+        let args = vec!["-c".into(), script.into()];
+        let mut client = AcpClient::spawn_with_env("bash", &args, &[], false, &launch_env)
+            .await
+            .expect("spawn fake ACP peer");
+        client.initialize().await.expect("initialize fake ACP peer");
+        (client, capture)
+    }
+
+    fn desktop_task_class() -> TaskClassMetadata {
+        TaskClassMetadata {
+            version: crate::task_class::METADATA_VERSION,
+            task_class: "coding".into(),
+            taxonomy_version: crate::task_class::TAXONOMY_VERSION.into(),
+            source: crate::task_class::DESKTOP_SOURCE.into(),
+        }
+    }
+
+    #[test]
+    fn strict_task_class_detection_uses_effective_profile_and_fails_closed() {
+        let profile_id = ("BUZZ_ACP_ROUTE_PROFILE_ID".into(), "profile-1".into());
+        assert!(launch_requires_task_class(&[], &[profile_id.clone()], &[]));
+
+        let non_strict_override = (
+            "BUZZ_AGENT_ROUTE_PROFILE_JSON".into(),
+            r#"{"version":1,"task_fit_policy":null}"#.into(),
+        );
+        assert!(!launch_requires_task_class(
+            &[],
+            &[profile_id.clone(), non_strict_override.clone()],
+            &[],
+        ));
+
+        let malformed_profile = ("BUZZ_AGENT_ROUTE_PROFILE_JSON".into(), "not-json".into());
+        assert!(launch_requires_task_class(&[], &[malformed_profile], &[]));
+
+        let strict_persona_profile = (
+            "BUZZ_AGENT_ROUTE_PROFILE_JSON".into(),
+            r#"{"version":1,"task_fit_policy":{}}"#.into(),
+        );
+        assert!(!launch_requires_task_class(
+            &[strict_persona_profile],
+            &[non_strict_override],
+            &[],
+        ));
+    }
+
+    async fn task_class_capabilities_after_initialize(init_result: &str) -> (bool, bool) {
+        let script = format!(
+            "read -r _init; printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{result}}}'; \\
+             sleep 5",
+            result = init_result,
+        );
+        let mut client = spawn_script(&script).await;
+        client
+            .initialize()
+            .await
+            .expect("initialize should succeed");
+        (
+            client.task_class_metadata_supported(),
+            client.task_class_metadata_required(),
+        )
+    }
+
+    #[tokio::test]
+    async fn initialize_requires_exact_task_class_extension_version() {
+        let exact = task_class_capabilities_after_initialize(
+            r#"{"protocolVersion":2,"agentCapabilities":{},"_meta":{"buzz":{"taskClass":{"version":1,"required":true}}}}"#,
+        )
+        .await;
+        assert_eq!(exact, (true, true));
+
+        let absent = task_class_capabilities_after_initialize(
+            r#"{"protocolVersion":2,"agentCapabilities":{}}"#,
+        )
+        .await;
+        assert_eq!(absent, (false, false));
+
+        let unknown_version = task_class_capabilities_after_initialize(
+            r#"{"protocolVersion":2,"_meta":{"buzz":{"taskClass":{"version":2,"required":true}}}}"#,
+        )
+        .await;
+        assert_eq!(unknown_version, (false, true));
+    }
+
+    #[tokio::test]
+    async fn selected_task_class_stays_out_of_ordinary_acp_prompt() {
+        let (mut client, capture) = task_class_prompt_client(
+            "ordinary-acp-task-class",
+            r#"{"protocolVersion":2,"agentInfo":{"name":"codex"}}"#,
+            None,
+        )
+        .await;
+        let task_class = desktop_task_class();
+        let stop = client
+            .session_prompt_blocks_with_task_class_metadata(
+                "session-1",
+                &["classified by the Desktop operator"],
+                std::time::Duration::from_secs(2),
+                std::time::Duration::from_secs(2),
+                Some(&task_class),
+            )
+            .await
+            .expect("ordinary ACP peer accepts an ordinary prompt");
+        assert_eq!(stop, StopReason::EndTurn);
+        let request: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(capture).expect("captured prompt"))
+                .expect("valid prompt JSON");
+        assert_eq!(request["method"], "session/prompt");
+        assert!(request["params"]["_meta"].is_null());
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn exact_v1_buzz_peer_receives_selected_task_class() {
+        let (mut client, capture) = task_class_prompt_client(
+            "buzz-v1-task-class",
+            r#"{"protocolVersion":2,"agentInfo":{"name":"buzz-agent"},"_meta":{"buzz":{"taskClass":{"version":1,"required":false}}}}"#,
+            None,
+        )
+        .await;
+        let task_class = desktop_task_class();
+        client
+            .session_prompt_blocks_with_task_class_metadata(
+                "session-1",
+                &["classified task"],
+                std::time::Duration::from_secs(2),
+                std::time::Duration::from_secs(2),
+                Some(&task_class),
+            )
+            .await
+            .expect("negotiated Buzz peer accepts selected class");
+        let request: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(capture).expect("captured prompt"))
+                .expect("valid prompt JSON");
+        assert_eq!(
+            request["params"]["_meta"]["buzz"]["taskClass"]["taskClass"],
+            "coding"
+        );
+        assert_eq!(
+            request["params"]["_meta"]["buzz"]["taskClass"]["source"],
+            "desktop_ui"
+        );
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn strict_task_class_profile_sends_metadata_to_identified_v1_buzz_peer() {
+        let strict_profile = r#"{"version":1,"preference_order":["local-fast"],"task_fit_policy":{"taskClass":"coding","taskClassTaxonomyVersion":"operator-defined-v1","evaluationPolicyVersion":"task-fit-outcomes-v1","minimumDistinctTasks":20,"minimumWilsonLowerBound95":0.8,"maximumAgeSeconds":604800,"requireObservedModelIdentity":true},"candidates":[{"id":"local-fast","provider":"openai","model":"qwen-local","data_location":"local"}]}"#;
+        let (mut client, capture) = task_class_prompt_client(
+            "strict-v1-buzz-task-class",
+            r#"{"protocolVersion":2,"agentInfo":{"name":"buzz-agent"},"_meta":{"buzz":{"taskClass":{"version":1,"required":false}}}}"#,
+            Some(strict_profile),
+        )
+        .await;
+        let task_class = desktop_task_class();
+        assert!(task_class.validate());
+        assert!(client.strict_task_class_required);
+        let stop = client
+            .session_prompt_blocks_with_task_class_metadata(
+                "session-1",
+                &["operator-authored coding task"],
+                std::time::Duration::from_secs(2),
+                std::time::Duration::from_secs(2),
+                Some(&task_class),
+            )
+            .await
+            .expect("strict route accepts identified v1 Buzz peer and valid class");
+        assert_eq!(stop, StopReason::EndTurn);
+        let request: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(capture).expect("captured prompt"))
+                .expect("valid prompt JSON");
+        assert_eq!(request["method"], "session/prompt");
+        assert_eq!(
+            request["params"]["_meta"]["buzz"]["taskClass"],
+            serde_json::json!({
+                "version": 1,
+                "taskClass": "coding",
+                "taxonomyVersion": "operator-defined-v1",
+                "source": "desktop_ui"
+            })
+        );
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn strict_task_class_profile_rejects_legacy_buzz_peer_before_prompt_write() {
+        let strict_profile = r#"{"version":1,"task_fit_policy":{"taskClass":"coding","taskClassTaxonomyVersion":"operator-defined-v1","evaluationPolicyVersion":"task-fit-outcomes-v1","minimumDistinctTasks":20,"minimumWilsonLowerBound95":0.8,"maximumAgeSeconds":604800,"requireObservedModelIdentity":true}}"#;
+        let (mut client, capture) = task_class_prompt_client(
+            "strict-legacy-buzz-task-class",
+            r#"{"protocolVersion":2,"agentInfo":{"name":"buzz-agent"}}"#,
+            Some(strict_profile),
+        )
+        .await;
+        let task_class = desktop_task_class();
+        let error = client
+            .session_prompt_blocks_with_task_class_metadata(
+                "session-1",
+                &["classified task"],
+                std::time::Duration::from_secs(2),
+                std::time::Duration::from_secs(2),
+                Some(&task_class),
+            )
+            .await
+            .expect_err("strict routing cannot send a class to legacy Buzz");
+        assert!(matches!(
+            error,
+            AcpError::UnsupportedCapability {
+                capability: "Buzz task-class metadata",
+                version: 1
+            }
+        ));
+        assert!(
+            !capture.exists(),
+            "strict rejection must happen before write"
+        );
+        assert!(!client.has_in_flight_prompt());
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn strict_task_class_profile_rejects_unknown_peer_identity_before_prompt_write() {
+        let strict_profile = r#"{"version":1,"task_fit_policy":{"taskClass":"coding","taskClassTaxonomyVersion":"operator-defined-v1","evaluationPolicyVersion":"task-fit-outcomes-v1","minimumDistinctTasks":20,"minimumWilsonLowerBound95":0.8,"maximumAgeSeconds":604800,"requireObservedModelIdentity":true}}"#;
+        let (mut client, capture) = task_class_prompt_client(
+            "strict-unknown-peer-task-class",
+            r#"{"protocolVersion":2,"agentInfo":{"name":"renamed-wrapper"},"_meta":{"buzz":{"taskClass":{"version":1,"required":false}}}}"#,
+            Some(strict_profile),
+        )
+        .await;
+        let task_class = desktop_task_class();
+        let error = client
+            .session_prompt_blocks_with_task_class_metadata(
+                "session-1",
+                &["classified task"],
+                std::time::Duration::from_secs(2),
+                std::time::Duration::from_secs(2),
+                Some(&task_class),
+            )
+            .await
+            .expect_err("strict routing must abstain when peer identity is unknown");
+        assert!(matches!(
+            error,
+            AcpError::UnsupportedCapability {
+                capability: "identifiable Buzz Agent task-class metadata peer",
+                version: 1
+            }
+        ));
+        assert!(
+            !capture.exists(),
+            "strict rejection must happen before write"
+        );
+        assert!(!client.has_in_flight_prompt());
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn non_strict_legacy_buzz_peer_keeps_prompt_compatibility() {
+        let (mut client, capture) = task_class_prompt_client(
+            "nonstrict-legacy-buzz-task-class",
+            r#"{"protocolVersion":2,"agentInfo":{"name":"buzz-agent"}}"#,
+            None,
+        )
+        .await;
+        let task_class = desktop_task_class();
+        let stop = client
+            .session_prompt_blocks_with_task_class_metadata(
+                "session-1",
+                &["legacy-compatible prompt"],
+                std::time::Duration::from_secs(2),
+                std::time::Duration::from_secs(2),
+                Some(&task_class),
+            )
+            .await
+            .expect("known non-strict profile keeps the ordinary prompt path");
+        assert_eq!(stop, StopReason::EndTurn);
+        let request: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(capture).expect("captured prompt"))
+                .expect("valid prompt JSON");
+        assert!(request["params"]["_meta"].is_null());
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn required_unknown_task_class_abstains_before_prompt_write() {
+        let script = "read -r _init; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"protocolVersion\":2,\"_meta\":{\"buzz\":{\"taskClass\":{\"version\":1,\"required\":true}}}}}'; sleep 5";
+        let mut client = spawn_script(script).await;
+        client
+            .initialize()
+            .await
+            .expect("initialize should succeed");
+        let error = client
+            .session_prompt_blocks_with_task_class_metadata(
+                "session-1",
+                &["task"],
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_secs(1),
+                None,
+            )
+            .await
+            .expect_err("required task-class metadata must fail closed");
+        assert!(matches!(
+            error,
+            AcpError::TaskClassMetadataRequired { version: 1 }
+        ));
+        assert!(!client.has_in_flight_prompt());
+        client.shutdown().await;
     }
 
     /// Test 1a: an adapter advertising `_meta.steering.supported: true`

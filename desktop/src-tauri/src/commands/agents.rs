@@ -32,6 +32,12 @@ mod pending;
 use pending::build_agent_archive_request;
 pub(crate) use pending::{retain_managed_agent_pending, tombstone_managed_agent_pending};
 
+#[tauri::command]
+pub fn list_agent_archetypes() -> Vec<crate::managed_agents::execution_profile::AgentArchetypeInfo>
+{
+    crate::managed_agents::execution_profile::list_agent_archetypes()
+}
+
 /// Build a summary from fresh disk state (personas, teams, global config).
 /// For one-shot command paths only — the 5s list poll calls
 /// `build_managed_agent_summary` directly with stores loaded once per call,
@@ -592,10 +598,21 @@ pub async fn create_managed_agent(
         // definition's NIP-AP defaults, then client defaults. The ONLY parse
         // point for definition behavioral strings — fails loudly on a bad
         // mode/range instead of minting an agent the author didn't describe.
+        crate::managed_agents::execution_profile::validate_archetype_backend(
+            input.execution_profile_id.as_deref(),
+            &input.backend,
+        )?;
+        let execution_profile =
+            crate::managed_agents::execution_profile::resolve_execution_profile(
+                input.execution_profile_id.as_deref(),
+            )?;
+        let profile_parallelism = execution_profile
+            .as_ref()
+            .and_then(|profile| profile.parallelism);
         let minted = crate::managed_agents::resolve_mint_behavioral_defaults(
             input.respond_to,
             respond_to_allowlist.clone(),
-            input.parallelism,
+            input.parallelism.or(profile_parallelism),
             linked_persona.as_ref(),
         )?;
         let record = ManagedAgentRecord {
@@ -625,8 +642,14 @@ pub async fn create_managed_agent(
             // max_turn_duration_seconds for actual turn-length control.
             turn_timeout_seconds: DEFAULT_AGENT_TURN_TIMEOUT_SECONDS,
             // 0 or None → harness uses its own default (320s idle, 3600s max), and the CLI also clamps 0 → minimum.
-            idle_timeout_seconds: input.idle_timeout_seconds.filter(|s| *s > 0),
-            max_turn_duration_seconds: input.max_turn_duration_seconds.filter(|s| *s > 0),
+            idle_timeout_seconds: input
+                .idle_timeout_seconds
+                .filter(|s| *s > 0)
+                .or_else(|| execution_profile.as_ref()?.idle_timeout_seconds),
+            max_turn_duration_seconds: input
+                .max_turn_duration_seconds
+                .filter(|s| *s > 0)
+                .or_else(|| execution_profile.as_ref()?.max_turn_duration_seconds),
             parallelism: minted.parallelism.unwrap_or(DEFAULT_AGENT_PARALLELISM),
             session_policy: linked_persona
                 .as_ref()
@@ -691,6 +714,7 @@ pub async fn create_managed_agent(
                 relay_mesh.clone()
             },
             effort_level: None,
+            execution_profile,
         };
 
         records.push(record);

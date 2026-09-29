@@ -436,6 +436,8 @@ pub enum Provider {
     DatabricksV2,
     /// OpenRouter multi-provider gateway. Routes to `{base_url}/chat/completions` with bearer auth. Wire format is OpenAI-chat-compatible.
     OpenRouter,
+    /// DeepSeek API. Uses Chat Completions with DeepSeek reasoning replay semantics.
+    DeepSeek,
 }
 
 /// Optional visibility filter for the Databricks model catalog.
@@ -544,6 +546,11 @@ pub enum OpenAiApi {
 pub struct Config {
     pub provider: Provider,
     pub system_prompt: String,
+    /// Optional, explicit model override for the in-process thread status
+    /// summarizer. It uses the same provider, API key, and endpoint as this agent.
+    pub summary_model: Option<String>,
+    /// Bounded output allowance for the optional status summarizer.
+    pub summary_max_output_tokens: u32,
     pub max_rounds: u32,
     pub max_output_tokens: u32,
     /// Maximum number of retries after a provider returns a successful but
@@ -646,6 +653,7 @@ impl Config {
             env("ANTHROPIC_API_KEY").as_deref(),
             env("OPENAI_COMPAT_API_KEY").as_deref(),
             env("OPENROUTER_API_KEY").as_deref(),
+            env("DEEPSEEK_API_KEY").as_deref(),
         )?;
 
         // Universal model override — takes priority over provider-specific model
@@ -653,6 +661,20 @@ impl Config {
         // present. Set by the desktop from the persona/record to express explicit
         // user intent; provider-specific vars serve as defaults for CLI/standalone use.
         let buzz_agent_model = env("BUZZ_AGENT_MODEL");
+        let summary_model = env("BUZZ_AGENT_SUMMARY_MODEL")
+            .map(|raw| {
+                let model = raw.trim();
+                if model.is_empty() {
+                    return Err("config: BUZZ_AGENT_SUMMARY_MODEL must not be empty".to_string());
+                }
+                if model.len() > 256 {
+                    return Err(
+                        "config: BUZZ_AGENT_SUMMARY_MODEL must be at most 256 bytes".to_string()
+                    );
+                }
+                Ok(model.to_owned())
+            })
+            .transpose()?;
 
         // OPENAI_COMPAT_API is only read when provider=openai, so a stray
         // bad value can't break an Anthropic-only deployment.
@@ -698,6 +720,16 @@ impl Config {
                 env_or("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
                 OpenAiApi::Chat, // OpenRouter uses Chat Completions only
             ),
+            Provider::DeepSeek => (
+                req("DEEPSEEK_API_KEY")?,
+                resolve_model(
+                    buzz_agent_model.as_deref(),
+                    env("DEEPSEEK_MODEL").as_deref(),
+                )
+                .unwrap_or_else(|| "deepseek-chat".into()),
+                env_or("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
+                OpenAiApi::Chat,
+            ),
         };
         let system_prompt = match (env("BUZZ_AGENT_SYSTEM_PROMPT"), env("BUZZ_AGENT_SYSTEM_PROMPT_FILE")) {
             (Some(_), Some(_)) => return Err(
@@ -709,6 +741,8 @@ impl Config {
         let cfg = Config {
             provider,
             system_prompt,
+            summary_model,
+            summary_max_output_tokens: parse_env("BUZZ_AGENT_SUMMARY_MAX_OUTPUT_TOKENS", 1200u32)?,
             api_key,
             model,
             base_url,
@@ -759,6 +793,63 @@ impl Config {
         Ok(cfg)
     }
 
+    /// Clone the process-level agent policy while binding a route candidate to
+    /// its own provider connection, model, and system prompt. Credentials are
+    /// read only from the provider's established environment key; route profile
+    /// data never carries credential values.
+    pub(crate) fn for_route_target(
+        &self,
+        provider: Provider,
+        model: &str,
+        system_prompt: String,
+    ) -> Result<Self, String> {
+        let (api_key, base_url, openai_api) = match provider {
+            Provider::Anthropic => (
+                configured_secret("ANTHROPIC_API_KEY")?,
+                env_or("ANTHROPIC_BASE_URL", "https://api.anthropic.com"),
+                OpenAiApi::Auto,
+            ),
+            Provider::OpenAi => (
+                configured_secret("OPENAI_COMPAT_API_KEY")?,
+                env_or("OPENAI_COMPAT_BASE_URL", "https://api.openai.com/v1"),
+                parse_openai_api(env("OPENAI_COMPAT_API").as_deref())?,
+            ),
+            Provider::Databricks | Provider::DatabricksV2 => (
+                env("DATABRICKS_TOKEN").unwrap_or_default(),
+                env("DATABRICKS_HOST")
+                    .filter(|host| !host.trim().is_empty())
+                    .ok_or_else(|| {
+                        "config: DATABRICKS_HOST required for route target".to_string()
+                    })?,
+                OpenAiApi::Chat,
+            ),
+            Provider::OpenRouter => (
+                configured_secret("OPENROUTER_API_KEY")?,
+                env_or("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
+                OpenAiApi::Chat,
+            ),
+            Provider::DeepSeek => (
+                configured_secret("DEEPSEEK_API_KEY")?,
+                env_or("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
+                OpenAiApi::Chat,
+            ),
+        };
+        let mut config = self.clone();
+        config.provider = provider;
+        config.model = model.to_owned();
+        config.system_prompt = system_prompt;
+        config.api_key = api_key;
+        config.base_url = base_url;
+        config.openai_api = openai_api;
+        // The optional status summarizer is explicitly tied to the primary
+        // provider. Do not silently reuse it across a routed provider change.
+        if provider != self.provider {
+            config.summary_model = None;
+        }
+        config.validate()?;
+        Ok(config)
+    }
+
     /// Construct a minimal `Config` for model-catalog discovery.
     ///
     /// Only the fields used by [`build_token_source`](crate::llm::build_token_source)
@@ -777,6 +868,8 @@ impl Config {
             base_url,
             model: String::new(),
             system_prompt: String::new(),
+            summary_model: None,
+            summary_max_output_tokens: 1200,
             anthropic_api_version: "2023-06-01".into(),
             openai_api: OpenAiApi::Chat,
             max_rounds: 0,
@@ -814,6 +907,12 @@ impl Config {
         const MIN_LINE_BYTES: usize = 1024;
         const MIN_TOOL_RESULT_TEXT_BYTES: usize = 1024;
         const MIN_TIMEOUT: Duration = Duration::from_secs(1);
+
+        if self.summary_max_output_tokens == 0 || self.summary_max_output_tokens > 4096 {
+            return Err(
+                "config: BUZZ_AGENT_SUMMARY_MAX_OUTPUT_TOKENS must be between 1 and 4096".into(),
+            );
+        }
 
         if self.max_output_tokens < 1 {
             return Err("config: BUZZ_AGENT_MAX_OUTPUT_TOKENS must be >= 1".into());
@@ -912,6 +1011,12 @@ fn req(k: &str) -> Result<String, String> {
     env(k).ok_or_else(|| format!("config: {k} required"))
 }
 
+fn configured_secret(key: &str) -> Result<String, String> {
+    env(key)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| format!("config: {key} required for route target"))
+}
+
 /// Returns the first present value. `explicit_override` (BUZZ_AGENT_MODEL,
 /// set by the desktop from the persona/record) wins over `provider_default`
 /// (provider-specific env var that may be inherited from the shell).
@@ -933,6 +1038,7 @@ fn resolve_provider(
     anthropic_key: Option<&str>,
     openai_key: Option<&str>,
     openrouter_key: Option<&str>,
+    deepseek_key: Option<&str>,
 ) -> Result<Provider, String> {
     match requested.map(str::trim).filter(|s| !s.is_empty()) {
         Some(raw) => {
@@ -950,6 +1056,8 @@ fn resolve_provider(
                 "databricks_v2" | "databricks-v2" => Ok(Provider::DatabricksV2),
                 "openrouter" if present_nonempty(openrouter_key) => Ok(Provider::OpenRouter),
                 "openrouter" => Err("config: OPENROUTER_API_KEY required".into()),
+                "deepseek" if present_nonempty(deepseek_key) => Ok(Provider::DeepSeek),
+                "deepseek" => Err("config: DEEPSEEK_API_KEY required".into()),
                 _ => Err(format!(
                     "config: BUZZ_AGENT_PROVIDER={raw} not supported"
                 )),
@@ -1298,29 +1406,36 @@ mod tests {
     #[test]
     fn resolve_provider_keeps_requested_provider_when_token_present() {
         assert_eq!(
-            resolve_provider(Some("anthropic"), Some("sk-ant"), None, None).unwrap(),
+            resolve_provider(Some("anthropic"), Some("sk-ant"), None, None, None).unwrap(),
             Provider::Anthropic
         );
         assert_eq!(
-            resolve_provider(Some("openai"), None, Some("sk-openai"), None).unwrap(),
+            resolve_provider(Some("openai"), None, Some("sk-openai"), None, None).unwrap(),
             Provider::OpenAi
+        );
+        assert_eq!(
+            resolve_provider(Some("deepseek"), None, None, None, Some("sk-deepseek")).unwrap(),
+            Provider::DeepSeek
         );
     }
 
     #[test]
     fn resolve_provider_errors_when_requested_provider_key_missing() {
         // No fallback — missing key returns an error regardless of Databricks availability.
-        let err = resolve_provider(Some("anthropic"), None, None, None).unwrap_err();
+        let err = resolve_provider(Some("anthropic"), None, None, None, None).unwrap_err();
         assert!(err.contains("ANTHROPIC_API_KEY required"), "{err}");
 
-        let err = resolve_provider(Some("openai-compat"), None, Some("   "), None).unwrap_err();
+        let err =
+            resolve_provider(Some("openai-compat"), None, Some("   "), None, None).unwrap_err();
         assert!(err.contains("OPENAI_COMPAT_API_KEY required"), "{err}");
+        let err = resolve_provider(Some("deepseek"), None, None, None, Some("  ")).unwrap_err();
+        assert!(err.contains("DEEPSEEK_API_KEY required"), "{err}");
     }
 
     #[test]
     fn resolve_provider_errors_when_provider_env_absent() {
         // No implicit inference — absent BUZZ_AGENT_PROVIDER is an error.
-        let err = resolve_provider(None, None, None, None).unwrap_err();
+        let err = resolve_provider(None, None, None, None, None).unwrap_err();
         assert!(err.contains("BUZZ_AGENT_PROVIDER is required"), "{err}");
     }
 
@@ -1330,19 +1445,19 @@ mod tests {
         // When BUZZ_AGENT_PROVIDER=databricks, resolve_provider succeeds regardless
         // of DATABRICKS_HOST/MODEL (those are validated later in from_env()).
         assert_eq!(
-            resolve_provider(Some("databricks"), None, None, None).unwrap(),
+            resolve_provider(Some("databricks"), None, None, None, None).unwrap(),
             Provider::Databricks
         );
         // Missing key for other providers still errors — no Databricks fallback.
-        let err = resolve_provider(Some("openai"), None, None, None).unwrap_err();
+        let err = resolve_provider(Some("openai"), None, None, None, None).unwrap_err();
         assert!(err.contains("OPENAI_COMPAT_API_KEY required"), "{err}");
-        let err = resolve_provider(None, None, None, None).unwrap_err();
+        let err = resolve_provider(None, None, None, None, None).unwrap_err();
         assert!(err.contains("BUZZ_AGENT_PROVIDER is required"), "{err}");
     }
 
     #[test]
     fn resolve_provider_unsupported_error_preserves_user_casing() {
-        let err = resolve_provider(Some("OpenAIish"), None, None, None).unwrap_err();
+        let err = resolve_provider(Some("OpenAIish"), None, None, None, None).unwrap_err();
         assert!(err.contains("BUZZ_AGENT_PROVIDER=OpenAIish"));
     }
 
@@ -2364,14 +2479,14 @@ mod tests {
     #[test]
     fn resolve_provider_openrouter_with_key() {
         assert_eq!(
-            resolve_provider(Some("openrouter"), None, None, Some("sk-or-123")).unwrap(),
+            resolve_provider(Some("openrouter"), None, None, Some("sk-or-123"), None).unwrap(),
             Provider::OpenRouter
         );
     }
 
     #[test]
     fn resolve_provider_openrouter_missing_key() {
-        let err = resolve_provider(Some("openrouter"), None, None, None).unwrap_err();
+        let err = resolve_provider(Some("openrouter"), None, None, None, None).unwrap_err();
         assert!(err.contains("OPENROUTER_API_KEY"));
     }
 

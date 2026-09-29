@@ -16,6 +16,7 @@ export async function sendChannelMessage(
   expectedRelayUrl?: string,
   expectedSignerPubkey?: string,
   rootEventId?: string | null,
+  taskClass?: string | null,
 ): Promise<SendChannelMessageResult> {
   const response = await invokeTauri<RawSendChannelMessageResult>(
     "send_channel_message",
@@ -31,6 +32,7 @@ export async function sendChannelMessage(
       sentFromThreadTag: sentFromThreadTag ?? null,
       mentionPubkeys: mentionPubkeys ?? null,
       kind: kind ?? null,
+      taskClass: taskClass ?? null,
       // Tenant scope captured by the caller before its first await; the
       // backend fails closed when the active community no longer matches.
       expectedRelayUrl: expectedRelayUrl ?? null,
@@ -47,4 +49,30 @@ export async function sendChannelMessage(
     depth: response.depth,
     createdAt: response.created_at,
   };
+}
+
+export async function sendThreadGuidance(input: {
+  channelId: string;
+  content: string;
+  expectedRelayUrl: string;
+  expectedSignerPubkey: string;
+  rootEventId: string;
+}): Promise<SendChannelMessageResult> {
+  const content = input.content.trim();
+  if (!content) throw new Error("Guidance cannot be empty.");
+  return sendChannelMessage(
+    input.channelId,
+    content,
+    input.rootEventId,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    input.expectedRelayUrl,
+    input.expectedSignerPubkey,
+    input.rootEventId,
+  );
 }

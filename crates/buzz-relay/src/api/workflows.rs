@@ -202,6 +202,7 @@ fn run_json(run: &buzz_db::workflow::WorkflowRunRecord) -> Value {
         "id": run.id,
         "workflow_id": run.workflow_id,
         "status": run.status,
+        "trigger_event_id": run.trigger_event_id.as_ref().map(hex::encode),
         "current_step": run.current_step,
         "execution_trace": run.execution_trace,
         "started_at": run.started_at.map(|value| value.timestamp()),
@@ -262,5 +263,34 @@ mod tests {
         let wire = approval_json(&approval);
         assert!(wire.get("token").is_none());
         assert_eq!(wire["approval_ref"], hex::encode([0xab; 32]));
+    }
+
+    #[test]
+    fn run_wire_exposes_source_event_link_without_changing_run_identity() {
+        let now = Utc::now();
+        let trigger_event_id = vec![0xab; 32];
+        let run = buzz_db::workflow::WorkflowRunRecord {
+            id: Uuid::new_v4(),
+            community_id: buzz_core::CommunityId::from_uuid(Uuid::new_v4()),
+            workflow_id: Uuid::new_v4(),
+            status: buzz_db::workflow::RunStatus::Running,
+            trigger_event_id: Some(trigger_event_id.clone()),
+            current_step: 1,
+            execution_trace: serde_json::json!([]),
+            trigger_context: None,
+            started_at: Some(now),
+            completed_at: None,
+            error_message: None,
+            error_code: None,
+            created_at: now,
+        };
+
+        let wire = run_json(&run);
+        assert_eq!(wire["id"], run.id.to_string());
+        assert_eq!(wire["trigger_event_id"], hex::encode(&trigger_event_id));
+
+        let mut scheduled = run;
+        scheduled.trigger_event_id = None;
+        assert!(run_json(&scheduled)["trigger_event_id"].is_null());
     }
 }

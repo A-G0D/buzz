@@ -1,5 +1,14 @@
 import * as React from "react";
-import { EllipsisVertical, OctagonX, Settings2 } from "lucide-react";
+import {
+  BookOpen,
+  EllipsisVertical,
+  FileText,
+  History,
+  OctagonX,
+  Play,
+  Route,
+  Settings2,
+} from "lucide-react";
 import {
   consumePendingSnapshotImport,
   subscribeSnapshotImport,
@@ -13,6 +22,11 @@ import { PersonaDeleteDialog } from "./PersonaDeleteDialog";
 import { PersonaShareDialog } from "./PersonaShareDialog";
 import { AgentSnapshotExportDialog } from "./AgentSnapshotExportDialog";
 import { AgentSnapshotImportDialog } from "./AgentSnapshotImportDialog";
+import { AgentSkillLibrary } from "./AgentSkillLibrary";
+import { AgentPromptProfileLibrary } from "./AgentPromptProfileLibrary";
+import { AgentRouteProfileLibrary } from "./AgentRouteProfileLibrary";
+import { AgentCriticHistoryDialog } from "./AgentCriticHistoryDialog";
+import { AgentCriticRunDialog } from "./AgentCriticRunDialog";
 import { TeamSnapshotExportDialog } from "./TeamSnapshotExportDialog";
 import { TeamSnapshotImportDialog } from "./TeamSnapshotImportDialog";
 import { TeamShareDialog } from "./TeamShareDialog";
@@ -49,6 +63,11 @@ export function AgentsView() {
   const fullAiDefaultsTriggerRef = React.useRef<HTMLButtonElement>(null);
   const compactActionsTriggerRef = React.useRef<HTMLButtonElement>(null);
   const [isAiDefaultsOpen, setIsAiDefaultsOpen] = React.useState(false);
+  const [isCriticHistoryOpen, setIsCriticHistoryOpen] = React.useState(false);
+  const [isCriticRunOpen, setIsCriticRunOpen] = React.useState(false);
+  const [openLibrary, setOpenLibrary] = React.useState<
+    "skills" | "prompts" | "routes" | null
+  >(null);
 
   function openAiDefaults(trigger: HTMLButtonElement | null) {
     aiDefaultsTriggerRef.current = trigger;
@@ -144,166 +163,270 @@ export function AgentsView() {
           data-testid="agents-page-content"
         >
           <PageHeader
+            actionClassName="flex w-full items-center justify-end gap-2"
+            className="flex-col items-stretch"
             action={
-              <>
-                <div className="flex flex-wrap justify-end gap-2 [@container(max-width:40rem)]:hidden">
-                  <Button
-                    data-testid="agent-defaults-button"
-                    ref={fullAiDefaultsTriggerRef}
-                    onClick={(event) => openAiDefaults(event.currentTarget)}
-                    size="sm"
-                    variant="outline"
-                  >
-                    <Settings2 />
-                    {hasSavedAgentDefaults
-                      ? "Agent defaults"
-                      : "Set agent defaults"}
-                  </Button>
-                  {runningAgentCount > 0 ? (
+              openLibrary ? undefined : (
+                <>
+                  <div className="flex flex-wrap justify-end gap-2 [@container(max-width:40rem)]:hidden">
                     <Button
-                      disabled={isActionPending}
-                      onClick={() => {
-                        void agents.handleBulkStopRunning();
-                      }}
+                      data-testid="agent-skill-library-open"
+                      onClick={() => setOpenLibrary("skills")}
                       size="sm"
                       variant="outline"
                     >
-                      <OctagonX />
-                      Stop running agents
+                      <BookOpen />
+                      Skill library
                     </Button>
-                  ) : null}
-                </div>
-
-                <DropdownMenu modal={false}>
-                  <DropdownMenuTrigger asChild>
                     <Button
-                      aria-label="Agent actions"
-                      className="hidden [@container(max-width:40rem)]:inline-flex"
-                      data-testid="agent-actions-menu-trigger"
-                      ref={compactActionsTriggerRef}
-                      size="icon"
-                      type="button"
+                      data-testid="agent-prompt-profile-library-open"
+                      onClick={() => setOpenLibrary("prompts")}
+                      size="sm"
                       variant="outline"
                     >
-                      <EllipsisVertical />
+                      <FileText />
+                      Prompt profiles
                     </Button>
-                  </DropdownMenuTrigger>
-                  <DropdownMenuContent align="end">
-                    <DropdownMenuItem
-                      onSelect={() => {
-                        openAiDefaults(compactActionsTriggerRef.current);
-                      }}
+                    <Button
+                      onClick={() => setOpenLibrary("routes")}
+                      size="sm"
+                      variant="outline"
+                    >
+                      <Route />
+                      Routing profiles
+                    </Button>
+                    <Button
+                      data-testid="agent-critic-run-open"
+                      onClick={() => setIsCriticRunOpen(true)}
+                      size="sm"
+                      variant="default"
+                    >
+                      <Play />
+                      Run critics
+                    </Button>
+                    <Button
+                      data-testid="agent-critic-history-open"
+                      onClick={() => setIsCriticHistoryOpen(true)}
+                      size="sm"
+                      variant="outline"
+                    >
+                      <History />
+                      Critic history
+                    </Button>
+                    <Button
+                      data-testid="agent-defaults-button"
+                      ref={fullAiDefaultsTriggerRef}
+                      onClick={(event) => openAiDefaults(event.currentTarget)}
+                      size="sm"
+                      variant="outline"
                     >
                       <Settings2 />
                       {hasSavedAgentDefaults
                         ? "Agent defaults"
                         : "Set agent defaults"}
-                    </DropdownMenuItem>
+                    </Button>
                     {runningAgentCount > 0 ? (
-                      <DropdownMenuItem
+                      <Button
                         disabled={isActionPending}
-                        onSelect={() => {
+                        onClick={() => {
                           void agents.handleBulkStopRunning();
                         }}
+                        size="sm"
+                        variant="outline"
                       >
                         <OctagonX />
                         Stop running agents
-                      </DropdownMenuItem>
+                      </Button>
                     ) : null}
-                  </DropdownMenuContent>
-                </DropdownMenu>
-              </>
-            }
-            description="Set up and manage your agents."
-            title="Agents"
-          />
-          <div className="flex flex-col gap-8">
-            <UnifiedAgentsSection
-              getAvailability={agents.getAvailability}
-              defaultModel={inheritedDefaults.model.value}
-              actionErrorMessage={agents.actionErrorMessage}
-              actionNoticeMessage={agents.actionNoticeMessage}
-              agents={agents.managedAgents}
-              agentsError={
-                agents.managedAgentsQuery.error instanceof Error
-                  ? agents.managedAgentsQuery.error
-                  : null
-              }
-              isActionPending={isActionPending}
-              isAgentsLoading={agents.managedAgentsQuery.isLoading}
-              startingAgentPubkey={agents.startingAgentPubkey}
-              restartingAgentPubkey={agents.restartingAgentPubkey}
-              startingPersonaIds={agents.startingPersonaIds}
-              onOpenAgentProfile={(pubkey, options) => {
-                openProfilePanel?.(pubkey, options);
-              }}
-              onOpenPersonaProfile={(persona) => {
-                openPersonaProfilePanel?.(persona);
-              }}
-              onStartAgent={(pubkey) => {
-                void agents.handleStart(pubkey);
-              }}
-              onRestartAgent={(pubkey) => {
-                void agents.handleRestart(pubkey);
-              }}
-              onStartPersona={(persona) => {
-                void agents.handleStartPersona(persona);
-              }}
-              // Persona props
-              personas={personas.libraryPersonas}
-              personasError={
-                personas.personasQuery.error instanceof Error
-                  ? personas.personasQuery.error
-                  : null
-              }
-              personaFeedbackErrorMessage={
-                personas.personaFeedbackSurface === "library"
-                  ? personas.personaErrorMessage
-                  : null
-              }
-              personaFeedbackNoticeMessage={
-                personas.personaFeedbackSurface === "library"
-                  ? personas.personaNoticeMessage
-                  : null
-              }
-              isPersonasLoading={personas.personasQuery.isLoading}
-              isPersonasPending={personas.isPending}
-              onOpenCatalog={() => openCommunityCatalog("agents")}
-              onDuplicatePersona={personas.openDuplicate}
-              onEditPersona={personas.openEdit}
-              onSharePersona={personas.openShare}
-              onDeactivatePersona={(persona) => {
-                void personas.handleSetActive(persona, false, "library");
-              }}
-              onDeletePersona={personas.openDelete}
-            />
+                  </div>
 
-            <TeamsSection
-              error={
-                teamActions.teamsQuery.error instanceof Error
-                  ? teamActions.teamsQuery.error
-                  : null
-              }
-              isLoading={teamActions.teamsQuery.isLoading}
-              isPending={
-                teamActions.createTeamMutation.isPending ||
-                teamActions.updateTeamMutation.isPending ||
-                teamActions.deleteTeamMutation.isPending
-              }
-              onCreate={teamActions.openCreateDialog}
-              onDelete={teamActions.setTeamToDelete}
-              onDuplicate={teamActions.openDuplicateDialog}
-              onEdit={teamActions.openEditDialog}
-              onAddToChannel={teamActions.setTeamToAddToChannel}
-              onDiscover={() => openCommunityCatalog("teams")}
-              onShare={teamActions.openShare}
-              onImport={() => {
-                teamImportInputRef.current?.click();
-              }}
-              personas={personas.libraryPersonas}
-              teams={teamActions.teams}
-            />
-          </div>
+                  <DropdownMenu modal={false}>
+                    <DropdownMenuTrigger asChild>
+                      <Button
+                        aria-label="Agent actions"
+                        className="hidden [@container(max-width:40rem)]:inline-flex"
+                        data-testid="agent-actions-menu-trigger"
+                        ref={compactActionsTriggerRef}
+                        size="icon"
+                        type="button"
+                        variant="outline"
+                      >
+                        <EllipsisVertical />
+                      </Button>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent align="end">
+                      <DropdownMenuItem
+                        onSelect={() => setOpenLibrary("skills")}
+                      >
+                        <BookOpen />
+                        Skill library
+                      </DropdownMenuItem>
+                      <DropdownMenuItem
+                        onSelect={() => setOpenLibrary("prompts")}
+                      >
+                        <FileText />
+                        Prompt profiles
+                      </DropdownMenuItem>
+                      <DropdownMenuItem
+                        onSelect={() => setOpenLibrary("routes")}
+                      >
+                        <Route />
+                        Routing profiles
+                      </DropdownMenuItem>
+                      <DropdownMenuItem
+                        data-testid="agent-critic-run-open-compact"
+                        onSelect={() => setIsCriticRunOpen(true)}
+                      >
+                        <Play />
+                        Run critics
+                      </DropdownMenuItem>
+                      <DropdownMenuItem
+                        data-testid="agent-critic-history-open-compact"
+                        onSelect={() => setIsCriticHistoryOpen(true)}
+                      >
+                        <History />
+                        Critic history
+                      </DropdownMenuItem>
+                      <DropdownMenuItem
+                        onSelect={() => {
+                          openAiDefaults(compactActionsTriggerRef.current);
+                        }}
+                      >
+                        <Settings2 />
+                        {hasSavedAgentDefaults
+                          ? "Agent defaults"
+                          : "Set agent defaults"}
+                      </DropdownMenuItem>
+                      {runningAgentCount > 0 ? (
+                        <DropdownMenuItem
+                          disabled={isActionPending}
+                          onSelect={() => {
+                            void agents.handleBulkStopRunning();
+                          }}
+                        >
+                          <OctagonX />
+                          Stop running agents
+                        </DropdownMenuItem>
+                      ) : null}
+                    </DropdownMenuContent>
+                  </DropdownMenu>
+                </>
+              )
+            }
+            description={
+              openLibrary === "skills"
+                ? "Create and review reusable instructions for your local agents."
+                : openLibrary === "prompts"
+                  ? "Create versioned prompt profiles for distinct API and harness targets."
+                  : openLibrary === "routes"
+                    ? "Choose ordered provider/model candidates for local Buzz Agent prompts."
+                    : "Set up and manage your agents."
+            }
+            title={
+              openLibrary === "skills"
+                ? "Skill library"
+                : openLibrary === "prompts"
+                  ? "Prompt profiles"
+                  : openLibrary === "routes"
+                    ? "Routing profiles"
+                    : "Agents"
+            }
+          />
+          {openLibrary === "skills" ? (
+            <AgentSkillLibrary onBack={() => setOpenLibrary(null)} />
+          ) : openLibrary === "prompts" ? (
+            <AgentPromptProfileLibrary onBack={() => setOpenLibrary(null)} />
+          ) : openLibrary === "routes" ? (
+            <AgentRouteProfileLibrary onBack={() => setOpenLibrary(null)} />
+          ) : (
+            <div className="flex flex-col gap-8">
+              <UnifiedAgentsSection
+                getAvailability={agents.getAvailability}
+                defaultModel={inheritedDefaults.model.value}
+                actionErrorMessage={agents.actionErrorMessage}
+                actionNoticeMessage={agents.actionNoticeMessage}
+                agents={agents.managedAgents}
+                agentsError={
+                  agents.managedAgentsQuery.error instanceof Error
+                    ? agents.managedAgentsQuery.error
+                    : null
+                }
+                isActionPending={isActionPending}
+                isAgentsLoading={agents.managedAgentsQuery.isLoading}
+                startingAgentPubkey={agents.startingAgentPubkey}
+                restartingAgentPubkey={agents.restartingAgentPubkey}
+                startingPersonaIds={agents.startingPersonaIds}
+                onOpenAgentProfile={(pubkey, options) => {
+                  openProfilePanel?.(pubkey, options);
+                }}
+                onOpenPersonaProfile={(persona) => {
+                  openPersonaProfilePanel?.(persona);
+                }}
+                onStartAgent={(pubkey) => {
+                  void agents.handleStart(pubkey);
+                }}
+                onRestartAgent={(pubkey) => {
+                  void agents.handleRestart(pubkey);
+                }}
+                onStartPersona={(persona) => {
+                  void agents.handleStartPersona(persona);
+                }}
+                // Persona props
+                personas={personas.libraryPersonas}
+                personasError={
+                  personas.personasQuery.error instanceof Error
+                    ? personas.personasQuery.error
+                    : null
+                }
+                personaFeedbackErrorMessage={
+                  personas.personaFeedbackSurface === "library"
+                    ? personas.personaErrorMessage
+                    : null
+                }
+                personaFeedbackNoticeMessage={
+                  personas.personaFeedbackSurface === "library"
+                    ? personas.personaNoticeMessage
+                    : null
+                }
+                isPersonasLoading={personas.personasQuery.isLoading}
+                isPersonasPending={personas.isPending}
+                onOpenCatalog={() => openCommunityCatalog("agents")}
+                onDuplicatePersona={personas.openDuplicate}
+                onEditPersona={personas.openEdit}
+                onSharePersona={personas.openShare}
+                onDeactivatePersona={(persona) => {
+                  void personas.handleSetActive(persona, false, "library");
+                }}
+                onDeletePersona={personas.openDelete}
+              />
+
+              <TeamsSection
+                error={
+                  teamActions.teamsQuery.error instanceof Error
+                    ? teamActions.teamsQuery.error
+                    : null
+                }
+                isLoading={teamActions.teamsQuery.isLoading}
+                isPending={
+                  teamActions.createTeamMutation.isPending ||
+                  teamActions.updateTeamMutation.isPending ||
+                  teamActions.deleteTeamMutation.isPending
+                }
+                onCreate={teamActions.openCreateDialog}
+                onDelete={teamActions.setTeamToDelete}
+                onDuplicate={teamActions.openDuplicateDialog}
+                onEdit={teamActions.openEditDialog}
+                onAddToChannel={teamActions.setTeamToAddToChannel}
+                onDiscover={() => openCommunityCatalog("teams")}
+                onShare={teamActions.openShare}
+                onImport={() => {
+                  teamImportInputRef.current?.click();
+                }}
+                personas={personas.libraryPersonas}
+                teams={teamActions.teams}
+              />
+            </div>
+          )}
         </div>
       </div>
 
@@ -356,6 +479,7 @@ export function AgentsView() {
           onSubmit={(input, options) =>
             personas.handleSubmit(
               input,
+              undefined,
               undefined,
               undefined,
               undefined,
@@ -678,6 +802,14 @@ export function AgentsView() {
           }}
         />
       ) : null}
+      <AgentCriticHistoryDialog
+        onOpenChange={setIsCriticHistoryOpen}
+        open={isCriticHistoryOpen}
+      />
+      <AgentCriticRunDialog
+        onOpenChange={setIsCriticRunOpen}
+        open={isCriticRunOpen}
+      />
       {/* Hidden file input for team snapshot import via file picker */}
       <input
         accept=".team.json,.team.png"

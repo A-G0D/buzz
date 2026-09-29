@@ -276,6 +276,40 @@ pub fn build_message(
     )
 }
 
+/// Kind 9 — stream message with explicit operator task-class metadata.
+///
+/// The adapter accepts only built-in classes and stamps the provenance fields
+/// before the existing owner signing path signs the event.
+#[allow(clippy::too_many_arguments)]
+pub fn build_message_with_task_class(
+    channel_id: Uuid,
+    content: &str,
+    thread_ref: Option<&ThreadRef>,
+    mentions: &[&str],
+    media_tags: &[Vec<String>],
+    custom_emoji_tags: &[Vec<String>],
+    mention_ref_tags: &[Vec<String>],
+    link_preview_tags: &[Vec<String>],
+    sent_from_thread_tag: Option<&[String]>,
+    relay_base: &str,
+    task_class: &str,
+) -> Result<EventBuilder, String> {
+    build_message_internal(
+        channel_id,
+        content,
+        thread_ref,
+        mentions,
+        media_tags,
+        custom_emoji_tags,
+        mention_ref_tags,
+        link_preview_tags,
+        sent_from_thread_tag,
+        relay_base,
+        &[],
+        Some(task_class),
+    )
+}
+
 /// Kind 9 — stream message with internal client marker tags.
 ///
 /// This is intentionally narrower than arbitrary extra tags: callers can add
@@ -295,6 +329,37 @@ pub fn build_message_with_client_tags(
     relay_base: &str,
     client_tags: &[Vec<String>],
 ) -> Result<EventBuilder, String> {
+    build_message_internal(
+        channel_id,
+        content,
+        thread_ref,
+        mentions,
+        media_tags,
+        custom_emoji_tags,
+        mention_ref_tags,
+        link_preview_tags,
+        sent_from_thread_tag,
+        relay_base,
+        client_tags,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_message_internal(
+    channel_id: Uuid,
+    content: &str,
+    thread_ref: Option<&ThreadRef>,
+    mentions: &[&str],
+    media_tags: &[Vec<String>],
+    custom_emoji_tags: &[Vec<String>],
+    mention_ref_tags: &[Vec<String>],
+    link_preview_tags: &[Vec<String>],
+    sent_from_thread_tag: Option<&[String]>,
+    relay_base: &str,
+    client_tags: &[Vec<String>],
+    task_class: Option<&str>,
+) -> Result<EventBuilder, String> {
     if sent_from_thread_tag.is_some() && thread_ref.is_some() {
         return Err("sent-from-thread provenance requires a top-level message".into());
     }
@@ -310,6 +375,28 @@ pub fn build_message_with_client_tags(
     crate::link_preview_tags::append(link_preview_tags, relay_base, &mut tags)?;
     append_sent_from_thread_tag(sent_from_thread_tag, &mut tags)?;
     append_client_tags(client_tags, &mut tags)?;
+    if let Some(task_class) = task_class {
+        const BUILT_IN_CLASSES: &[&str] = &[
+            "coding",
+            "code_review",
+            "research",
+            "writing",
+            "analysis",
+            "planning",
+            "summarization",
+            "classification",
+        ];
+        if !BUILT_IN_CLASSES.contains(&task_class) {
+            return Err("task class is not a supported Desktop class".into());
+        }
+        tags.push(tag(vec![
+            "buzz:task-class",
+            "1",
+            "operator-defined-v1",
+            "desktop_ui",
+            task_class,
+        ])?);
+    }
     Ok(EventBuilder::new(Kind::Custom(9), content).tags(tags))
 }
 
@@ -783,6 +870,80 @@ pub use workflows::{
 mod tests {
     use super::*;
     use nostr::Keys;
+
+    #[test]
+    fn desktop_task_class_message_is_owner_signable_and_bounded() {
+        let keys = Keys::generate();
+        let channel_id = Uuid::new_v4();
+        let event = build_message_with_task_class(
+            channel_id,
+            "Review this change",
+            None,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+            "https://relay.example",
+            "code_review",
+        )
+        .expect("built-in Desktop class")
+        .sign_with_keys(&keys)
+        .expect("sign message");
+        event.verify().expect("signed metadata verifies");
+        assert!(event.tags.iter().any(|tag| {
+            tag.as_slice()
+                == [
+                    "buzz:task-class",
+                    "1",
+                    "operator-defined-v1",
+                    "desktop_ui",
+                    "code_review",
+                ]
+        }));
+
+        let rejected = build_message_with_task_class(
+            channel_id,
+            "Review this change",
+            None,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+            "https://relay.example",
+            "invented",
+        );
+        assert!(rejected.is_err());
+    }
+
+    #[test]
+    fn ordinary_message_builder_keeps_task_class_absent() {
+        let keys = Keys::generate();
+        let event = build_message(
+            Uuid::new_v4(),
+            "Ordinary message",
+            None,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+            "https://relay.example",
+        )
+        .expect("build ordinary message")
+        .sign_with_keys(&keys)
+        .expect("sign ordinary message");
+        event.verify().expect("ordinary message verifies");
+        assert!(!event.tags.iter().any(|tag| tag
+            .as_slice()
+            .first()
+            .is_some_and(|name| name == "buzz:task-class")));
+    }
+
     #[test]
     fn channel_builders_reject_hash_only_names() {
         let channel_id = Uuid::new_v4();

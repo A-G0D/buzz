@@ -12,11 +12,20 @@ import {
   addChannelMembers,
   createManagedAgent,
   getChannelMembers,
+  listAgentArchetypes,
   listManagedAgents,
   updateManagedAgent,
 } from "@/shared/api/tauri";
 import { listPersonas } from "@/shared/api/tauriPersonas";
 import { startManagedAgent } from "@/shared/api/tauriManagedAgents";
+import { getIdentity } from "@/shared/api/tauriIdentity";
+import { getCachedRelayOrigin } from "@/shared/lib/mediaUrl";
+import {
+  applyStoredProjectAgentProfileDefault,
+  applyStoredProjectAgentRouteProfileDefault,
+  projectAgentRouteProfileEnvVars,
+} from "@/features/projects/projectAgentProfileDefault";
+import { listAgentRouteProfiles } from "@/shared/api/tauriAgentRouteProfiles";
 import type {
   AcpRuntime,
   AgentPersona,
@@ -74,6 +83,14 @@ export type CreateChannelManagedAgentInput = {
   personaId?: string | null;
   /** Team this instance is deployed from; prevents cross-team reuse. */
   teamId?: string | null;
+  /** Built-in local archetype selected for this managed instance. */
+  executionProfileId?: string;
+  /** Saved route profile pinned to a new local Buzz Agent instance. */
+  routeProfileId?: string;
+  /** Per-agent defaults applied when this input is added to a project. */
+  parallelism?: number;
+  idleTimeoutSeconds?: number;
+  maxTurnDurationSeconds?: number;
   /**
    * True when `runtime` is a runtime the user deliberately picked to override
    * the persona (a deploy-dialog runtime selector), as opposed to a
@@ -405,6 +422,11 @@ export async function provisionChannelManagedAgent(
     mcpCommand: input.runtime.mcpCommand ?? "",
     personaId: input.personaId ?? undefined,
     teamId: input.teamId ?? undefined,
+    executionProfileId: input.executionProfileId,
+    envVars: projectAgentRouteProfileEnvVars(input),
+    parallelism: input.parallelism,
+    idleTimeoutSeconds: input.idleTimeoutSeconds,
+    maxTurnDurationSeconds: input.maxTurnDurationSeconds,
     systemPrompt: input.systemPrompt?.trim() || undefined,
     avatarUrl: resolvedAvatarUrl,
     model: input.model?.trim() || undefined,
@@ -451,8 +473,28 @@ export async function createChannelManagedAgents(
   channelId: string,
   inputs: readonly CreateChannelManagedAgentInput[],
 ): Promise<CreateChannelManagedAgentsResult> {
+  let effectiveInputs = [...inputs];
+  if (inputs.length > 0) {
+    const identity = await getIdentity();
+    const scope = {
+      relayUrl: getCachedRelayOrigin() ?? "",
+      ownerPubkey: identity.pubkey,
+      channelId,
+    };
+    effectiveInputs = await applyStoredProjectAgentRouteProfileDefault(
+      scope,
+      inputs,
+      listAgentRouteProfiles,
+    );
+    effectiveInputs = await applyStoredProjectAgentProfileDefault(
+      scope,
+      effectiveInputs,
+      listAgentArchetypes,
+    );
+  }
+
   // Fetch managed agents and channel members once for smart reuse checks.
-  const needsPersonaPolicy = inputs.some(
+  const needsPersonaPolicy = effectiveInputs.some(
     (input) =>
       Boolean(input.personaId) &&
       !input.forceNewInstance &&
@@ -474,8 +516,8 @@ export async function createChannelManagedAgents(
   const successes: CreateChannelManagedAgentResult[] = [];
   const failures: CreateChannelManagedAgentBatchFailure[] = [];
 
-  for (let i = 0; i < inputs.length; i++) {
-    const input = inputs[i];
+  for (let i = 0; i < effectiveInputs.length; i++) {
+    const input = effectiveInputs[i];
     try {
       const result = await createChannelManagedAgent(channelId, input, context);
       successes.push(result);

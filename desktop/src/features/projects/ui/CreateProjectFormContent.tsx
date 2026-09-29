@@ -57,12 +57,21 @@ export function CreateProjectFormContent({
 
     setErrorMessage(null);
     try {
+      const agentResourceDefaults = settings.getResourceDefaults();
+      const agentRouteProfileId = settings.getRouteProfileId();
+      const agents = settings.buildAgents(
+        agentResourceDefaults,
+        agentRouteProfileId,
+      );
       await onCreate({
         name: trimmedName,
         description: description.trim() || undefined,
         channelVisibility: settings.channelVisibility,
         projectVisibility: settings.projectVisibility,
-        agents: settings.buildAgents(),
+        agentExecutionProfileId: settings.executionProfileId || undefined,
+        agentRouteProfileId: agentRouteProfileId ?? undefined,
+        agents,
+        agentResourceDefaults,
         templateId: settings.templateId,
       });
       onCreated();

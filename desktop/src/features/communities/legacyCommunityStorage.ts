@@ -10,6 +10,7 @@ const LOCAL_DEV_RELAY_URLS = new Set([
   "ws://localhost:3000",
   "ws://127.0.0.1:3000",
 ]);
+const LEGACY_STORAGE_READ_TIMEOUT_MS = 3_000;
 
 type LegacyCommunityStorageSnapshot = {
   workspaces: string | null;
@@ -111,12 +112,16 @@ export function applyLegacyCommunityStorage(
  * Buzz does not already have community state, except for the known broken
  * Sprout→Buzz first-run handoff that created a single localhost community.
  */
-export async function migrateLegacyCommunityStorageBeforeRender(): Promise<void> {
+export async function migrateLegacyCommunityStorageBeforeRender(
+  readLegacyStorage: () => Promise<LegacyCommunityStorageSnapshot> = () =>
+    invokeTauri<LegacyCommunityStorageSnapshot>("get_legacy_workspace_storage"),
+  timeoutMs = LEGACY_STORAGE_READ_TIMEOUT_MS,
+): Promise<void> {
   if (typeof window === "undefined") {
     return;
   }
 
-  migrateLegacyCommunityStorage(window.localStorage);
+  migrateLegacyCommunityStorage();
   // block/buzz#5078 — read through the throw-safe accessor so a denied-storage
   // origin degrades to "no community state" instead of crashing pre-render.
   const currentCommunitiesRaw = getStorageItem(BUZZ_COMMUNITIES_KEY);
@@ -130,12 +135,25 @@ export async function migrateLegacyCommunityStorageBeforeRender(): Promise<void>
   }
 
   try {
-    applyLegacyCommunityStorage(
-      await invokeTauri<LegacyCommunityStorageSnapshot>(
-        "get_legacy_workspace_storage",
-      ),
-    );
+    let timeout: ReturnType<typeof globalThis.setTimeout> | undefined;
+    const legacyStorage = await Promise.race([
+      readLegacyStorage(),
+      new Promise<never>((_, reject) => {
+        timeout = globalThis.setTimeout(
+          () => reject(new Error("legacy workspace read timed out")),
+          timeoutMs,
+        );
+      }),
+    ]).finally(() => {
+      if (timeout !== undefined) {
+        globalThis.clearTimeout(timeout);
+      }
+    });
+    applyLegacyCommunityStorage(legacyStorage);
   } catch (error) {
-    console.warn("Failed to read legacy Sprout community storage.", error);
+    console.warn(
+      "Failed to read legacy Sprout community storage; continuing startup without migration.",
+      error,
+    );
   }
 }

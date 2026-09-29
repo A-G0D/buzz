@@ -227,6 +227,7 @@ mod tests {
             definition_parallelism: None,
             relay_mesh: None,
             effort_level: None,
+            execution_profile: None,
         }
     }
 
@@ -261,6 +262,19 @@ mod tests {
         linked.system_prompt = Some("stale\u{200B} prompt".to_string());
         build_agent_event(&linked)
             .expect("linked record prompt is omitted in favor of the validated persona");
+    }
+
+    #[test]
+    fn execution_archetype_is_not_part_of_the_public_agent_event() {
+        let mut local = sample_agent();
+        local.persona_id = None;
+        local.execution_profile =
+            super::super::execution_profile::resolve_execution_profile(Some("critic")).unwrap();
+
+        let json = serde_json::to_string(&agent_event_content(&local)).unwrap();
+        assert!(json.contains("You are a test agent."));
+        assert!(!json.contains("<agent-archetype"));
+        assert!(!json.contains("execution_profile"));
     }
 
     #[test]

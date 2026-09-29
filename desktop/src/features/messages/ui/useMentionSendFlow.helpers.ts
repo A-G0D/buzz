@@ -77,6 +77,7 @@ export type PendingNonMemberMentionSend = {
     threadHeadId: string | null;
   } | null;
   trimmed: string;
+  taskClass: string | null;
   mentionPubkeys: string[];
   nonMemberPubkeys: string[];
   outgoingTags?: string[][];
@@ -110,6 +111,7 @@ export type SendMessageWithMentionFlowInput = {
   recoveryDraftKey: string | null | undefined;
   spoileredAttachmentUrls?: ReadonlySet<string>;
   trimmed: string;
+  taskClass?: string | null;
 };
 
 export async function resolvePreviewTags(

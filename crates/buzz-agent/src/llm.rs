@@ -61,8 +61,38 @@ const LLM_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 
 impl Llm {
     pub fn new(cfg: &Config) -> Result<Self, AgentError> {
-        let http = Client::builder()
+        Self::new_for_route(cfg, false)
+    }
+
+    /// Build the bounded model-test client. Redirects are disabled for every
+    /// destination; loopback probes also bypass ambient proxies.
+    pub(crate) fn new_for_synthetic_probe(cfg: &Config) -> Result<Self, AgentError> {
+        let builder = Client::builder()
             .connect_timeout(LLM_CONNECT_TIMEOUT)
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none());
+        let http = builder
+            .build()
+            .map_err(|e| AgentError::Llm(format!("http: {e}")))?;
+        let auth = build_token_source(cfg)?;
+        Ok(Self {
+            http,
+            auto_upgraded: AtomicBool::new(false),
+            auth,
+        })
+    }
+
+    /// Build an API client for a selected route. Local routes ignore ambient
+    /// HTTP proxy settings and refuse redirects so task data cannot be sent to
+    /// a different network host after the loopback check.
+    pub(crate) fn new_for_route(cfg: &Config, enforce_loopback: bool) -> Result<Self, AgentError> {
+        let mut builder = Client::builder().connect_timeout(LLM_CONNECT_TIMEOUT);
+        if enforce_loopback {
+            builder = builder
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none());
+        }
+        let http = builder
             // No client-level read_timeout: we apply a per-request total
             // timeout via RequestBuilder::timeout() so that escalated budgets
             // on slow models are not silently floored by a fixed client-level
@@ -115,6 +145,14 @@ impl Llm {
                 self.post_openrouter(cfg, &body)
                     .await
                     .and_then(parse_openai_with_reasoning_details)
+            }
+            Provider::DeepSeek => {
+                let body =
+                    deepseek_body(cfg, system_prompt, history, tools, effective_model, effort);
+                self.post_openai(cfg, "/chat/completions", &body, effective_model)
+                    .await
+                    .map_err(PostError::into_agent)
+                    .and_then(parse_deepseek)
             }
             Provider::OpenAi | Provider::Databricks => {
                 let provider_str = match cfg.provider {
@@ -270,6 +308,22 @@ impl Llm {
                     );
                     let v = self.post_openrouter(cfg, &body).await?;
                     Ok(parse_openai(v)?.text)
+                }
+                Provider::DeepSeek => {
+                    let mut body = deepseek_body(
+                        cfg,
+                        system_prompt,
+                        &[HistoryItem::User(user_prompt.into())],
+                        &[],
+                        effective_model,
+                        cfg.thinking_effort,
+                    );
+                    body["max_tokens"] = json!(max_output_tokens);
+                    let response = self
+                        .post_openai(cfg, "/chat/completions", &body, effective_model)
+                        .await
+                        .map_err(PostError::into_agent)?;
+                    Ok(parse_openai(response)?.text)
                 }
                 Provider::OpenAi | Provider::Databricks => {
                     let r = self
@@ -821,6 +875,51 @@ fn openai_body(
     if !tools_json.is_empty() {
         body["tools"] = Value::Array(tools_json);
         body["tool_choice"] = json!("auto");
+    }
+    body
+}
+
+fn deepseek_body(
+    cfg: &Config,
+    system_prompt: &str,
+    history: &[HistoryItem],
+    tools: &[ToolDef],
+    effective_model: &str,
+    effort: Option<ThinkingEffort>,
+) -> Value {
+    let mut body = openai_body(cfg, system_prompt, history, tools, effective_model, None);
+    let max_tokens = body["max_completion_tokens"].take();
+    body["max_tokens"] = max_tokens;
+    if let Some(object) = body.as_object_mut() {
+        object.remove("max_completion_tokens");
+    }
+    if let Some(messages) = body["messages"].as_array_mut() {
+        for (item, message) in history
+            .iter()
+            .filter(|item| matches!(item, HistoryItem::Assistant { .. }))
+            .zip(messages.iter_mut().filter(|m| m["role"] == "assistant"))
+        {
+            if let HistoryItem::Assistant {
+                reasoning_details: Some(details),
+                ..
+            } = item
+            {
+                if let Some(content) = details.get("deepseek_reasoning_content") {
+                    message["reasoning_content"] = content.clone();
+                }
+            }
+        }
+    }
+    if let Some(effort) = effort {
+        let value = match effort {
+            ThinkingEffort::None => "none",
+            ThinkingEffort::Minimal | ThinkingEffort::Low => "low",
+            ThinkingEffort::Medium | ThinkingEffort::High | ThinkingEffort::XHigh => "high",
+            ThinkingEffort::Max => "max",
+        };
+        body["reasoning_effort"] = json!(value);
+        body["thinking"] =
+            json!({"type": if effort == ThinkingEffort::None { "disabled" } else { "enabled" }});
     }
     body
 }
@@ -1587,6 +1686,21 @@ fn parse_openai_with_reasoning_details(v: Value) -> Result<LlmResponse, AgentErr
     Ok(response)
 }
 
+fn parse_deepseek(v: Value) -> Result<LlmResponse, AgentError> {
+    let reasoning_content = v
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|a| a.first())
+        .and_then(|c| c.get("message"))
+        .and_then(|m| m.get("reasoning_content"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let mut response = parse_openai(v)?;
+    response.reasoning_details =
+        reasoning_content.map(|content| json!({"deepseek_reasoning_content": content}));
+    Ok(response)
+}
+
 fn make_tool_call(
     id: String,
     name: String,
@@ -1602,7 +1716,7 @@ fn make_tool_call(
         _ => {
             return Err(AgentError::Llm(
                 "tool_call arguments must be a JSON object".into(),
-            ))
+            ));
         }
     };
     Ok(ToolCall {
@@ -1630,7 +1744,7 @@ async fn read_error_body(mut resp: reqwest::Response) -> String {
     String::from_utf8_lossy(&buf).into_owned()
 }
 
-const MAX_RETRIES: u32 = 3;
+pub(crate) const MAX_RETRIES: u32 = 3;
 const BASE_BACKOFF_MS: u64 = 500;
 const MAX_BACKOFF_MS: u64 = 8_000;
 
@@ -2097,7 +2211,7 @@ pub(crate) fn databricks_pkce_config(
 ///   flow; subsequent requests use the cache + refresh transparently.
 pub(crate) fn build_token_source(cfg: &Config) -> Result<Arc<dyn TokenSource>, AgentError> {
     match cfg.provider {
-        Provider::Anthropic | Provider::OpenAi | Provider::OpenRouter => {
+        Provider::Anthropic | Provider::OpenAi | Provider::OpenRouter | Provider::DeepSeek => {
             Ok(Arc::new(StaticTokenSource::new(cfg.api_key.clone())))
         }
         Provider::Databricks | Provider::DatabricksV2 => {
@@ -2124,9 +2238,11 @@ pub(crate) fn build_token_source(cfg: &Config) -> Result<Arc<dyn TokenSource>, A
 pub(crate) fn summary_completion_cap(provider: Provider, max_output_tokens: u32) -> u32 {
     match provider {
         Provider::OpenRouter => max_output_tokens.saturating_mul(2),
-        Provider::Anthropic | Provider::OpenAi | Provider::Databricks | Provider::DatabricksV2 => {
-            max_output_tokens
-        }
+        Provider::Anthropic
+        | Provider::OpenAi
+        | Provider::Databricks
+        | Provider::DatabricksV2
+        | Provider::DeepSeek => max_output_tokens,
     }
 }
 
@@ -2605,6 +2721,11 @@ mod tests {
     include!("llm_fqn_tests.rs");
     use super::*;
     use crate::config::{Config, HookServers, OpenAiApi, Provider, ThinkingSummary};
+    use crate::route_preview::{
+        complete_routed, select_profile_route, BoundRouteCandidate, BoundRouteSelection,
+        CandidateDisposition, DataLocation, DataPolicy, Evidence, EvidenceSource, RouteCandidate,
+        RouteDecision, RouteExecution, RouteProfileDocument, RouteRequirements,
+    };
     use crate::types::{HistoryItem, ToolCall, ToolResult, ToolResultContent};
     use std::collections::VecDeque;
     use std::time::Duration;
@@ -2615,6 +2736,8 @@ mod tests {
         Config {
             provider,
             system_prompt: "system".into(),
+            summary_model: None,
+            summary_max_output_tokens: 1200,
             max_rounds: 10,
             max_output_tokens: 1024,
             max_token_recoveries: 3,
@@ -2768,6 +2891,48 @@ mod tests {
         (base_url, captured)
     }
 
+    async fn spawn_redirect_stubs() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let redirected = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let redirected_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let redirected_url = format!(
+            "http://{}/redirected",
+            redirected_listener.local_addr().unwrap()
+        );
+        let redirected_for_server = redirected.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = redirected_listener.accept().await else {
+                    return;
+                };
+                redirected_for_server.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let mut request = [0u8; 2048];
+                let _ = socket.read(&mut request).await;
+                let response = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                let _ = socket.write_all(response).await;
+            }
+        });
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut request = [0u8; 2048];
+                let _ = socket.read(&mut request).await;
+                let response = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: {redirected_url}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        (base_url, redirected)
+    }
+
     fn chat_response(text: &str) -> Value {
         json!({
             "choices": [{
@@ -2798,6 +2963,271 @@ mod tests {
             .filter(|request| request.method == "POST")
             .filter_map(|request| request.body.as_ref()?.get("model")?.as_str())
             .collect()
+    }
+
+    fn route_fact<T>(value: T) -> Evidence<T> {
+        Evidence::Known {
+            value,
+            source: EvidenceSource::RuntimeObserved,
+        }
+    }
+
+    fn route_candidate(id: &str, provider: Provider, model: &str) -> RouteCandidate {
+        RouteCandidate {
+            id: id.into(),
+            provider,
+            model: model.into(),
+            available: route_fact(true),
+            data_location: route_fact(DataLocation::Hosted),
+            max_cost_microusd: Evidence::Unknown,
+            max_seconds: Evidence::Unknown,
+            context_tokens: Evidence::Unknown,
+            input_context_upper_bound_tokens: Evidence::Unknown,
+            tokens_per_second_milli: Evidence::Unknown,
+            tools: Evidence::Unknown,
+        }
+    }
+
+    #[tokio::test]
+    async fn routed_completion_dispatches_only_to_the_preview_selected_model() {
+        let (base_url, captured) =
+            spawn_sequence_stub(vec![StubHttpResponse::ok(chat_response("routed response"))]).await;
+        let mut config = cfg(Provider::DeepSeek);
+        config.base_url = base_url;
+        let other_config = config.clone();
+        let candidates = vec![
+            BoundRouteCandidate::new(
+                route_candidate("other", Provider::DeepSeek, "other-model"),
+                other_config,
+            )
+            .unwrap(),
+            BoundRouteCandidate::new(
+                route_candidate("selected", Provider::DeepSeek, "deepseek-chat"),
+                config,
+            )
+            .unwrap(),
+        ];
+        let requirements = RouteRequirements {
+            data_policy: DataPolicy::Allow(BTreeSet::from([DataLocation::Hosted])),
+            preferred_candidate_id: Some("selected".into()),
+            ..Default::default()
+        };
+
+        let execution = complete_routed(
+            &requirements,
+            &candidates,
+            &[HistoryItem::User("local smoke".into())],
+            &[],
+        )
+        .await;
+
+        let RouteExecution::Selected {
+            preview,
+            candidate_id,
+            result,
+        } = execution
+        else {
+            panic!("eligible selected candidate should be selected");
+        };
+        assert_eq!(candidate_id, "selected");
+        assert_eq!(
+            preview.decision,
+            RouteDecision::Chosen {
+                candidate_id: "selected".into()
+            }
+        );
+        assert_eq!(
+            preview.candidates[1].disposition,
+            CandidateDisposition::Chosen
+        );
+        assert_eq!(result.unwrap().text, "routed response");
+        let requests = captured.lock().await;
+        assert_eq!(posted_models(&requests), vec!["deepseek-chat"]);
+    }
+
+    #[tokio::test]
+    async fn acp_route_profile_dispatches_to_selected_provider_and_prompt_profile() {
+        let (openai_url, openai_requests) =
+            spawn_sequence_stub(vec![StubHttpResponse::ok(chat_response("wrong route"))]).await;
+        let (deepseek_url, deepseek_requests) =
+            spawn_sequence_stub(vec![StubHttpResponse::ok(chat_response("DeepSeek route"))]).await;
+        let profile_json = json!({
+            "version": 1,
+            "data_policy": "allow-hosted",
+            "preference_order": ["deepseek", "openai"],
+            "candidates": [
+                {
+                    "id": "openai",
+                    "provider": "openai",
+                    "model": "gpt-route-model",
+                    "data_location": "hosted",
+                    "prompt_addendum": "OpenAI-specific prompt."
+                },
+                {
+                    "id": "deepseek",
+                    "provider": "deepseek",
+                    "model": "deepseek-chat",
+                    "data_location": "hosted",
+                    "prompt_addendum": "DeepSeek-specific prompt."
+                }
+            ]
+        });
+        let profile = RouteProfileDocument::parse(profile_json.to_string().as_bytes()).unwrap();
+        let selected = select_profile_route(
+            &profile,
+            "shared persona prompt",
+            |provider, model, prompt| {
+                let (base_url, config_provider) = match provider {
+                    Provider::OpenAi => (openai_url.clone(), Provider::OpenAi),
+                    Provider::DeepSeek => (deepseek_url.clone(), Provider::DeepSeek),
+                    _ => panic!("unexpected provider in profile"),
+                };
+                let mut config = cfg(config_provider);
+                config.model = model.to_owned();
+                config.base_url = base_url;
+                config.system_prompt = prompt;
+                Ok(config)
+            },
+        )
+        .unwrap();
+        let BoundRouteSelection::Chosen { selected, .. } = selected else {
+            panic!("explicit first eligible provider should be chosen");
+        };
+        let execution = complete_routed(
+            &RouteRequirements {
+                data_policy: DataPolicy::Allow(std::collections::BTreeSet::from([
+                    DataLocation::Hosted,
+                ])),
+                preferred_candidate_id: Some("deepseek".into()),
+                ..Default::default()
+            },
+            &[selected],
+            &[HistoryItem::User(
+                "task sent only to selected provider".into(),
+            )],
+            &[],
+        )
+        .await;
+        let RouteExecution::Selected {
+            candidate_id,
+            result,
+            ..
+        } = execution
+        else {
+            panic!("selected provider should receive one request");
+        };
+
+        assert_eq!(candidate_id, "deepseek");
+        assert_eq!(result.unwrap().text, "DeepSeek route");
+        assert!(openai_requests.lock().await.is_empty());
+        let sent = deepseek_requests.lock().await;
+        assert_eq!(posted_models(&sent), vec!["deepseek-chat"]);
+        assert!(sent[0].body.as_ref().unwrap()["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("shared persona prompt"));
+        assert!(sent[0].body.as_ref().unwrap()["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("DeepSeek-specific prompt."));
+    }
+
+    #[tokio::test]
+    async fn routed_completion_makes_no_provider_call_after_safety_refusal() {
+        let (base_url, captured) =
+            spawn_sequence_stub(vec![StubHttpResponse::ok(chat_response("must not run"))]).await;
+        let mut config = cfg(Provider::DeepSeek);
+        config.base_url = base_url;
+        let candidate = BoundRouteCandidate::new(
+            route_candidate("selected", Provider::DeepSeek, "deepseek-chat"),
+            config,
+        )
+        .unwrap();
+        let requirements = RouteRequirements {
+            data_policy: DataPolicy::Allow(BTreeSet::from([DataLocation::Hosted])),
+            safety_refusal: true,
+            ..Default::default()
+        };
+
+        let execution = complete_routed(
+            &requirements,
+            &[candidate],
+            &[HistoryItem::User("local smoke".into())],
+            &[],
+        )
+        .await;
+
+        assert!(matches!(execution, RouteExecution::Abstained { .. }));
+        assert!(captured.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn local_route_refuses_redirects_to_other_hosts() {
+        let (base_url, redirected) = spawn_redirect_stubs().await;
+        let mut config = cfg(Provider::DeepSeek);
+        config.base_url = base_url;
+        let llm = Llm::new_for_route(&config, true).unwrap();
+
+        let result = complete_model(&llm, &config, "deepseek-chat").await;
+
+        assert!(result.is_err());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(redirected.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn routed_completion_does_not_switch_candidates_after_provider_failure() {
+        let failures = (0..MAX_RETRIES)
+            .map(|_| StubHttpResponse::error(503, "upstream unavailable"))
+            .collect();
+        let (base_url, captured) = spawn_sequence_stub(failures).await;
+        let mut config = cfg(Provider::DeepSeek);
+        config.base_url = base_url;
+        let alternate_config = config.clone();
+        let candidates = vec![
+            BoundRouteCandidate::new(
+                route_candidate("selected", Provider::DeepSeek, "deepseek-chat"),
+                config,
+            )
+            .unwrap(),
+            BoundRouteCandidate::new(
+                route_candidate("alternate", Provider::DeepSeek, "alternate-model"),
+                alternate_config,
+            )
+            .unwrap(),
+        ];
+        let requirements = RouteRequirements {
+            data_policy: DataPolicy::Allow(BTreeSet::from([DataLocation::Hosted])),
+            preferred_candidate_id: Some("selected".into()),
+            ..Default::default()
+        };
+
+        let execution = complete_routed(
+            &requirements,
+            &candidates,
+            &[HistoryItem::User("local smoke".into())],
+            &[],
+        )
+        .await;
+
+        let RouteExecution::Selected { result, .. } = execution else {
+            panic!("eligible selected candidate should be selected");
+        };
+        assert!(result.is_err());
+        let requests = captured.lock().await;
+        assert!(!posted_models(&requests).is_empty());
+        assert!(posted_models(&requests)
+            .iter()
+            .all(|model| *model == "deepseek-chat"));
+    }
+
+    #[test]
+    fn route_binding_rejects_provider_mismatch_before_dispatch() {
+        let candidate = route_candidate("mismatch", Provider::DeepSeek, "deepseek-chat");
+        assert!(matches!(
+            BoundRouteCandidate::new(candidate, cfg(Provider::OpenAi)),
+            Err(crate::route_preview::RouteBindingError::ProviderMismatch)
+        ));
     }
 
     /// An explicit model is sent verbatim and never rewritten to something
@@ -2853,6 +3283,34 @@ mod tests {
                 "no catalog probe belongs on this path"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn selected_deepseek_provider_dispatches_to_its_configured_endpoint() {
+        let (base_url, captured) =
+            spawn_sequence_stub(vec![StubHttpResponse::ok(chat_response("deepseek ok"))]).await;
+        let mut config = cfg(Provider::DeepSeek);
+        config.base_url = base_url;
+        config.model = "deepseek-chat".into();
+        let llm = Llm::new(&config).unwrap();
+
+        let response = complete_model(&llm, &config, "deepseek-chat")
+            .await
+            .unwrap();
+
+        assert_eq!(response.text, "deepseek ok");
+        let requests = captured.lock().await;
+        let request = requests
+            .iter()
+            .find(|request| request.method == "POST")
+            .expect("the selected DeepSeek provider must make one chat request");
+        assert_eq!(request.path, "/v1/chat/completions");
+        let body = request.body.as_ref().expect("chat request body");
+        assert_eq!(body["model"], "deepseek-chat");
+        assert!(body.get("max_tokens").is_some());
+        assert!(body.get("max_completion_tokens").is_none());
+        assert_eq!(body["messages"][0]["role"], "system");
+        assert_eq!(body["messages"][1]["role"], "user");
     }
 
     #[tokio::test]
@@ -3193,9 +3651,15 @@ mod tests {
     fn is_responses_required_error_matrix() {
         for (body, want) in [
             // Databricks GPT-5.5 (the actual case we observed).
-            ("Function tools with reasoning_effort are not supported for gpt-5.5 in /v1/chat/completions. Please use /v1/responses instead.", true),
+            (
+                "Function tools with reasoning_effort are not supported for gpt-5.5 in /v1/chat/completions. Please use /v1/responses instead.",
+                true,
+            ),
             // Forward-compat: OpenAI saying the same thing in prose.
-            ("This model requires the Responses API. Please use the Responses API instead.", true),
+            (
+                "This model requires the Responses API. Please use the Responses API instead.",
+                true,
+            ),
             // Negatives — must NOT trigger on unrelated 4xx.
             ("{\"error\":\"invalid_api_key\"}", false),
             ("max_tokens is not supported with this model", false),
@@ -6097,6 +6561,56 @@ mod tests {
     }
 
     // ---- A3: OpenRouter body-shape tests ----
+
+    #[test]
+    fn deepseek_body_uses_documented_fields_and_replays_reasoning_content() {
+        let mut c = cfg(Provider::DeepSeek);
+        c.max_output_tokens = 321;
+        let history = vec![
+            HistoryItem::Assistant {
+                text: String::new(),
+                tool_calls: vec![ToolCall {
+                    provider_id: "call_1".into(),
+                    name: "do_it".into(),
+                    arguments: json!({}),
+                    provider_extra: Map::new(),
+                }],
+                reasoning_details: Some(json!({"deepseek_reasoning_content":"trace"})),
+            },
+            HistoryItem::ToolResult(ToolResult {
+                provider_id: "call_1".into(),
+                content: vec![ToolResultContent::Text("ok".into())],
+                is_error: false,
+            }),
+        ];
+        let body = deepseek_body(
+            &c,
+            "system",
+            &history,
+            &[],
+            "deepseek-chat",
+            Some(ThinkingEffort::Medium),
+        );
+        assert_eq!(body["max_tokens"], 321);
+        assert!(body.get("max_completion_tokens").is_none());
+        assert_eq!(body["reasoning_effort"], "high");
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["messages"][1]["reasoning_content"], "trace");
+    }
+
+    #[test]
+    fn deepseek_parser_keeps_reasoning_content_for_history_replay() {
+        let response = parse_deepseek(json!({"choices":[{"finish_reason":"tool_calls","message":{
+            "role":"assistant", "content":"", "reasoning_content":"trace",
+            "tool_calls":[{"id":"c1","type":"function","function":{"name":"x","arguments":"{}"}}]
+        }}]}))
+        .unwrap();
+        assert_eq!(response.reasoning, "trace");
+        assert_eq!(
+            response.reasoning_details,
+            Some(json!({"deepseek_reasoning_content":"trace"}))
+        );
+    }
 
     fn tools_vec() -> Vec<ToolDef> {
         vec![ToolDef {

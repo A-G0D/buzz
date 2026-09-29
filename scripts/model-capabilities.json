@@ -4,7 +4,19 @@
     "models_dev": "https://models.dev/api.json (retrieved 2026-07-31, SHA-256 d5a4974cd69f19b0f67713acaa6bb3b16e920defdc07ecbdf6b0a936181bb0e0)",
     "anthropic_thinking": "https://platform.claude.com/docs/en/build-with-claude/extended-thinking (July 2025)",
     "anthropic_effort": "https://platform.claude.com/docs/en/build-with-claude/effort (July 2025)",
-    "openai_reasoning": "https://platform.openai.com/docs/guides/reasoning (July 2025)"
+    "openai_reasoning": "https://platform.openai.com/docs/guides/reasoning (July 2025)",
+    "deepseek_thinking_mode": "https://api-docs.deepseek.com/guides/thinking_mode/ and https://api-docs.deepseek.com/api/list-models/ (checked 2026-09-25): model effort vocabulary low|high|max (with none disabling thinking); local choices minimal→low, low→low, medium→high, high→high, xhigh→high, max→max; ultra→max (ultra is not a ThinkingEffort value). The model list and per-model support remain dynamic; this is provider-level baseline data, not a claim for unknown IDs."
+  },
+  "effort_mappings": {
+    "deepseek": {
+      "none": "none",
+      "minimal": "low",
+      "low": "low",
+      "medium": "high",
+      "high": "high",
+      "xhigh": "high",
+      "max": "max"
+    }
   },
   "family_tokens": [
     "claude-",
@@ -1648,6 +1660,38 @@
           "max"
         ],
         "default_effort": "medium",
+        "normalization_policy": "none"
+      },
+      "concrete_unknown": {
+        "databricks_v2_wire_route": "not-applicable",
+        "thinking_mode": "none",
+        "supported_efforts": [
+          "none",
+          "minimal",
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ],
+        "default_effort": "medium",
+        "normalization_policy": "none"
+      }
+    },
+    "deepseek": {
+      "blank": {
+        "databricks_v2_wire_route": "not-applicable",
+        "thinking_mode": "adaptive",
+        "supported_efforts": [
+          "none",
+          "minimal",
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ],
+        "default_effort": "high",
         "normalization_policy": "none"
       },
       "concrete_unknown": {

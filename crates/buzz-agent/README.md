@@ -56,6 +56,11 @@ OPENROUTER_API_KEY=sk-or-v1-... \
 OPENROUTER_MODEL=anthropic/claude-sonnet-4.5 \
   ./target/release/buzz-agent
 
+# Or DeepSeek
+BUZZ_AGENT_PROVIDER=deepseek \
+DEEPSEEK_API_KEY=sk-... \
+  ./target/release/buzz-agent
+
 # Or Databricks model serving via OAuth 2.0 PKCE
 BUZZ_AGENT_PROVIDER=databricks \
 DATABRICKS_HOST=https://dbc-...cloud.databricks.com \
@@ -147,12 +152,17 @@ Everything is environment variables. No flags, no config files. (We are a subpro
 | `OPENROUTER_API_KEY` | — | Required when provider=openrouter. |
 | `OPENROUTER_MODEL` | — | Required when provider=openrouter. Use OpenRouter's `vendor/model` id, e.g. `anthropic/claude-sonnet-4.5`. |
 | `OPENROUTER_BASE_URL` | `https://openrouter.ai/api/v1` | |
+| `DEEPSEEK_API_KEY` | — | Required when provider=deepseek. |
+| `DEEPSEEK_MODEL` | `deepseek-chat` | Optional model default; `BUZZ_AGENT_MODEL` overrides it. |
+| `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | |
 | `DATABRICKS_HOST` | — | Required when provider=databricks or provider=databricks_v2. |
 | `DATABRICKS_MODEL` | — | Required when provider=databricks or provider=databricks_v2. |
 | `DATABRICKS_MODEL_FILTER` | — | Optional discovery-only, comma-separated full-string `*`/`?` patterns OR-matched against raw Databricks endpoint and Unity Catalog model-service IDs. Blank/unset shows all; this is visibility filtering, not an authorization boundary. |
 | `DATABRICKS_TOKEN` | — | Optional static bearer escape hatch. If unset, Databricks uses browser OAuth + refresh cache. |
 | `BUZZ_AGENT_SYSTEM_PROMPT` | built-in | Inline system prompt. |
 | `BUZZ_AGENT_SYSTEM_PROMPT_FILE` | — | File path. Mutually exclusive with the above. |
+| `BUZZ_AGENT_SUMMARY_MODEL` | — | Optional. Enables the in-process `summarize_status_evidence` tool and selects its model. Uses this agent's provider, API key, and endpoint; thread evidence is sent only when the agent calls the tool. |
+| `BUZZ_AGENT_SUMMARY_MAX_OUTPUT_TOKENS` | `1200` | Status-summary output budget; valid range 1–4096. |
 | `BUZZ_AGENT_MAX_ROUNDS` | `0` | Tool-loop iteration cap. 0 = unlimited. |
 | `BUZZ_AGENT_MAX_OUTPUT_TOKENS` | `65536` | Desired per-call ceiling. Set this at or below the served model's output limit for each agent deployment. Proactive handoff is independently based on 90% of `BUZZ_AGENT_MAX_CONTEXT_TOKENS`. |
 | `BUZZ_AGENT_MAX_TOKEN_RECOVERIES` | `3` | Retries after a successful response is truncated at the output-token limit. `0` disables recovery; the finite value and `BUZZ_AGENT_MAX_ROUNDS` prevent infinite retries. |
@@ -241,12 +251,13 @@ lifecycle hook — see [MCP_DRIVEN_HOOKS.md](../../docs/MCP_DRIVEN_HOOKS.md).
 | Ollama | `openai` | `POST {base}/chat/completions` | llama3.1, qwen2.5-coder |
 | Block Gateway | `openai` | `POST {base}/chat/completions` | gpt-5, claude |
 | OpenRouter | `openrouter` | `POST {base}/chat/completions` | anything they route (extended-thinking replay, provider-agnostic tool calling) |
+| DeepSeek | `deepseek` | `POST {base}/chat/completions` | DeepSeek Chat Completions (reasoning and tool calls) |
 | Databricks | `databricks` | `POST {host}/serving-endpoints/{model}/invocations` | goose-claude-4-6-sonnet |
 | Databricks AI Gateway v2 | `databricks_v2` | `POST {host}/ai-gateway/{provider}/v1/...` | workspace endpoints and Unity Catalog model-service FQNs; UC Claude services use Anthropic Messages, UC GPT-5+ services use OpenAI Responses, and unknown UC FQNs use MLflow Chat Completions |
 
 The optional `DATABRICKS_MODEL_FILTER` applies only to model discovery. Each comma-separated entry is trimmed and matched against the complete raw ID with case-sensitive `*` (zero or more characters) and `?` (one Unicode character) semantics; patterns are OR-ed. Unset or blank preserves the full authenticated catalog. A nonblank value containing no usable patterns is rejected. This controls picker visibility only; Databricks and Unity Catalog permissions remain the authorization boundary. A filtered-empty result is authoritative and does not restore the built-in fallback models.
 
-If `BUZZ_AGENT_PROVIDER=anthropic` is selected without `ANTHROPIC_API_KEY`, `BUZZ_AGENT_PROVIDER=openai` is selected without `OPENAI_COMPAT_API_KEY`, or `BUZZ_AGENT_PROVIDER=openrouter` is selected without `OPENROUTER_API_KEY`, the agent returns an error — there is no implicit fallback to another provider.
+If `BUZZ_AGENT_PROVIDER=anthropic` is selected without `ANTHROPIC_API_KEY`, `BUZZ_AGENT_PROVIDER=openai` without `OPENAI_COMPAT_API_KEY`, `BUZZ_AGENT_PROVIDER=openrouter` without `OPENROUTER_API_KEY`, or `BUZZ_AGENT_PROVIDER=deepseek` without `DEEPSEEK_API_KEY`, the agent returns an error — there is no implicit fallback to another provider.
 
 `provider=openai` speaks two HTTP dialects: the [Responses API](https://platform.openai.com/docs/api-reference/responses) (`/v1/responses`, required for GPT-5 / o-series tool-calling on OpenAI's own service) and the [Chat Completions API](https://platform.openai.com/docs/api-reference/chat) (`/chat/completions`, the broadly-supported OpenAI-compatible wire format).
 
@@ -255,9 +266,12 @@ By default (`OPENAI_COMPAT_API=auto`) the agent picks **Responses** when `OPENAI
 `provider=openrouter` is first-class, not routed through `provider=openai`: it speaks OpenAI's Chat Completions wire format but with OpenRouter-specific extensions layered on top —
 
 - `reasoning.effort` is set on the request when reasoning effort is configured. The request deliberately carries no `provider.require_parameters` filter: that filter routes only to endpoints advertising every parameter in the body, and 83 of 274 tools-capable OpenRouter models do not advertise `reasoning`, so it turns an effort setting into a hard 404 on a valid model id. A model that cannot reason answers without reasoning instead.
+
 - The response's `reasoning_details` array (opaque extended-thinking payload) is captured and replayed byte-for-byte on the next turn's assistant message, so multi-turn tool use keeps the model's chain-of-thought.
 - `anthropic/*` models get Anthropic-style `cache_control` breakpoints injected on the system message and the last two user messages.
 - Retryable statuses (429 and typed `provider_overloaded` 503) honor the documented `Retry-After` header (clamped to a small ceiling — see `RETRY_AFTER_CAP_SECS` in `llm.rs` — since the sleep happens outside `BUZZ_AGENT_LLM_TIMEOUT_SECS`); 502 and untyped 503 retry with jittered backoff instead. `401` is treated as an expired/invalid key and refreshed once, while `402` (no credits) and `403` (guardrail/moderation/permission) fail immediately without retry.
+
+`provider=deepseek` uses `max_tokens`, maps configured effort to DeepSeek's documented `reasoning_effort` values (`none`, `low`, `high`, `max`), and sets its `thinking.type` toggle consistently. It discovers models through authenticated `GET /models`. Assistant `reasoning_content` is retained and replayed on following requests, as DeepSeek requires for multi-turn tool use.
 
 `Provider` is a Rust `enum` with one `match` in `Llm::complete`. There is no trait, no `Box<dyn>`, no async-trait. Adding a provider is a `match` arm and one `body`/`parse` pair in `llm.rs`.
 

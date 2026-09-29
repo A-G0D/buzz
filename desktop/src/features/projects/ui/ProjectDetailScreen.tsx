@@ -39,7 +39,9 @@ import {
   buildProjectDetailAgentContext,
   type ProjectDetailAgentContext,
 } from "@/features/projects/lib/projectDetailAgentContext";
+import type { ProjectIssuePlanChatHandoff } from "@/features/projects/lib/projectIssuePlan";
 import { projectDetailSelectionItem } from "@/features/projects/lib/projectDetailSelectionItem";
+import { selectionItemFromTask } from "@/features/projects/lib/projectSelection";
 import {
   projectRepoUnavailablePresentation,
   projectRepoUnavailableReason,
@@ -48,6 +50,7 @@ import {
 import { wantsProjectRepositorySurface } from "@/features/projects/lib/projectDetailSearch";
 import { hasAuthoritativeHomeBinding } from "@/features/projects/lib/projectHomeChannel";
 import { selectProjectRepository } from "@/features/projects/projectModels";
+import { projectIssueHierarchy } from "@/features/projects/projectIssues.mjs";
 import { isProjectRelayValidated } from "@/features/projects/projectSnapshot";
 import { ProjectSelectionProvider } from "@/features/projects/lib/useProjectSelection";
 import { useMemberChannelIds } from "@/features/projects/useRepositoryAccess";
@@ -718,6 +721,12 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
   const displayedRepositoryFiles = displayedRepositorySnapshot?.files ?? [];
   const selectedIssue =
     issuesQuery.data?.find((item) => item.id === selectedIssueId) ?? null;
+  const selectedIssueSubtasks =
+    selectedIssue?.category === "epic"
+      ? (projectIssueHierarchy(issuesQuery.data ?? []).childrenByParentId.get(
+          selectedIssue.id,
+        ) ?? [])
+      : [];
   const displayedSnapshotCommits =
     repoSource === "local"
       ? (localRepoSnapshotQuery.data?.snapshot.commits ?? [])
@@ -761,9 +770,44 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
     project,
     repository,
     source: repoSource,
+    subtasks: selectedIssueSubtasks,
     workItems: [selectedCommit, selectedIssue, selectedPullRequest],
   });
   const selectionChat = repositoryPanel.openSelectionChatFor(agentPageContext);
+  const openApprovedIssuePlanInChat = (
+    handoff: ProjectIssuePlanChatHandoff,
+  ) => {
+    const { issue, projectAddress, tasks } = handoff.snapshot;
+    if (projectAddress !== repository.repoAddress) return false;
+    const taskItem = selectionItemFromTask({
+      channelId: repository.channelId ?? project.projectChannelId,
+      id: issue.id,
+      title: issue.title,
+    });
+    const planContext: ProjectDetailAgentContext = {
+      ...agentPageContext,
+      approvedIssuePlan: handoff,
+      repoAddress: projectAddress,
+      view: "Task detail",
+      workItem: {
+        description: issue.content,
+        id: issue.id,
+        kind: "task",
+        status: issue.status,
+        subtasks: tasks
+          .filter((task) => task.id !== issue.id)
+          .map((task) => ({
+            description: task.content,
+            id: task.id,
+            status: task.status,
+            title: task.title,
+          })),
+        title: issue.title,
+      },
+    };
+    repositoryPanel.openSelectionChat(planContext, [taskItem]);
+    return true;
+  };
   const repositoryPanelAction = (
     <ProjectRightPanelControls
       collapsed={repositoryPanel.collapsed}
@@ -931,6 +975,7 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
                     }
                     onSelectedCommitHashChange={handleSelectedCommitHashChange}
                     onSelectedIssueIdChange={handleSelectedIssueIdChange}
+                    onUseApprovedIssuePlan={openApprovedIssuePlanInChat}
                     onSelectedPullRequestIdChange={
                       handleSelectedPullRequestIdChange
                     }

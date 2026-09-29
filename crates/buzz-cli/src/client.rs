@@ -564,7 +564,6 @@ impl BuzzClient {
     }
 
     /// Get the relay base URL.
-    #[allow(dead_code)]
     pub fn relay_url(&self) -> &str {
         &self.relay_url
     }
@@ -816,6 +815,55 @@ impl BuzzClient {
             }
         })
         .await
+    }
+
+    /// Execute a relay query while rejecting response bodies above the caller's
+    /// byte budget. The response is streamed and never buffered past the limit.
+    pub async fn query_multi_bounded(
+        &self,
+        filters: &[serde_json::Value],
+        max_response_bytes: usize,
+    ) -> Result<String, CliError> {
+        if max_response_bytes == 0 {
+            return Err(CliError::Usage(
+                "query response byte limit must be positive".into(),
+            ));
+        }
+        let url = format!("{}/query", self.relay_url);
+        let body =
+            bytes::Bytes::from(serde_json::to_vec(filters).map_err(|error| {
+                CliError::Other(format!("filter serialization failed: {error}"))
+            })?);
+        self.with_retry_body(|| {
+            let body = body.clone();
+            let url = url.clone();
+            async move {
+                let auth = sign_nip98(&self.keys, "POST", &url, Some(&body))?;
+                let response = self
+                    .with_auth_tag(
+                        self.http
+                            .post(&url)
+                            .header("Authorization", auth)
+                            .header("Content-Type", "application/json")
+                            .body(body),
+                    )
+                    .send()
+                    .await?;
+                self.handle_response_bounded(response, max_response_bytes)
+                    .await
+            }
+        })
+        .await
+    }
+
+    /// Execute a single-filter query with a streamed response byte budget.
+    pub async fn query_bounded(
+        &self,
+        filter: &serde_json::Value,
+        max_response_bytes: usize,
+    ) -> Result<String, CliError> {
+        self.query_multi_bounded(std::slice::from_ref(filter), max_response_bytes)
+            .await
     }
 
     /// Execute a one-shot count via the HTTP bridge.
@@ -1396,6 +1444,70 @@ impl BuzzClient {
         }
         Ok(resp.text().await?)
     }
+
+    async fn handle_response_bounded(
+        &self,
+        response: reqwest::Response,
+        max_response_bytes: usize,
+    ) -> Result<String, CliError> {
+        let status = response.status();
+        let body_limit = if status.is_success() {
+            max_response_bytes
+        } else {
+            max_response_bytes.min(8 * 1024)
+        };
+        let body = read_response_bounded(response, body_limit).await?;
+        let text = String::from_utf8(body)
+            .map_err(|error| CliError::Other(format!("relay response was not UTF-8: {error}")))?;
+        if status.is_success() {
+            return Ok(text);
+        }
+        let message = serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("error")
+                    .or_else(|| value.get("message"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+            .unwrap_or(text);
+        let message = if status.as_u16() == 403 && std::env::var("BUZZ_AUTH_TAG").is_ok() {
+            format!(
+                "{message} (BUZZ_AUTH_TAG is set — it may be stale or revoked; try unsetting it)"
+            )
+        } else {
+            message
+        };
+        Err(CliError::Relay {
+            status: status.as_u16(),
+            body: message,
+        })
+    }
+}
+
+async fn read_response_bounded(
+    mut response: reqwest::Response,
+    max_bytes: usize,
+) -> Result<Vec<u8>, CliError> {
+    if response
+        .content_length()
+        .is_some_and(|content_length| content_length > max_bytes as u64)
+    {
+        return Err(CliError::Other(format!(
+            "relay response exceeded the {max_bytes}-byte query budget"
+        )));
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if chunk.len() > max_bytes.saturating_sub(body.len()) {
+            return Err(CliError::Other(format!(
+                "relay response exceeded the {max_bytes}-byte query budget"
+            )));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 /// Normalize a relay URL: ws:// → http://, wss:// → https://, strip trailing slash.
@@ -2021,6 +2133,28 @@ mod retry_policy_tests {
             attempts.load(Ordering::SeqCst) >= 2,
             "must have retried at least once"
         );
+    }
+
+    #[tokio::test]
+    async fn bounded_query_rejects_a_response_over_its_byte_budget() {
+        let app = Router::new().route(
+            "/query",
+            post(|| async {
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Body::from("x".repeat(128)))
+                    .unwrap()
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = test_client(&format!("http://{addr}"));
+        let result = client
+            .query_bounded(&serde_json::json!({"limit": 1}), 32)
+            .await;
+        assert!(result.is_err());
     }
 
     /// `with_retry_body` retries a 429 with a `retry in Ns` hint, honours the hint

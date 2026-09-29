@@ -150,7 +150,7 @@ test("submitted project context stays compact and expandable", async ({
 });
 
 test("sidebar project add flow browses before creating", async ({ page }) => {
-  await installMockBridge(page);
+  await installMockBridge(page, { activePersonaIds: ["builtin:fizz"] });
   await page.goto("/", { waitUntil: "domcontentloaded" });
   await expect(page.getByTestId("sidebar-project-buzz")).toHaveCount(0);
   await page.getByTestId("sidebar-projects-section-label").hover();
@@ -175,6 +175,27 @@ test("sidebar project add flow browses before creating", async ({ page }) => {
   );
   await expect(page.getByTestId("create-project-team")).toHaveText("None");
   await expect(page.getByTestId("create-project-agent")).toHaveText("None");
+  await expect(page.getByTestId("agent-archetype-preview")).toHaveCount(0);
+  await page.getByTestId("create-project-agent").click();
+  await page.getByRole("menuitemradio", { name: "Fizz" }).click();
+  const projectArchetype = page.getByRole("button", {
+    name: "Agent starting style",
+  });
+  await expect(projectArchetype).toBeVisible();
+  await projectArchetype.click();
+  await page.getByRole("menuitemradio", { name: "Critic" }).click();
+  await page.getByText("Preview prompt and limits").click();
+  const profilePreview = page.getByTestId("agent-archetype-preview");
+  await expect(profilePreview).toContainText(
+    '<agent-archetype id="critic" version="1">',
+  );
+  await expect(profilePreview).toContainText("Parallel agents: 1");
+  await expect(profilePreview).toContainText("Idle timeout: 5 min");
+  await expect(profilePreview).toContainText("Maximum turn: 30 min");
+  await profilePreview.scrollIntoViewIfNeeded();
+  await page.getByTestId("create-project-dialog").screenshot({
+    path: `${SHOTS}/10-agent-archetype-preview.png`,
+  });
   await page.getByRole("button", { name: "Back to projects" }).click();
   await expect(browser).toBeVisible();
 
@@ -189,6 +210,108 @@ test("sidebar project add flow browses before creating", async ({ page }) => {
   await addedProject.click({ button: "right" });
   await page.getByRole("menuitem", { name: "Remove from sidebar" }).click();
   await expect(addedProject).toHaveCount(0);
+});
+
+test("project creation sends the selected archetype to each new agent", async ({
+  page,
+}) => {
+  await installMockBridge(page, { activePersonaIds: ["builtin:fizz"] });
+  await page.goto("/", { waitUntil: "domcontentloaded" });
+  await page.getByTestId("sidebar-projects-section-label").hover();
+  await page.getByTestId("sidebar-projects-create").click();
+
+  const browser = page.getByTestId("project-browser-dialog");
+  await browser
+    .getByRole("searchbox", { name: "Search projects" })
+    .fill("critic profile project");
+  await browser.getByTestId("project-browser-create").click();
+  await expect(page.getByTestId("create-project-agent")).toHaveText("None");
+  await expect(page.getByTestId("agent-archetype-preview")).toHaveCount(0);
+  await page.getByTestId("create-project-agent").click();
+  const fizzOption = page.getByTestId(
+    "create-project-agent-option-builtin:fizz",
+  );
+  await expect(fizzOption).toBeVisible();
+  await fizzOption.click();
+  await page.getByRole("button", { name: "Agent starting style" }).click();
+  await page.getByRole("menuitemradio", { name: "Critic" }).click();
+  await page
+    .locator("summary", { hasText: "Starting limits for these agents" })
+    .click();
+  await page.getByLabel("Parallelism (1–32)").fill("3");
+  await page.getByLabel("Idle timeout (seconds)").fill("240");
+  await page.getByTestId("create-project-submit").click();
+
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (
+            window as Window & {
+              __BUZZ_E2E_COMMAND_LOG__?: Array<{
+                command: string;
+                payload: Record<string, unknown>;
+              }>;
+            }
+          ).__BUZZ_E2E_COMMAND_LOG__?.findLast(
+            (entry) => entry.command === "create_managed_agent",
+          )?.payload,
+      ),
+    )
+    .toMatchObject({
+      input: {
+        executionProfileId: "critic",
+        parallelism: 3,
+        idleTimeoutSeconds: 240,
+        personaId: "builtin:fizz",
+      },
+    });
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        Array.from({ length: window.localStorage.length }, (_, index) =>
+          window.localStorage.key(index),
+        )
+          .filter(
+            (key): key is string =>
+              key?.startsWith("buzz-project-agent-profile.v1:") ?? false,
+          )
+          .map((key) => {
+            const raw = window.localStorage.getItem(key);
+            return raw
+              ? (JSON.parse(raw) as { profileId?: string }).profileId
+              : null;
+          }),
+      ),
+    )
+    .toEqual(["critic"]);
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        Array.from({ length: window.localStorage.length }, (_, index) =>
+          window.localStorage.key(index),
+        )
+          .filter(
+            (key): key is string =>
+              key?.startsWith("buzz-project-agent-resource-defaults.v1:") ??
+              false,
+          )
+          .map((key) => {
+            const raw = window.localStorage.getItem(key);
+            return raw
+              ? (
+                  JSON.parse(raw) as {
+                    defaults?: {
+                      parallelism?: number;
+                      idleTimeoutSeconds?: number;
+                    };
+                  }
+                ).defaults
+              : null;
+          }),
+      ),
+    )
+    .toEqual([{ parallelism: 3, idleTimeoutSeconds: 240 }]);
 });
 
 test("restricted repositories keep event work visible and offer access help", async ({

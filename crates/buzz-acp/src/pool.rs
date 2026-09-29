@@ -809,6 +809,8 @@ impl ChannelInfoResolver {
 }
 
 pub struct PromptContext {
+    /// Configured ACP worker pool capacity captured for attempt provenance.
+    pub configured_worker_pool_slots: u32,
     pub mcp_servers: Vec<McpServer>,
     pub initial_message: Option<String>,
     pub idle_timeout: Duration,
@@ -819,6 +821,20 @@ pub struct PromptContext {
     pub turn_liveness_interval: Duration,
     pub dedup_mode: DedupMode,
     pub system_prompt: Option<String>,
+    /// Resolved managed-agent provider/model identifiers for local run provenance.
+    pub provider_id: Option<String>,
+    pub model_id: Option<String>,
+    /// Versioned execution profile identity for local run provenance.
+    pub execution_profile_id: Option<String>,
+    pub execution_profile_version: Option<u32>,
+    /// Versioned target prompt-profile identity for local run provenance.
+    pub prompt_profile_id: Option<String>,
+    pub prompt_profile_version: Option<u32>,
+    pub prompt_profile_hash: Option<String>,
+    /// Versioned route profile identity from the managed-agent launch.
+    pub route_profile_id: Option<String>,
+    pub route_profile_version: Option<u32>,
+    pub route_profile_hash: Option<String>,
     /// Sanitized agent name used to compose `_meta.sessionTitle` on session/new.
     /// Channel sessions add the channel name; thread sessions also add the root
     /// ID prefix. Never part of the prompt.
@@ -2298,6 +2314,18 @@ fn send_prompt_result(
     outcome: PromptOutcome,
     batch: Option<FlushBatch>,
 ) {
+    if matches!(&source, PromptSource::Channel(_)) {
+        let journal_outcome = match &outcome {
+            PromptOutcome::Ok(_) => "acp_turn_returned",
+            PromptOutcome::Error(_) => "error",
+            PromptOutcome::ProjectContextIndeterminate(_) => "project_context_indeterminate",
+            PromptOutcome::AgentExited => "agent_exited",
+            PromptOutcome::Timeout(_) => "timeout",
+            PromptOutcome::Cancelled => "cancelled",
+            PromptOutcome::CancelDrainTimeout(_) => "cancel_drain_timeout",
+        };
+        crate::run_journal::record_returned(turn_id, journal_outcome);
+    }
     agent.acp.clear_steer_rx();
     let _ = result_tx.send(PromptResult {
         agent,
@@ -2353,6 +2381,7 @@ pub async fn run_prompt_task(
                 PromptSource::Channel(_) => "channel",
                 PromptSource::Heartbeat => "heartbeat",
             },
+            "adapterChildGenerationId": agent.acp.child_generation_id().to_string(),
             "triggeringEventIds": triggering_event_ids,
         }),
     );
@@ -2431,6 +2460,12 @@ pub async fn run_prompt_task(
         },
         PromptSource::Heartbeat => None,
     };
+    if let Some(project) = resolved_channel_info
+        .as_ref()
+        .and_then(|info| info.project.as_ref())
+    {
+        crate::run_journal::record_project_linked(&turn_id, &project.coordinate);
+    }
 
     //
     // Core memory is delivered inside the system prompt the harness already
@@ -2704,6 +2739,9 @@ pub async fn run_prompt_task(
             "isNewSession": is_new_session,
         }),
     );
+    if matches!(&source, PromptSource::Channel(_)) {
+        crate::run_journal::record_session_resolved(&turn_id, &session_id);
+    }
 
     // Standing context is fixed for the life of a session. Agents with
     // systemPrompt support already hold it from session/new; legacy agents
@@ -3062,6 +3100,8 @@ pub async fn run_prompt_task(
             .collect(),
         None => prompt_sections.iter().map(String::as_str).collect(),
     };
+    let task_class_metadata =
+        crate::task_class::from_batch(batch.as_ref(), ctx.agent_owner_pubkey.as_ref());
     let prompt_bytes: usize = prompt_blocks.iter().map(|block| block.len()).sum();
     let has_standing_context = match &source {
         PromptSource::Channel(_) => !standing.sections().is_empty(),
@@ -3096,6 +3136,9 @@ pub async fn run_prompt_task(
         "turn starting for {}",
         prompt_label(&source)
     );
+    if matches!(&source, PromptSource::Channel(_)) {
+        crate::run_journal::record_prompt_call_started(&turn_id);
+    }
 
     // When control_rx is Some (channel tasks), wrap the prompt in select! so
     // the main loop can cancel, interrupt, or rotate it. Heartbeats
@@ -3106,22 +3149,24 @@ pub async fn run_prompt_task(
             // Heartbeat / non-cancellable path.
             tokio::select! {
                 biased;
-                result = agent.acp.session_prompt_blocks_with_idle_timeout(
+                result = agent.acp.session_prompt_blocks_with_task_class_metadata(
                     &session_id,
                     &prompt_blocks,
                     ctx.idle_timeout,
                     ctx.max_turn_duration,
+                    task_class_metadata.as_ref(),
                 ) => result,
             }
         }
         Some(rx) => {
             tokio::select! {
                 biased;
-                result = agent.acp.session_prompt_blocks_with_idle_timeout(
+                result = agent.acp.session_prompt_blocks_with_task_class_metadata(
                     &session_id,
                     &prompt_blocks,
                     ctx.idle_timeout,
                     ctx.max_turn_duration,
+                    task_class_metadata.as_ref(),
                 ) => result,
                 mode = rx => {
                     let control_signal = mode.unwrap_or(ControlSignal::Cancel);
@@ -9987,6 +10032,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
     ) -> PromptContext {
         use crate::relay::RestClient;
         PromptContext {
+            configured_worker_pool_slots: 1,
             mcp_servers: vec![],
             initial_message: None,
             idle_timeout: Duration::from_secs(60),
@@ -9994,6 +10040,16 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             turn_liveness_interval: Duration::ZERO,
             dedup_mode: DedupMode::Drop,
             system_prompt: None,
+            provider_id: None,
+            model_id: None,
+            execution_profile_id: None,
+            execution_profile_version: None,
+            prompt_profile_id: None,
+            prompt_profile_version: None,
+            prompt_profile_hash: None,
+            route_profile_id: None,
+            route_profile_version: None,
+            route_profile_hash: None,
             session_title: None,
             team_instructions: None,
             heartbeat_prompt: None,

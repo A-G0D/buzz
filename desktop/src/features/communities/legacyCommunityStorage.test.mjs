@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { applyLegacyCommunityStorage } from "./legacyCommunityStorage.ts";
+import {
+  applyLegacyCommunityStorage,
+  migrateLegacyCommunityStorageBeforeRender,
+} from "./legacyCommunityStorage.ts";
+import { migrateLegacyCommunityStorage } from "./communityStorage.ts";
 
 function createMemoryStorage(initial = {}) {
   const values = new Map(Object.entries(initial));
@@ -150,4 +154,105 @@ test("applyLegacyCommunityStorage migrates onboarding completion keys", () => {
   );
 
   assert.equal(storage.getItem("buzz-onboarding-complete.v1:abc123"), "true");
+});
+
+test("migrateLegacyCommunityStorage tolerates a denied localStorage getter", () => {
+  const originalWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+  Object.defineProperty(globalThis, "window", {
+    configurable: true,
+    value: Object.defineProperty({}, "localStorage", {
+      get() {
+        throw new DOMException("Storage access denied", "SecurityError");
+      },
+    }),
+  });
+
+  try {
+    assert.doesNotThrow(() => migrateLegacyCommunityStorage());
+  } finally {
+    if (originalWindow) {
+      Object.defineProperty(globalThis, "window", originalWindow);
+    } else {
+      Reflect.deleteProperty(globalThis, "window");
+    }
+  }
+});
+
+test("pre-render community migration resolves when localStorage is denied", async () => {
+  const originalWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+  const originalWarn = console.warn;
+  Object.defineProperty(globalThis, "window", {
+    configurable: true,
+    value: Object.defineProperty({}, "localStorage", {
+      get() {
+        throw new DOMException("Storage access denied", "SecurityError");
+      },
+    }),
+  });
+  console.warn = () => {};
+
+  try {
+    await assert.doesNotReject(migrateLegacyCommunityStorageBeforeRender());
+  } finally {
+    console.warn = originalWarn;
+    if (originalWindow) {
+      Object.defineProperty(globalThis, "window", originalWindow);
+    } else {
+      Reflect.deleteProperty(globalThis, "window");
+    }
+  }
+});
+
+test("pre-render community migration continues when the legacy IPC read stalls", async () => {
+  const originalWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+  const originalWarn = console.warn;
+  Object.defineProperty(globalThis, "window", {
+    configurable: true,
+    value: { localStorage: createMemoryStorage() },
+  });
+  console.warn = () => {};
+
+  try {
+    await assert.doesNotReject(
+      migrateLegacyCommunityStorageBeforeRender(() => new Promise(() => {}), 1),
+    );
+  } finally {
+    console.warn = originalWarn;
+    if (originalWindow) {
+      Object.defineProperty(globalThis, "window", originalWindow);
+    } else {
+      Reflect.deleteProperty(globalThis, "window");
+    }
+  }
+});
+
+test("pre-render community migration applies a legacy IPC result before its deadline", async () => {
+  const originalWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+  const storage = createMemoryStorage();
+  Object.defineProperty(globalThis, "window", {
+    configurable: true,
+    value: { localStorage: storage },
+  });
+
+  try {
+    await migrateLegacyCommunityStorageBeforeRender(
+      async () => ({
+        workspaces: legacyCommunities,
+        activeWorkspaceId: "legacy-community",
+        onboardingCompletions: [],
+      }),
+      1_000,
+    );
+    assert.equal(storage.getItem("buzz-communities"), legacyCommunities);
+    assert.equal(
+      storage.getItem("buzz-active-community-id"),
+      "legacy-community",
+    );
+  } finally {
+    if (originalWindow) {
+      Object.defineProperty(globalThis, "window", originalWindow);
+    } else {
+      Reflect.deleteProperty(globalThis, "window");
+    }
+  }
 });

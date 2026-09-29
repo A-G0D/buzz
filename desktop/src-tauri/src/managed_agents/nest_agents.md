@@ -44,6 +44,27 @@ created: 2026-01-15
 - **`.scratch/` is disposable** — don't rely on it across sessions
 - **Stay on task** — only stage files relevant to your current work
 
+## Task instructions and skill use
+
+`AGENT_GUIDES/AGENTS.md` is the task-specific table of contents. When using
+Buzz's MCP tools, use `instruction_map` with `root="buzz_nest"` for the nest
+index and `root="workspace"` for the project `AGENTS.md`. Then explicitly
+request only the matching coding, writing, research, or orchestration map. The
+tool reports local links but does not follow them or load skill bodies. Each
+map routes to the smallest relevant installed skill when one exists; no-match
+is valid. If the tool is unavailable, use the configured local skill mechanism
+and local `AGENTS.md` files.
+For an explicit request to “run critics on this” or obtain independent review,
+also read `AGENT_GUIDES/CRITICS.md`; ordinary review discussion is not a trigger.
+
+Before proposing a skill, compare its scope with installed skills and prefer
+reuse, a scoped edit proposal, or no skill. A one-off task is not a reason to
+create one. A new skill candidate needs a recurring procedure, known provenance,
+and a small with/without task comparison. Until skill-evaluation controls
+exist, proposal-only is the default; local import remains an explicit UI action.
+Buzz does not silently ingest remote files or execute bundled code. Keep
+provenance, versions, regressions, and a revert path with any later adoption.
+
 ## Git Commit Attribution
 
 Git authorship, co-authorship, DCO sign-off, and cryptographic signing are separate claims. Follow repository-local rules and the authorizing human's explicit directions; do not infer attribution from repository ownership or from who requested, approved, or reviewed the work.

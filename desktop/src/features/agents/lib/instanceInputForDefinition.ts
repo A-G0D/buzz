@@ -112,6 +112,7 @@ export async function buildInstanceInputForDefinition(
   runtime: AcpRuntime,
   upload?: UploadMediaBytes,
   backendIntent?: BackendIntent,
+  executionProfileId?: string,
 ): Promise<CreateManagedAgentInput> {
   const avatarUrl = await resolveManagedAgentAvatarUrl(
     persona.avatarUrl,
@@ -141,6 +142,7 @@ export async function buildInstanceInputForDefinition(
 
   return {
     ...base,
+    ...(executionProfileId ? { executionProfileId } : {}),
     acpCommand: persona.acpCommand || "buzz-acp",
     agentCommand: runtime.command,
     // Do NOT seed agentArgs from runtime.defaultArgs: record.agent_args must

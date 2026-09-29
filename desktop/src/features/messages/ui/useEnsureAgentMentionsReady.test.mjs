@@ -22,10 +22,10 @@ const dom = new JSDOM("<!doctype html><html><body></body></html>", {
   url: "http://localhost",
 });
 
-/** Every backend command reached during a test — the pass must reach none. */
+/** Backend commands reached during the readiness pass; the pass must reach none. */
 let tauriInvocations = [];
 
-before(() => {
+before(async () => {
   Object.assign(globalThis, {
     document: dom.window.document,
     HTMLElement: dom.window.HTMLElement,
@@ -41,6 +41,14 @@ before(() => {
     transformCallback: () => 1,
   };
   globalThis.__TAURI_INTERNALS__ = dom.window.__TAURI_INTERNALS__;
+
+  // Loading channelAgents through the hook's static imports starts the shared
+  // relay-origin/media-port bootstrap. Keep that setup IPC outside the
+  // readiness-pass recorder and cancel its retry loop before the tests run.
+  await import("./useEnsureAgentMentionsReady.ts");
+  const { resetMediaCaches } = await import("@/shared/lib/mediaUrl");
+  resetMediaCaches();
+  tauriInvocations = [];
 });
 
 after(() => dom.window.close());

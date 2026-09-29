@@ -26,6 +26,16 @@ test("model discovery status names missing OpenAI-compatible credentials", () =>
   assert.match(status?.message ?? "", /OpenAI models/);
 });
 
+test("model discovery status names missing DeepSeek credentials", () => {
+  const status = formatModelDiscoveryErrorStatus(
+    new Error("config: DEEPSEEK_API_KEY required"),
+    "deepseek",
+  );
+  assert.equal(status?.tone, "warning");
+  assert.match(status?.message ?? "", /DeepSeek API key/);
+  assert.match(status?.message ?? "", /DeepSeek models/);
+});
+
 test("Buzz shared compute names the empty state and next action", () => {
   const status = formatModelDiscoveryErrorStatus(
     new Error("no Buzz shared compute serving members are available"),

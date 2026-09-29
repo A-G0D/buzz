@@ -186,6 +186,66 @@ command. After the job finishes the script derives a `metadata.yaml` from the
 manifest roster (validated schema; review the display names before submitting)
 and prints the `harbor upload` / `harbor leaderboard submit` commands.
 
+### Local task-fit evidence
+
+For a completed **single-agent** run, add `--task-class coding` (or another
+short lowercase label) to write `route-fit-evidence.json` into the local Harbor
+job directory. The class is an operator annotation under the
+`operator-defined-v1` label convention; this versions labels but does not make
+different operators' class meanings equivalent. The report records the
+manifest condition and prompt hashes, endpoint configuration hash, runtime
+binary hashes, Harbor job-result hash, dataset/task checksums, per-trial
+verifier rewards, and separate task/trial counts. Its one-sided 95% Wilson
+lower bound uses unique task-content checksums as samples; a case passes only
+when every attempt across labels sharing that checksum meets the threshold.
+Schema v2 counts unique task-content checksums and includes a hash of that case
+set. Its fixed score rule is `task-fit-outcomes-v1`. It is written only with
+locked Harbor 0.16.1 when every trial completed with a canonical verifier reward and
+every task received the declared number of attempts. Team manifests and
+incomplete or ambiguous jobs are rejected.
+
+For local tasks, Harbor 0.16.1 computes `task_checksum` from included task files,
+using their relative paths and per-file SHA-256 digests. This pins packaged task
+content; it does not authenticate the result producer or remote provider
+execution. See Harbor's [trial result schema](https://raw.githubusercontent.com/harbor-framework/harbor/v0.16.1/src/harbor/models/trial/result.py),
+[task packager](https://raw.githubusercontent.com/harbor-framework/harbor/v0.16.1/src/harbor/publisher/packager.py),
+and [task lock](https://raw.githubusercontent.com/harbor-framework/harbor/v0.16.1/src/harbor/models/job/lock.py).
+
+This report contains identifiers and aggregate/evaluation results, not prompt
+text or endpoint credentials. Keep it local unless you have reviewed its
+contents. It is **advisory only**: Buzz routing does not read benchmark reports,
+and this score applies only to the exact benchmark condition. Buzz-native
+regression/workflow runs remain product tests and must not be presented as
+general model-quality evidence. Different checksums may still describe related
+cases, so the Wilson bound does not prove statistical independence.
+
+### Local Buzz Agent route smoke
+
+To repeat the fixed local sample without starting Harbor or Docker, run Buzz
+Agent ACP against a loopback OpenAI-compatible endpoint:
+
+```bash
+cd benchmarks/harbor-buzz-orchestra
+uv run --no-project --python 3.12 -- \
+  python scripts/run_local_route_smoke.py \
+  --binary ../../target/debug/buzz-agent \
+  --base-url http://127.0.0.1:8000/v1 \
+  --output /path/to/local-route-smoke.json
+```
+
+The runner rejects non-loopback URLs and redirects, disables proxy use, and
+rejects unlisted model IDs or ambiguous catalogs without explicit selection.
+It creates an isolated temporary home, uses one local-only ephemeral route
+candidate, sends ten fixed synthetic prompts sequentially, and disables
+tools. The output cap, timeout, same-candidate recoveries, and full-suite
+repetitions (1–5) are configurable; two repeats provide a quick stability
+check. The report stores prompt/output hashes, visible-output length, usage,
+timing, and sanitized outcomes; it omits prompt/response text, endpoint URLs,
+credential values, and absolute model paths. Model identity is endpoint-reported and not
+independently attested. This is a repeatable smoke, not broad model
+qualification, Rust compilation, saved-profile evidence, or signed-in desktop
+acceptance.
+
 ## Validate
 
 ```bash

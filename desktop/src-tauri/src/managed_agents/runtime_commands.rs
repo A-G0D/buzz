@@ -283,6 +283,8 @@ fn start_pair(
     runtimes.remove(&key);
     terminate_untracked_pair_runtime(&app, &key)?;
 
+    let _start_reservation = super::reserve_managed_agent_start(&app, &mut runtimes, &key)?;
+
     let owner = state
         .keys
         .lock()
@@ -296,6 +298,7 @@ fn start_pair(
         pid: process.child.id(),
         desktop_instance_id: current_instance_id(&app),
         started_at: now.clone(),
+        start_nonce: Some(process.start_nonce.clone()),
     };
     if let Err(error) = write_agent_runtime_receipt(&app, &receipt) {
         let _ = terminate_process(process.child.id());

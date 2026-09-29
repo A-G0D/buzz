@@ -25,6 +25,8 @@ function providerObjectLabel(provider: string): string {
       return "OpenAI";
     case "openai-compat":
       return "OpenAI-compatible";
+    case "deepseek":
+      return "DeepSeek";
     default:
       return provider.trim() || "this provider";
   }
@@ -112,6 +114,13 @@ export function formatModelDiscoveryErrorStatus(
     return {
       message:
         "Enter an OpenAI runtime API key (OPENAI_COMPAT_API_KEY) to load OpenAI models.",
+      tone: "warning",
+    };
+  }
+
+  if (message.includes("DEEPSEEK_API_KEY required")) {
+    return {
+      message: "Enter a DeepSeek API key to load DeepSeek models.",
       tone: "warning",
     };
   }

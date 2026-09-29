@@ -17,10 +17,12 @@ use crate::{
     app_state::AppState,
     managed_agents::{
         agent_readiness, current_instance_id, find_managed_agent_mut, known_acp_runtime,
-        load_global_agent_config, load_managed_agents, load_personas, record_agent_command,
-        resolve_effective_agent_env, save_global_agent_config, save_managed_agents,
-        stop_managed_agent_process, sync_managed_agent_processes, validate_global_config,
-        AgentReadiness, BackendKind, GlobalAgentConfig,
+        load_global_agent_config, load_global_agent_resource_policy, load_managed_agents,
+        load_personas, record_agent_command, resolve_effective_agent_env, save_global_agent_config,
+        save_global_agent_resource_policy, save_managed_agents, stop_managed_agent_process,
+        sync_managed_agent_processes, validate_global_agent_resource_policy,
+        validate_global_config, AgentReadiness, BackendKind, DeviceMemorySnapshot,
+        GlobalAgentConfig, GlobalAgentResourcePolicy,
     },
 };
 
@@ -46,6 +48,41 @@ pub struct GlobalAgentConfigSaveResult {
 #[tauri::command]
 pub fn get_global_agent_config(app: AppHandle) -> Result<GlobalAgentConfig, String> {
     load_global_agent_config(&app)
+}
+
+/// Read the device-local hard limits for Buzz-managed local agent processes.
+#[tauri::command]
+pub fn get_global_agent_resource_policy(
+    app: AppHandle,
+) -> Result<GlobalAgentResourcePolicy, String> {
+    load_global_agent_resource_policy(&app)
+}
+
+/// Read a point-in-time estimate of available and total system RAM.
+#[tauri::command]
+pub fn get_device_memory_snapshot() -> DeviceMemorySnapshot {
+    crate::managed_agents::device_memory_snapshot()
+}
+
+/// Persist the resource policy. The process-map lock makes the write linearize
+/// between starts; lowering a limit never kills already-running processes.
+#[tauri::command]
+pub fn set_global_agent_resource_policy(
+    policy: GlobalAgentResourcePolicy,
+    app: AppHandle,
+) -> Result<GlobalAgentResourcePolicy, String> {
+    use tauri::Manager;
+    validate_global_agent_resource_policy(&policy)?;
+    let state = app.state::<AppState>();
+    let _runtime_guard = state
+        .managed_agent_processes
+        .lock()
+        .map_err(|error| error.to_string())?;
+    let _memory_admission_guard = state
+        .managed_agent_memory_admission
+        .lock()
+        .map_err(|error| error.to_string())?;
+    save_global_agent_resource_policy(&app, &policy)
 }
 
 /// Validate and persist a new global agent configuration, then auto-restart

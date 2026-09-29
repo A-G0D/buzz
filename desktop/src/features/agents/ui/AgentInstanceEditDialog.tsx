@@ -1,5 +1,5 @@
 import * as React from "react";
-import { useQueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { ChevronDown } from "lucide-react";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 import { toast } from "sonner";
@@ -28,6 +28,7 @@ import { ChooserDialogContent } from "@/shared/ui/chooser-dialog-content";
 import { Dialog } from "@/shared/ui/dialog";
 import { Input } from "@/shared/ui/input";
 import { setManagedAgentAutoRestart } from "@/shared/api/tauriManagedAgents";
+import { listAgentRouteProfiles } from "@/shared/api/tauriAgentRouteProfiles";
 import { EffortPickerField } from "./EffortPickerField";
 import { EditAgentAdvancedFields } from "./EditAgentAdvancedFields";
 import {
@@ -73,6 +74,7 @@ import type { EnvVarsValue } from "./EnvVarsEditor";
 import { useRequiredCredentialState } from "./useRequiredCredentialState";
 import { RunOnSummarySection } from "./RunOnSummarySection";
 import { PersonaDropdownField } from "./PersonaDropdownField";
+import { AgentRouteProfileField } from "./AgentRouteProfileField";
 import {
   MODEL_DISCOVERY_LOADING_VALUE,
   usePersonaModelDiscovery,
@@ -96,6 +98,8 @@ import {
   runtimeDropdownAction,
   usePendingHarnessSelection,
 } from "./addCustomHarness";
+
+const ROUTE_PROFILE_ID_ENV = "BUZZ_AGENT_ROUTE_PROFILE_ID";
 
 export function AgentInstanceEditDialog({
   agent,
@@ -150,6 +154,11 @@ export function AgentInstanceEditDialog({
   const [isCustomProviderEditing, setIsCustomProviderEditing] =
     React.useState(false);
   const [envVars, setEnvVars] = React.useState<EnvVarsValue>(agent.envVars);
+  const routeProfilesQuery = useQuery({
+    queryKey: ["agent-route-profiles"],
+    queryFn: listAgentRouteProfiles,
+    enabled: open,
+  });
   const [autoRestartOnConfigChange, setAutoRestartOnConfigChange] =
     React.useState(agent.autoRestartOnConfigChange);
   // Effort picker is Save-gated: hold the pending selection in dialog state and
@@ -898,6 +907,18 @@ export function AgentInstanceEditDialog({
     })),
     { label: "Custom provider...", value: CUSTOM_PROVIDER_DROPDOWN_VALUE },
   ];
+  const selectedRouteProfileId = envVars[ROUTE_PROFILE_ID_ENV] ?? "";
+  const routeProfilesSupported =
+    agent.backend.type === "local" && prospectiveRuntimeId === "buzz-agent";
+
+  function updateRouteProfileSelection(profileId: string) {
+    setEnvVars((current) => {
+      const next = { ...current };
+      if (profileId) next[ROUTE_PROFILE_ID_ENV] = profileId;
+      else delete next[ROUTE_PROFILE_ID_ENV];
+      return next;
+    });
+  }
 
   const previewLabel = name.trim() || "Agent name";
   const previewAvatarUrl = avatarUrl.trim() || null;
@@ -1009,6 +1030,18 @@ export function AgentInstanceEditDialog({
               onModeChange={setRespondTo}
             />
             <RunOnSummarySection backend={agent.backend} />
+            {agent.executionProfile ? (
+              <div
+                className="space-y-1 rounded-xl border border-border/70 px-3 py-2"
+                data-testid="agent-execution-profile"
+              >
+                <p className="text-xs text-muted-foreground">Starting style</p>
+                <p className="text-sm font-medium">
+                  {agent.executionProfile.name} · v
+                  {agent.executionProfile.version}
+                </p>
+              </div>
+            ) : null}
 
             {/* Provider (runtime) */}
             <div className="space-y-1.5">
@@ -1171,6 +1204,21 @@ export function AgentInstanceEditDialog({
                     key="edit-agent-advanced-fields"
                     transition={advancedFieldsTransition}
                   >
+                    {routeProfilesSupported || selectedRouteProfileId ? (
+                      <AgentRouteProfileField
+                        disabled={isSaving}
+                        error={
+                          routeProfilesQuery.error instanceof Error
+                            ? routeProfilesQuery.error
+                            : null
+                        }
+                        isLoading={routeProfilesQuery.isLoading}
+                        onChange={updateRouteProfileSelection}
+                        profiles={routeProfilesQuery.data ?? []}
+                        selectedId={selectedRouteProfileId}
+                        supported={routeProfilesSupported}
+                      />
+                    ) : null}
                     <EditAgentAdvancedFields
                       acpCommand={acpCommand}
                       acpCommandCandidates={acpCommandsQuery.data ?? []}
@@ -1179,9 +1227,10 @@ export function AgentInstanceEditDialog({
                       disabled={isSaving}
                       envVars={envVars}
                       fileSatisfiedEnvKeys={fileSatisfiedEnvKeys}
-                      hiddenEnvKeys={
-                        topLevelSecretEnvVar ? [topLevelSecretEnvVar] : []
-                      }
+                      hiddenEnvKeys={[
+                        ...(topLevelSecretEnvVar ? [topLevelSecretEnvVar] : []),
+                        ROUTE_PROFILE_ID_ENV,
+                      ]}
                       focusKey={
                         initialFocus?.type === "env_key"
                           ? initialFocus.key

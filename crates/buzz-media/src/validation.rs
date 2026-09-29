@@ -56,7 +56,9 @@ pub(crate) fn looks_like_mp4_iso_bmff(bytes: &[u8]) -> bool {
     let major = payload[..4].try_into().ok();
     major.is_some_and(|brand| MP4_BRANDS.contains(&brand))
         || payload[8..]
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .any(|brand| MP4_BRANDS.iter().any(|candidate| brand == candidate))
 }
 

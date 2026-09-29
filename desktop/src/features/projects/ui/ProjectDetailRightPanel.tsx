@@ -1,7 +1,9 @@
 import type * as React from "react";
 
+import { useChannelsQuery } from "@/features/channels/hooks";
 import { normalizeRelayUrl } from "@/features/communities/communityStorage";
 import { useCommunities } from "@/features/communities/useCommunities";
+import { resolveMemberProjectHomeChannel } from "@/features/projects/lib/projectHomeChannel";
 import { useIdentityQuery } from "@/shared/api/hooks";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 import type { ProjectDetailAgentContext } from "@/features/projects/lib/projectDetailAgentContext";
@@ -27,6 +29,7 @@ export function ProjectDetailRightPanel({
 }) {
   const { activeCommunity } = useCommunities();
   const identityQuery = useIdentityQuery();
+  const channelsQuery = useChannelsQuery();
   if (mode === "chat") {
     // Remount on community identity as well as repository address: the same
     // repo coordinate can exist in two communities, and retained panel state
@@ -37,12 +40,18 @@ export function ProjectDetailRightPanel({
     const signerScope = identityQuery.data?.pubkey
       ? normalizePubkey(identityQuery.data.pubkey)
       : "";
+    const homeChannel = resolveMemberProjectHomeChannel(
+      repositoryProps.project,
+      repositoryProps.projects,
+      channelsQuery.data ?? [],
+    );
     return (
       <ProjectAgentChatPanel
         canResetWidth={repositoryProps.canResetWidth}
         constrainToAvailableSpace={false}
         context={context}
-        key={`${relayScope}:${signerScope}:${context.repoAddress}`}
+        homeChannel={homeChannel}
+        key={`${relayScope}:${signerScope}:${context.repoAddress}:${homeChannel?.id ?? ""}`}
         onClose={onClose}
         onResetWidth={repositoryProps.onResetWidth}
         onResizeStart={repositoryProps.onResizeStart}

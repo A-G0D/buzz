@@ -1,0 +1,190 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Buzz skill-use evaluation receipt v1",
+  "description": "A structure-only receipt for the pinned synthetic 8 × 3 evaluation plan. It does not establish score correctness or skill efficacy.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "claim_boundary",
+    "fixture",
+    "config",
+    "config_sha256",
+    "model_provider_identity",
+    "cells"
+  ],
+  "properties": {
+    "schema_version": { "const": "buzz-skill-use-report-v1" },
+    "claim_boundary": {
+      "const": "Structure and provenance validation only; no verification of score correctness or skill efficacy."
+    },
+    "fixture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "payload_sha256"],
+      "properties": {
+        "schema_version": { "const": "buzz-skill-use-eval-v1" },
+        "payload_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "config": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "config_id",
+        "route_profile_id",
+        "base_prompt_sha256",
+        "toolset_sha256",
+        "generation_settings_sha256",
+        "verifier_id",
+        "verifier_version"
+      ],
+      "properties": {
+        "config_id": { "$ref": "#/$defs/nonempty" },
+        "route_profile_id": { "$ref": "#/$defs/nonempty" },
+        "base_prompt_sha256": { "$ref": "#/$defs/sha256" },
+        "toolset_sha256": { "$ref": "#/$defs/sha256" },
+        "generation_settings_sha256": { "$ref": "#/$defs/sha256" },
+        "verifier_id": { "$ref": "#/$defs/nonempty" },
+        "verifier_version": { "$ref": "#/$defs/nonempty" }
+      }
+    },
+    "config_sha256": { "$ref": "#/$defs/sha256" },
+    "model_provider_identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["self_reported", "observed"],
+      "properties": {
+        "self_reported": { "$ref": "#/$defs/identity_record" },
+        "observed": { "$ref": "#/$defs/identity_record" }
+      }
+    },
+    "cells": {
+      "type": "array",
+      "minItems": 24,
+      "maxItems": 24,
+      "items": { "$ref": "#/$defs/cell" }
+    }
+  },
+  "$defs": {
+    "nonempty": { "type": "string", "minLength": 1, "pattern": "\\S" },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "skillId": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" },
+    "identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "model", "revision"],
+      "properties": {
+        "provider": { "type": ["string", "null"], "minLength": 1 },
+        "model": { "type": ["string", "null"], "minLength": 1 },
+        "revision": { "type": ["string", "null"], "minLength": 1 }
+      }
+    },
+    "identity_record": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["value", "source_ref", "unavailable_reason"],
+      "properties": {
+        "value": { "oneOf": [{ "$ref": "#/$defs/identity" }, { "type": "null" }] },
+        "source_ref": { "type": ["string", "null"], "minLength": 1 },
+        "unavailable_reason": { "type": ["string", "null"], "minLength": 1 }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "value": { "type": "null" } }, "required": ["value"] },
+          "then": { "properties": { "source_ref": { "type": "null" }, "unavailable_reason": { "$ref": "#/$defs/nonempty" } } },
+          "else": { "properties": { "source_ref": { "$ref": "#/$defs/nonempty" }, "unavailable_reason": { "type": "null" } } }
+        }
+      ]
+    },
+    "measurement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["value", "evidence_ref", "unavailable_reason"],
+      "properties": {
+        "value": {},
+        "evidence_ref": { "type": ["string", "null"], "minLength": 1 },
+        "unavailable_reason": { "type": ["string", "null"], "minLength": 1 }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "value": { "type": "null" } }, "required": ["value"] },
+          "then": { "properties": { "evidence_ref": { "type": "null" }, "unavailable_reason": { "$ref": "#/$defs/nonempty" } } },
+          "else": { "properties": { "evidence_ref": { "$ref": "#/$defs/nonempty" }, "unavailable_reason": { "type": "null" } } }
+        }
+      ]
+    },
+    "cell": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["case_id", "condition", "config_sha256", "route", "answer", "verifier_status", "telemetry"],
+      "properties": {
+        "case_id": { "$ref": "#/$defs/nonempty" },
+        "condition": { "enum": ["no_skill", "focused_skill", "small_pack"] },
+        "config_sha256": { "$ref": "#/$defs/sha256" },
+        "route": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["route_action", "selected_skill_ids", "review_subject_ids", "target_skill_ids", "ingest_decision"],
+          "properties": {
+            "route_action": { "enum": ["none", "use_existing", "propose_create", "propose_merge", "propose_split", "defer_review", "import_approved"] },
+            "selected_skill_ids": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/skillId" } },
+            "review_subject_ids": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/skillId" } },
+            "target_skill_ids": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/skillId" } },
+            "ingest_decision": { "type": "boolean" }
+          }
+        },
+        "answer": { "$ref": "#/$defs/nonempty" },
+        "verifier_status": {
+          "allOf": [
+            { "$ref": "#/$defs/measurement" },
+            { "properties": { "value": { "enum": ["pass", "fail", null] } } }
+          ]
+        },
+        "telemetry": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["opened_skill_ids", "performed_import_ids", "added_context_tokens", "latency_ms", "cost_microusd", "tool_calls"],
+          "properties": {
+            "opened_skill_ids": {
+              "allOf": [
+                { "$ref": "#/$defs/measurement" },
+                { "properties": { "value": { "oneOf": [{ "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/skillId" } }, { "type": "null" }] } } }
+              ]
+            },
+            "performed_import_ids": {
+              "allOf": [
+                { "$ref": "#/$defs/measurement" },
+                { "properties": { "value": { "oneOf": [{ "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/skillId" } }, { "type": "null" }] } } }
+              ]
+            },
+            "added_context_tokens": {
+              "allOf": [
+                { "$ref": "#/$defs/measurement" },
+                { "properties": { "value": { "type": ["integer", "null"], "minimum": 0 } } }
+              ]
+            },
+            "latency_ms": {
+              "allOf": [
+                { "$ref": "#/$defs/measurement" },
+                { "properties": { "value": { "type": ["integer", "null"], "minimum": 0 } } }
+              ]
+            },
+            "cost_microusd": {
+              "allOf": [
+                { "$ref": "#/$defs/measurement" },
+                { "properties": { "value": { "type": ["integer", "null"], "minimum": 0 } } }
+              ]
+            },
+            "tool_calls": {
+              "allOf": [
+                { "$ref": "#/$defs/measurement" },
+                { "properties": { "value": { "type": ["integer", "null"], "minimum": 0 } } }
+              ]
+            }
+          }
+        }
+      }
+    }
+  }
+}

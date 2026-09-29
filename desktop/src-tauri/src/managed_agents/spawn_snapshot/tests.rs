@@ -21,6 +21,7 @@ fn snapshot_with_policy(
         global,
         enforced_owner_only,
     )
+    .expect("prospective prompt profile resolution succeeds")
     .canonical()
 }
 
@@ -100,6 +101,7 @@ fn record() -> ManagedAgentRecord {
         definition_parallelism: None,
         relay_mesh: None,
         effort_level: None,
+        execution_profile: None,
     }
 }
 

@@ -162,8 +162,10 @@ pub fn run() {
                     #[cfg(target_os = "macos")]
                     {
                         set_initial_window_backing(&window);
+                        let webview = webview.clone();
 
-                        let (initial_render_tx, initial_render_rx) = tokio::sync::oneshot::channel();
+                        let (initial_render_tx, mut initial_render_rx) =
+                            tokio::sync::oneshot::channel();
                         window
                             .app_handle()
                             .once(INITIAL_RENDER_READY_EVENT, move |_| {
@@ -173,20 +175,49 @@ pub fn run() {
                         tauri::async_runtime::spawn(async move {
                             wait_for_stable_initial_window_geometry(&window).await;
 
-                            if tokio::time::timeout(
-                                std::time::Duration::from_secs(5),
-                                initial_render_rx,
-                            )
-                            .await
-                            .is_err()
-                            {
+                            let initial_render_ready = matches!(
+                                tokio::time::timeout(
+                                    std::time::Duration::from_secs(5),
+                                    &mut initial_render_rx,
+                                )
+                                .await,
+                                Ok(Ok(()))
+                            );
+
+                            if !initial_render_ready {
                                 eprintln!(
-                                    "buzz-desktop: initial render did not commit before reveal timeout"
+                                    "buzz-desktop: initial render did not commit before reveal timeout; showing recovery screen"
                                 );
+                                if let Err(error) = webview.eval(&format!(
+                                    "window.__buzzStartupRecoveryAction = 'install';\n{INITIAL_RENDER_RECOVERY_SCRIPT}"
+                                )) {
+                                    eprintln!(
+                                        "buzz-desktop: failed to show startup recovery screen: {error}"
+                                    );
+                                }
                             }
 
                             reveal_initial_window(&window);
                             clear_initial_window_backing(&window).await;
+
+                            if !initial_render_ready
+                                && matches!(
+                                    tokio::time::timeout(
+                                        std::time::Duration::from_secs(60),
+                                        &mut initial_render_rx,
+                                    )
+                                    .await,
+                                    Ok(Ok(()))
+                                )
+                            {
+                                if let Err(error) = webview.eval(&format!(
+                                    "window.__buzzStartupRecoveryAction = 'remove';\n{INITIAL_RENDER_RECOVERY_SCRIPT}"
+                                )) {
+                                    eprintln!(
+                                        "buzz-desktop: failed to clear late startup recovery screen: {error}"
+                                    );
+                                }
+                            }
                         });
                     }
 
@@ -656,6 +687,25 @@ pub fn run() {
             get_forum_posts,
             get_forum_thread,
             get_thread_replies,
+            get_thread_brief,
+            create_goal_run_from_message,
+            append_goal_plan,
+            list_goal_runs_for_channel,
+            get_goal_run,
+            start_goal_task,
+            bind_goal_task_assignment,
+            ingest_goal_task_report,
+            accept_goal_task,
+            select_goal_coordinator,
+            select_goal_coordinators,
+            get_project_coordinator_runs,
+            get_recent_critic_rounds,
+            get_critic_round,
+            preview_critic_route_profile,
+            test_agent_route_candidate,
+            preview_critic_coordinator_guide,
+            run_critic_round,
+            cancel_critic_round,
             get_channel_reconnect_repair,
             get_channel_window,
             get_channel_messages_before,
@@ -702,6 +752,7 @@ pub fn run() {
             resolve_oa_owner,
             list_relay_agents,
             revalidate_relay_agents,
+            list_agent_archetypes,
             list_managed_agents,
             list_managed_agent_runtimes,
             start_managed_agent_runtime,
@@ -727,6 +778,9 @@ pub fn run() {
             put_agent_session_config,
             get_global_agent_config,
             set_global_agent_config,
+            get_global_agent_resource_policy,
+            get_device_memory_snapshot,
+            set_global_agent_resource_policy,
             mesh_start_node,
             mesh_stop_node,
             mesh_node_status,
@@ -736,6 +790,24 @@ pub fn run() {
             update_managed_agent,
             discover_acp_commands,
             discover_backend_providers,
+            list_agent_skills,
+            read_agent_skill,
+            save_agent_skill,
+            export_agent_skill_pack,
+            preview_agent_skill_pack,
+            install_agent_skill_pack,
+            list_agent_prompt_profiles,
+            read_agent_prompt_profile,
+            save_agent_prompt_profile,
+            list_agent_route_profiles,
+            read_agent_route_profile,
+            list_agent_route_throughput_summaries,
+            save_agent_route_profile,
+            preview_agent_task_fit_report,
+            import_agent_task_fit_report,
+            attest_agent_task_fit_report,
+            attest_agent_task_fit_report_for_route,
+            list_agent_task_fit_reports,
             probe_backend_provider,
             persona_catalog::fetch_persona_catalog,
             team_catalog::fetch_team_catalog,

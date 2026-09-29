@@ -1,5 +1,5 @@
 import * as React from "react";
-import { ArrowDown } from "lucide-react";
+import { ArrowDown, LoaderCircle, ScanSearch } from "lucide-react";
 
 import { HuddleTranscriptIntro } from "@/features/huddle/components/HuddleTranscriptIntro";
 import {
@@ -51,6 +51,12 @@ import { useStableSendToChannel } from "./useStableSendToChannel";
 import { useAnchoredScroll } from "./useAnchoredScroll";
 import { selectDeferredListRenderState } from "@/features/messages/lib/timelineSnapshot";
 import { selectThreadRowHighlight } from "@/features/messages/lib/threadReplyHighlight";
+import { buildThreadCriticSnapshot } from "@/features/messages/lib/threadCriticSnapshot";
+import { AgentCriticRunDialog } from "@/features/agents/ui/AgentCriticRunDialog";
+import { parseCriticTriggerIntent } from "@/features/agents/ui/criticTriggerIntent";
+import { getThreadBrief } from "@/shared/api/tauri";
+
+export const THREAD_BRIEF_LOAD_TIMEOUT_MS = 8_000;
 
 type MessageThreadPanelProps = ThreadPanelLayoutProps & {
   channel: Channel | null;
@@ -95,6 +101,7 @@ type MessageThreadPanelProps = ThreadPanelLayoutProps & {
       threadHeadId: string | null;
     } | null,
     forceRest?: boolean,
+    taskClass?: string | null,
   ) => Promise<void>;
   onSendToChannel?: (
     message: TimelineMessage,
@@ -221,6 +228,16 @@ export function MessageThreadPanel({
   const [collapsedThreadHeadId, setCollapsedThreadHeadId] = React.useState<
     string | null
   >(null);
+  const [isCriticRunOpen, setIsCriticRunOpen] = React.useState(false);
+  const [criticThreadContext, setCriticThreadContext] = React.useState<{
+    disclosure: string;
+    snapshot: string;
+    sourceIds: string[];
+  } | null>(null);
+  const [criticBriefLoadingRequestId, setCriticBriefLoadingRequestId] =
+    React.useState<number | null>(null);
+  const criticBriefRequestId = React.useRef(0);
+  const criticReviewTarget = React.useRef<string | null>(null);
   const isOverlay = useIsThreadPanelOverlay();
   const threadHeadId = threadHead?.id ?? null;
   useEscapeKey(
@@ -296,6 +313,91 @@ export function MessageThreadPanel({
     EMPTY_THREAD_REPLIES,
   );
   const isRepliesPending = deferredThreadReplies !== threadReplies;
+  const isCriticBriefLoading =
+    criticBriefLoadingRequestId !== null &&
+    criticBriefLoadingRequestId === criticBriefRequestId.current;
+  React.useEffect(() => {
+    const target = JSON.stringify([channelId, threadHeadId]);
+    if (criticReviewTarget.current !== target) {
+      criticReviewTarget.current = target;
+      criticBriefRequestId.current += 1;
+    }
+    return () => {
+      criticBriefRequestId.current += 1;
+    };
+  }, [channelId, threadHeadId]);
+  const openThreadReview = React.useCallback(async () => {
+    if (!threadHead || isHuddleTranscript || isCriticBriefLoading) return;
+    const requestId = ++criticBriefRequestId.current;
+    setCriticBriefLoadingRequestId(requestId);
+    let brief = null;
+    let briefError = false;
+    if (channelId) {
+      let briefTimeoutId: ReturnType<typeof setTimeout> | null = null;
+      try {
+        const result = await Promise.race([
+          getThreadBrief(threadHead.id, channelId, { limit: 30 }),
+          new Promise<never>((_, reject) => {
+            briefTimeoutId = setTimeout(
+              () => reject(new Error("Thread brief lookup timed out")),
+              THREAD_BRIEF_LOAD_TIMEOUT_MS,
+            );
+          }),
+        ]);
+        if (
+          result.thread_root_id.toLowerCase() === threadHead.id.toLowerCase()
+        ) {
+          brief = result;
+        } else {
+          briefError = true;
+        }
+      } catch {
+        briefError = true;
+      } finally {
+        if (briefTimeoutId !== null) clearTimeout(briefTimeoutId);
+      }
+    } else {
+      briefError = true;
+    }
+    if (requestId !== criticBriefRequestId.current) return;
+    setCriticThreadContext(
+      buildThreadCriticSnapshot({
+        head: threadHead,
+        replies: threadReplies,
+        repliesPending: threadRepliesPending || isRepliesPending,
+        repliesError: threadRepliesError,
+        brief,
+        briefError,
+      }),
+    );
+    setIsCriticRunOpen(true);
+    setCriticBriefLoadingRequestId(null);
+  }, [
+    channelId,
+    isCriticBriefLoading,
+    isHuddleTranscript,
+    isRepliesPending,
+    threadHead,
+    threadReplies,
+    threadRepliesError,
+    threadRepliesPending,
+  ]);
+  const consumeThreadReviewCommand = React.useCallback(
+    (draft: string) => {
+      const intent = parseCriticTriggerIntent(draft);
+      if (
+        intent.status !== "recognized" ||
+        !threadHead ||
+        !channelId ||
+        isHuddleTranscript
+      ) {
+        return false;
+      }
+      void openThreadReview();
+      return true;
+    },
+    [channelId, isHuddleTranscript, openThreadReview, threadHead],
+  );
   const scrollTargetIsVisibleReply = React.useMemo(
     () =>
       scrollTargetId !== null &&
@@ -853,9 +955,11 @@ export function MessageThreadPanel({
               onCancelEdit={onCancelEdit}
               onCancelReply={composerReplyTarget ? onCancelReply : undefined}
               onCaptureSendContext={onCaptureSendContext}
+              onConsumeSubmit={consumeThreadReviewCommand}
               onEditLastOwnMessage={onEditLastOwnMessage}
               onEditSave={onEditSave}
               onSend={onSend}
+              showTaskClassPicker
               placeholder={
                 isHuddleTranscript
                   ? "Message the huddle"
@@ -911,6 +1015,39 @@ export function MessageThreadPanel({
               headerLeading={headerLeading}
               headerTitle={headerTitle}
               headerTitleAriaLabel={headerTitleAriaLabel}
+              headerTrailing={
+                !isHuddleTranscript ? (
+                  <Button
+                    aria-busy={isCriticBriefLoading}
+                    aria-label={
+                      isCriticBriefLoading
+                        ? "Loading thread review context"
+                        : "Review this thread"
+                    }
+                    className="mr-1"
+                    data-testid="message-thread-review"
+                    disabled={isCriticBriefLoading}
+                    onClick={openThreadReview}
+                    size="icon"
+                    title={
+                      isCriticBriefLoading
+                        ? "Loading source-linked thread context"
+                        : "Review this thread"
+                    }
+                    type="button"
+                    variant="ghost"
+                  >
+                    {isCriticBriefLoading ? (
+                      <LoaderCircle
+                        aria-hidden="true"
+                        className="animate-spin"
+                      />
+                    ) : (
+                      <ScanSearch aria-hidden="true" />
+                    )}
+                  </Button>
+                ) : null
+              }
               isFocusMode={isFocusMode}
               isSinglePanelView={isSinglePanelView}
               onClose={onClose}
@@ -931,6 +1068,14 @@ export function MessageThreadPanel({
       >
         {threadScrollRegion}
       </AuxiliaryPanel>
+      <AgentCriticRunDialog
+        onOpenChange={(open) => {
+          setIsCriticRunOpen(open);
+          if (!open) setCriticThreadContext(null);
+        }}
+        open={isCriticRunOpen}
+        threadContext={criticThreadContext}
+      />
     </VideoReviewNavigationProvider>
   );
 }

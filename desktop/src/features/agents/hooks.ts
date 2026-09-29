@@ -37,6 +37,7 @@ import {
   installAcpRuntime,
   invokeTauri,
   listManagedAgents,
+  listAgentArchetypes,
   listRelayAgents,
   saveCustomHarness,
   updateManagedAgent,
@@ -72,6 +73,7 @@ import {
 import { teamsQueryKey } from "@/features/agents/teamHooks";
 import type {
   AcpRuntime,
+  AgentArchetypeInfo,
   AgentPersona,
   Channel,
   CreateManagedAgentInput,
@@ -137,6 +139,7 @@ export const managedAgentsQueryKey = ["managed-agents"] as const;
 export const personasQueryKey = ["personas"] as const;
 export const acpAuthMethodsQueryKey = ["acp-auth-methods"] as const;
 export const managedAgentPrereqsQueryKey = ["managed-agent-prereqs"] as const;
+export const agentArchetypesQueryKey = ["agent-archetypes"] as const;
 export const acpCommandsQueryKey = ["acp-commands"] as const;
 export const backendProvidersQueryKey = ["backend-providers"] as const;
 export const gitBashPrerequisiteQueryKey = ["git-bash-prerequisite"] as const;
@@ -416,6 +419,14 @@ export function useManagedAgentsQuery(options?: { enabled?: boolean }) {
         : false;
     },
     ...agentsFocusRefetchPolicy,
+  });
+}
+
+export function useAgentArchetypesQuery() {
+  return useQuery<AgentArchetypeInfo[]>({
+    queryKey: agentArchetypesQueryKey,
+    queryFn: listAgentArchetypes,
+    staleTime: Number.POSITIVE_INFINITY,
   });
 }
 

@@ -6,6 +6,8 @@ mod git_runtime_tests;
 
 mod acp;
 mod config;
+mod critic_round;
+mod critic_worker;
 mod engram_fetch;
 mod filter;
 mod isolated_execution;
@@ -16,11 +18,13 @@ mod prompt_framing;
 mod prompt_project;
 mod queue;
 mod relay;
+mod run_journal;
 mod run_task;
 mod runtime;
 use runtime::{AgentRuntime, PoolStartup, SessionMode};
 mod scope;
 mod setup_mode;
+mod task_class;
 mod usage;
 
 pub use usage::TurnUsage;
@@ -2069,6 +2073,7 @@ struct SteerAckEvent {
     /// Session scope of the steered event — the queue-side withhold/release
     /// and deadline extension target this, not the whole channel.
     scope: scope::SessionScope,
+    turn_id: String,
     event_id: String,
     /// `Ok` if the read loop sent any of the locked `SteerAck` variants.
     /// `Err` if the oneshot was dropped without a send — should not happen
@@ -2461,6 +2466,20 @@ pub fn run() -> Result<()> {
         Some("git-credential-nostr") => std::process::exit(git_credential_nostr::run()),
         Some("git-sign-nostr") => std::process::exit(git_sign_nostr::run()),
         _ => {}
+    }
+    if is_subcommand("critic-worker") {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        runtime.block_on(critic_worker::run_from_stdio())?;
+        return Ok(());
+    }
+    if is_subcommand("critic-round") {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        runtime.block_on(critic_round::run_from_stdio())?;
+        return Ok(());
     }
     config::propagate_legacy_env_vars();
     if is_subcommand("run") {
@@ -3818,9 +3837,11 @@ async fn run_harness(
             Some(PoolEvent::SteerAck(SteerAckEvent {
                 channel_id,
                 scope,
+                turn_id,
                 event_id,
                 ack,
             })) => {
+                run_journal::record_steer_outcome(&turn_id, &event_id, journal_steer_outcome(&ack));
                 // Mid-turn steer attempt resolved (either transport:
                 // `_goose/unstable/session/steer` or `_session/steering`).
                 // Locked semantics (Eva + Max + Perci, unanimous on Option X):
@@ -4314,6 +4335,14 @@ fn try_native_steer(
     steer_ack_tx: &mpsc::UnboundedSender<SteerAckEvent>,
 ) -> bool {
     let channel_id = scope.channel_id();
+    let Some(turn_id) = pool
+        .task_map()
+        .values()
+        .find(|meta| meta.scope.as_ref() == Some(&scope))
+        .map(|meta| meta.turn_id.clone())
+    else {
+        return false;
+    };
     // Build the steer body: framing strings come from
     // `queue::native_steer_framing()` (Eva's drift-proof requirement —
     // native and cancel+merge fallback share these so the agent gets the
@@ -4351,6 +4380,7 @@ fn try_native_steer(
 
     match pool.send_steer(&scope, request) {
         Ok(()) => {
+            run_journal::record_steer_submitted(&turn_id, &event_id_hex);
             // Withhold the queued event synchronously BEFORE spawning
             // the watcher: this closes the race where `mark_complete`
             // clears `in_flight_channels` and a stray `flush_next` could
@@ -4380,6 +4410,7 @@ fn try_native_steer(
                 let _ = ack_tx_clone.send(SteerAckEvent {
                     channel_id,
                     scope: scope_for_watcher,
+                    turn_id,
                     event_id: event_id_for_watcher,
                     ack,
                 });
@@ -4394,6 +4425,63 @@ fn try_native_steer(
             );
             false
         }
+    }
+}
+
+fn journal_steer_outcome(
+    ack: &std::result::Result<pool::SteerAck, tokio::sync::oneshot::error::RecvError>,
+) -> buzz_run_journal::SteerOutcome {
+    use buzz_run_journal::SteerOutcome;
+    match ack {
+        Ok(pool::SteerAck::Success { .. }) => SteerOutcome::AdapterAcknowledged,
+        Ok(pool::SteerAck::Err(pool::SteerError::AgentError { .. })) => {
+            SteerOutcome::AdapterRejected
+        }
+        Ok(pool::SteerAck::Err(
+            pool::SteerError::ExpectedRunIdMissing
+            | pool::SteerError::OutcomeRejected { .. }
+            | pool::SteerError::PromptCompleted,
+        )) => SteerOutcome::AttemptFailed,
+        Ok(pool::SteerAck::Err(pool::SteerError::Transport(_)))
+        | Ok(pool::SteerAck::PromptCompletedNeutral)
+        | Err(_) => SteerOutcome::DeliveryUnknown,
+    }
+}
+
+#[cfg(test)]
+mod journal_steer_outcome_tests {
+    use super::*;
+
+    #[test]
+    fn journal_outcomes_keep_ack_rejection_failure_and_uncertainty_distinct() {
+        use buzz_run_journal::SteerOutcome;
+        use pool::{SteerAck, SteerError};
+
+        assert_eq!(
+            journal_steer_outcome(&Ok(SteerAck::Success {
+                session_id: "session".into(),
+            })),
+            SteerOutcome::AdapterAcknowledged
+        );
+        assert_eq!(
+            journal_steer_outcome(&Ok(SteerAck::Err(SteerError::AgentError {
+                code: -32601,
+                message: "unsupported".into(),
+            }))),
+            SteerOutcome::AdapterRejected
+        );
+        assert_eq!(
+            journal_steer_outcome(&Ok(SteerAck::Err(SteerError::ExpectedRunIdMissing))),
+            SteerOutcome::AttemptFailed
+        );
+        assert_eq!(
+            journal_steer_outcome(&Ok(SteerAck::Err(SteerError::Transport("closed".into())))),
+            SteerOutcome::DeliveryUnknown
+        );
+        assert_eq!(
+            journal_steer_outcome(&Ok(SteerAck::PromptCompletedNeutral)),
+            SteerOutcome::DeliveryUnknown
+        );
     }
 }
 
@@ -4544,6 +4632,51 @@ fn dispatch_pending(
         let (control_tx, control_rx) = tokio::sync::oneshot::channel::<ControlSignal>();
         let turn_id = Uuid::new_v4().to_string();
         let task_turn_id = turn_id.clone();
+
+        let (session_scope, thread_root_event_id) = match &batch.scope {
+            scope::SessionScope::Conversation { .. } => ("conversation", None),
+            scope::SessionScope::Thread { root_event_id, .. } => {
+                ("thread", Some(root_event_id.clone()))
+            }
+        };
+        run_journal::record_started(buzz_run_journal::StartRecord {
+            turn_id: turn_id.clone(),
+            managed_worker_generation_nonce: None,
+            adapter_child_generation_id: Some(agent.acp.child_generation_id().to_string()),
+            channel_id: Some(batch.channel_id.to_string()),
+            session_scope: session_scope.into(),
+            thread_root_event_id,
+            batch_trigger_event_ids: batch
+                .events
+                .iter()
+                .map(|event| event.event.id.to_hex())
+                .collect(),
+            merged_cancelled_event_ids: batch
+                .cancelled_events
+                .iter()
+                .map(|event| event.event.id.to_hex())
+                .collect(),
+            agent_index: u32::try_from(agent_index).unwrap_or(u32::MAX),
+            configured_worker_pool_slots: ctx.configured_worker_pool_slots,
+            idle_timeout_secs: ctx.idle_timeout.as_secs(),
+            max_turn_duration_secs: ctx.max_turn_duration.as_secs(),
+            agent_profile: buzz_run_journal::AgentProfileSnapshot {
+                harness_id: ctx.harness_name.clone(),
+                provider_id: ctx.provider_id.clone(),
+                model_id: ctx.model_id.clone(),
+                agent_prompt_sha256: buzz_run_journal::agent_prompt_fingerprint(
+                    ctx.system_prompt.as_deref(),
+                ),
+                execution_profile_id: ctx.execution_profile_id.clone(),
+                execution_profile_version: ctx.execution_profile_version,
+                prompt_profile_id: ctx.prompt_profile_id.clone(),
+                prompt_profile_version: ctx.prompt_profile_version,
+                prompt_profile_hash: ctx.prompt_profile_hash.clone(),
+                route_profile_id: ctx.route_profile_id.clone(),
+                route_profile_version: ctx.route_profile_version,
+                route_profile_hash: ctx.route_profile_hash.clone(),
+            },
+        });
 
         // Assign ownership before moving the worker into the task. If this is
         // a bounded-hold fork, the new generation immediately invalidates the
@@ -5087,6 +5220,10 @@ fn recover_panicked_agent(
         return;
     };
     let i = meta.agent_index;
+
+    if meta.channel_id.is_some() {
+        run_journal::record_worker_crashed(&meta.turn_id);
+    }
 
     // Requeue BEFORE mark_complete (same rationale as handle_prompt_result).
     if let Some(batch) = meta.recoverable_batch {
@@ -5862,11 +5999,18 @@ async fn run_models(args: ModelsArgs) -> Result<()> {
     Ok(())
 }
 
-fn build_mcp_servers(config: &Config) -> Vec<McpServer> {
-    if config.mcp_command.is_empty() {
-        return vec![];
+fn build_mcp_servers(config: &Config) -> Result<Vec<McpServer>> {
+    if config.review_only {
+        ensure!(
+            config::normalize_agent_command_identity(&config.agent_command) == "buzz-agent",
+            "review-only mode is supported only by the direct Buzz Agent API runtime"
+        );
+        return Ok(vec![]);
     }
-    vec![McpServer {
+    if config.mcp_command.is_empty() {
+        return Ok(vec![]);
+    }
+    Ok(vec![McpServer {
         name: std::path::Path::new(&config.mcp_command)
             .file_stem()
             .and_then(|s| s.to_str())
@@ -5892,6 +6036,17 @@ fn build_mcp_servers(config: &Config) -> Vec<McpServer> {
                         .expect("secret key bech32 encoding should never fail"),
                 },
             ];
+            // The thread-brief MCP tool must read the same local attempt
+            // journal as ACP. Desktop uses this to keep dev/prod nests apart;
+            // forwarding the exact path avoids silently querying ~/.buzz.
+            if let Ok(nest_dir) = std::env::var("BUZZ_NEST_DIR") {
+                if !nest_dir.is_empty() {
+                    env.push(EnvVar {
+                        name: "BUZZ_NEST_DIR".into(),
+                        value: nest_dir,
+                    });
+                }
+            }
             // Forward BUZZ_AUTH_TAG (NIP-OA owner attestation credential)
             // so the MCP server can attach it to every signed event.
             if let Ok(auth_tag) = std::env::var("BUZZ_AUTH_TAG") {
@@ -5900,6 +6055,19 @@ fn build_mcp_servers(config: &Config) -> Vec<McpServer> {
                         name: "BUZZ_AUTH_TAG".into(),
                         value: auth_tag,
                     });
+                }
+            }
+            // Only the bundled developer MCP implements `run_critics` and
+            // needs the caller's pinned route rates to enforce its optional
+            // aggregate budget. Never pass profile data to arbitrary MCPs.
+            if is_buzz_dev_mcp_command(&config.mcp_command) {
+                if let Ok(route_profile) = std::env::var("BUZZ_AGENT_ROUTE_PROFILE_JSON") {
+                    if !route_profile.trim().is_empty() {
+                        env.push(EnvVar {
+                            name: "BUZZ_AGENT_ROUTE_PROFILE_JSON".into(),
+                            value: route_profile,
+                        });
+                    }
                 }
             }
             // Preserve the display-name contract for tools. Git authorship is
@@ -5923,7 +6091,14 @@ fn build_mcp_servers(config: &Config) -> Vec<McpServer> {
             }
             env
         },
-    }]
+    }])
+}
+
+fn is_buzz_dev_mcp_command(command: &str) -> bool {
+    std::path::Path::new(command)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| stem.eq_ignore_ascii_case("buzz-dev-mcp"))
 }
 
 #[cfg(test)]
@@ -9137,6 +9312,7 @@ mod build_mcp_servers_tests {
             agent_command: "goose".into(),
             agent_args: vec!["acp".into()],
             mcp_command: "test-mcp-server".into(),
+            review_only: false,
             idle_timeout_secs: config::DEFAULT_IDLE_TIMEOUT_SECS,
             max_turn_duration_secs: config::DEFAULT_MAX_TURN_DURATION_SECS,
             agents: 1,
@@ -9161,6 +9337,15 @@ mod build_mcp_servers_tests {
             typing_enabled: true,
             memory_enabled: false,
             model: None,
+            provider: None,
+            execution_profile_id: None,
+            execution_profile_version: None,
+            prompt_profile_id: None,
+            prompt_profile_version: None,
+            prompt_profile_hash: None,
+            route_profile_id: None,
+            route_profile_version: None,
+            route_profile_hash: None,
             effort_level: None,
             session_title: None,
             permission_mode: config::PermissionMode::BypassPermissions,
@@ -9181,6 +9366,26 @@ mod build_mcp_servers_tests {
     }
 
     #[test]
+    fn review_only_mode_removes_mcp_tools_for_direct_buzz_agent() {
+        let mut config = test_config();
+        config.agent_command = "buzz-agent".into();
+        config.review_only = true;
+        let servers = build_mcp_servers(&config).unwrap();
+
+        assert!(servers.is_empty());
+    }
+
+    #[test]
+    fn review_only_mode_rejects_harnesses_with_uncontrolled_native_tools() {
+        let mut config = test_config();
+        config.review_only = true;
+        let error = build_mcp_servers(&config).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("supported only by the direct Buzz Agent API runtime"));
+    }
+
+    #[test]
     fn session_new_forwards_complete_git_block_without_duplicate_names() {
         let mut config = test_config();
         let git = git::GitEnvironment::install(
@@ -9190,7 +9395,7 @@ mod build_mcp_servers_tests {
         )
         .unwrap();
         config.persona_env_vars.extend(git.env.iter().cloned());
-        let servers = build_mcp_servers(&config);
+        let servers = build_mcp_servers(&config).unwrap();
         let env = &servers[0].env;
         for (name, value) in &git.env {
             let entries: Vec<_> = env.iter().filter(|entry| entry.name == *name).collect();
@@ -9221,7 +9426,7 @@ mod build_mcp_servers_tests {
     #[test]
     fn session_new_mcp_server_has_required_fields() {
         let config = test_config();
-        let servers = build_mcp_servers(&config);
+        let servers = build_mcp_servers(&config).unwrap();
         assert_eq!(servers.len(), 1);
         let server = &servers[0];
         assert_eq!(server.name, "test-mcp-server");
@@ -9238,11 +9443,30 @@ mod build_mcp_servers_tests {
     }
 
     #[test]
+    fn session_new_mcp_server_uses_the_acp_local_journal_scope() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let previous = std::env::var_os("BUZZ_NEST_DIR");
+        std::env::set_var("BUZZ_NEST_DIR", "/tmp/buzz-test-nest");
+        let servers = build_mcp_servers(&test_config()).unwrap();
+        match previous {
+            Some(value) => std::env::set_var("BUZZ_NEST_DIR", value),
+            None => std::env::remove_var("BUZZ_NEST_DIR"),
+        }
+
+        let nest_env = servers[0]
+            .env
+            .iter()
+            .find(|env| env.name == "BUZZ_NEST_DIR")
+            .expect("managed MCP receives the ACP journal root");
+        assert_eq!(nest_env.value, "/tmp/buzz-test-nest");
+    }
+
+    #[test]
     fn session_new_mcp_server_forwards_buzz_auth_tag() {
         let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("BUZZ_AUTH_TAG", "test-attestation-tag");
         let config = test_config();
-        let servers = build_mcp_servers(&config);
+        let servers = build_mcp_servers(&config).unwrap();
         std::env::remove_var("BUZZ_AUTH_TAG");
 
         let server = &servers[0];
@@ -9259,7 +9483,7 @@ mod build_mcp_servers_tests {
         let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("BUZZ_AUTH_TAG", "");
         let config = test_config();
-        let servers = build_mcp_servers(&config);
+        let servers = build_mcp_servers(&config).unwrap();
         std::env::remove_var("BUZZ_AUTH_TAG");
 
         let server = &servers[0];
@@ -9268,11 +9492,42 @@ mod build_mcp_servers_tests {
     }
 
     #[test]
+    fn session_new_forwards_route_profile_only_to_buzz_dev_mcp() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        const ROUTE_PROFILE: &str = "BUZZ_AGENT_ROUTE_PROFILE_JSON";
+        let previous = std::env::var_os(ROUTE_PROFILE);
+        let profile = r#"{"version":1,"profile_id":"local-test"}"#;
+        std::env::set_var(ROUTE_PROFILE, profile);
+
+        let mut config = test_config();
+        config.mcp_command = "buzz-dev-mcp".into();
+        let trusted_server = build_mcp_servers(&config).unwrap();
+        config.mcp_command = "custom-mcp-server".into();
+        let custom_server = build_mcp_servers(&config).unwrap();
+
+        match previous {
+            Some(value) => std::env::set_var(ROUTE_PROFILE, value),
+            None => std::env::remove_var(ROUTE_PROFILE),
+        }
+
+        let forwarded = trusted_server[0]
+            .env
+            .iter()
+            .find(|entry| entry.name == ROUTE_PROFILE)
+            .expect("Buzz developer MCP receives the Local route profile");
+        assert_eq!(forwarded.value, profile);
+        assert!(!custom_server[0]
+            .env
+            .iter()
+            .any(|entry| entry.name == ROUTE_PROFILE));
+    }
+
+    #[test]
     fn test_display_name_set_is_forwarded_to_mcp_server() {
         let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("BUZZ_ACP_DISPLAY_NAME", "Duncan");
         let config = test_config();
-        let servers = build_mcp_servers(&config);
+        let servers = build_mcp_servers(&config).unwrap();
         std::env::remove_var("BUZZ_ACP_DISPLAY_NAME");
 
         let entry = servers[0]
@@ -9291,7 +9546,7 @@ mod build_mcp_servers_tests {
         let _guard = ENV_LOCK.lock().unwrap();
         std::env::remove_var("BUZZ_ACP_DISPLAY_NAME");
         let config = test_config();
-        let servers = build_mcp_servers(&config);
+        let servers = build_mcp_servers(&config).unwrap();
 
         // Absent, not empty-valued: dev-mcp distinguishes the two and only
         // falls back to the npub when the key is missing or blank.
@@ -9309,7 +9564,7 @@ mod build_mcp_servers_tests {
         let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("BUZZ_ACP_DISPLAY_NAME", "");
         let config = test_config();
-        let servers = build_mcp_servers(&config);
+        let servers = build_mcp_servers(&config).unwrap();
         std::env::remove_var("BUZZ_ACP_DISPLAY_NAME");
 
         assert!(
@@ -9325,7 +9580,7 @@ mod build_mcp_servers_tests {
     fn empty_mcp_command_returns_no_servers() {
         let mut config = test_config();
         config.mcp_command = "".into();
-        let servers = build_mcp_servers(&config);
+        let servers = build_mcp_servers(&config).unwrap();
         assert!(
             servers.is_empty(),
             "empty mcp_command should produce no MCP servers"
@@ -9336,7 +9591,7 @@ mod build_mcp_servers_tests {
     fn absolute_path_mcp_command_uses_file_stem_as_name() {
         let mut config = test_config();
         config.mcp_command = "/opt/bin/my-mcp-server".into();
-        let servers = build_mcp_servers(&config);
+        let servers = build_mcp_servers(&config).unwrap();
         assert_eq!(servers.len(), 1);
         assert_eq!(servers[0].name, "my-mcp-server");
     }
@@ -9357,7 +9612,7 @@ mod build_mcp_servers_tests {
 
         // Confirm a non-empty command with no stem (e.g. just a dot) also falls back.
         config.mcp_command = ".".into();
-        let servers = build_mcp_servers(&config);
+        let servers = build_mcp_servers(&config).unwrap();
         assert_eq!(servers.len(), 1);
         assert_eq!(
             servers[0].name, "mcp",
@@ -9401,6 +9656,7 @@ mod error_outcome_emission_tests {
             agent_command: "true".into(),
             agent_args: vec![],
             mcp_command: "test-mcp-server".into(),
+            review_only: false,
             idle_timeout_secs: config::DEFAULT_IDLE_TIMEOUT_SECS,
             max_turn_duration_secs: config::DEFAULT_MAX_TURN_DURATION_SECS,
             agents: 1,
@@ -9425,6 +9681,15 @@ mod error_outcome_emission_tests {
             typing_enabled: true,
             memory_enabled: false,
             model: None,
+            provider: None,
+            execution_profile_id: None,
+            execution_profile_version: None,
+            prompt_profile_id: None,
+            prompt_profile_version: None,
+            prompt_profile_hash: None,
+            route_profile_id: None,
+            route_profile_version: None,
+            route_profile_hash: None,
             effort_level: None,
             session_title: None,
             permission_mode: config::PermissionMode::BypassPermissions,

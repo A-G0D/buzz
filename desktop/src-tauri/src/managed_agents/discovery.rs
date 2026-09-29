@@ -323,6 +323,7 @@ pub fn try_record_agent_command(
 fn default_agent_args(command: &str) -> Option<Vec<String>> {
     match normalize_command_identity(command).as_str() {
         "goose" => Some(vec!["acp".to_string()]),
+        "dsh" => Some(vec!["--profile".to_string(), "acp".to_string()]),
         "codex" | "codex-acp" | "claude-agent-acp" | "claude-code-acp" | "claude-code"
         | "claudecode" | "buzz-agent" => Some(Vec::new()),
         _ => None,
@@ -1047,6 +1048,8 @@ fn discover_acp_runtime_phase1(runtime: &'static KnownAcpRuntime, force: bool) -
             max_tokens_env_var: runtime.max_tokens_env_var.map(str::to_string),
             context_limit_env_var: runtime.context_limit_env_var.map(str::to_string),
             max_rounds_env_var: runtime.max_rounds_env_var.map(str::to_string),
+            summary_model_env_var: runtime.summary_model_env_var.map(str::to_string),
+            summary_max_tokens_env_var: runtime.summary_max_tokens_env_var.map(str::to_string),
             install_hint,
             install_instructions_url: install_instructions_url.to_string(),
             can_auto_install,
@@ -1187,6 +1190,8 @@ pub fn discover_acp_runtimes_from(
                 max_tokens_env_var: None,
                 context_limit_env_var: None,
                 max_rounds_env_var: None,
+                summary_model_env_var: None,
+                summary_max_tokens_env_var: None,
                 install_hint: def.install_hint.clone(),
                 install_instructions_url: def.install_instructions_url.clone(),
                 // Security line: custom definitions carry no install scripts.

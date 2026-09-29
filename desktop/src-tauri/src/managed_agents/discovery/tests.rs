@@ -93,6 +93,14 @@ fn normalizes_buzz_agent_args_to_empty() {
     );
 }
 
+#[test]
+fn dsh_defaults_to_acp_profile_args() {
+    assert_eq!(
+        normalize_agent_args("dsh", Vec::new()),
+        vec!["--profile", "acp"]
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn explicit_path_resolution_ignores_non_executable_files() {
@@ -269,6 +277,7 @@ fn record_with(
         definition_parallelism: None,
         relay_mesh: None,
         effort_level: None,
+        execution_profile: None,
     }
 }
 

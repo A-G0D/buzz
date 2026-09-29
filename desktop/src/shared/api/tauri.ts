@@ -12,6 +12,8 @@ import type {
   HomeFeedResponse,
   ManagedAgent,
   ManagedAgentBackend,
+  AgentArchetypeInfo,
+  AgentExecutionProfileSnapshot,
   RelayAgent,
   RelayMember,
   RelayMemberRole,
@@ -21,6 +23,9 @@ import type {
   SearchMessagesInput,
   SearchMessagesResponse,
   ThreadCursor,
+  ThreadBriefResponse,
+  ProjectCoordinatorRunsResponse,
+  ProjectCoordinatorRunCursor,
   ThreadRepliesResponse,
   CreateManagedAgentInput,
   AgentModelsResponse,
@@ -128,6 +133,7 @@ export type RawManagedAgent = {
   parallelism: number;
   session_policy?: ManagedAgent["sessionPolicy"];
   system_prompt: string | null;
+  execution_profile?: AgentExecutionProfileSnapshot | null;
   avatar_url?: string | null;
   model: string | null;
   model_source?: ManagedAgent["modelSource"];
@@ -183,6 +189,8 @@ export type RawAcpRuntimeCatalogEntry = {
   max_tokens_env_var?: string | null;
   context_limit_env_var?: string | null;
   max_rounds_env_var?: string | null;
+  summary_model_env_var?: string | null;
+  summary_max_tokens_env_var?: string | null;
   install_hint: string;
   install_instructions_url: string;
   can_auto_install: boolean;
@@ -474,6 +482,50 @@ export async function getThreadReplies(
   };
 }
 
+/** Get the CLI-compatible source-linked brief for one exact Buzz thread. */
+export async function getThreadBrief(
+  rootEventId: string,
+  channelId: string,
+  options?: {
+    limit?: number;
+    depthLimit?: number;
+    cursor?: ThreadCursor | null;
+  },
+): Promise<ThreadBriefResponse> {
+  return invokeTauri<ThreadBriefResponse>("get_thread_brief", {
+    rootEventId,
+    channelId,
+    limit: options?.limit ?? null,
+    depthLimit: options?.depthLimit ?? null,
+    cursor: options?.cursor
+      ? {
+          created_at: options.cursor.createdAt,
+          event_id: options.cursor.eventId,
+        }
+      : null,
+  });
+}
+
+/** Read current project-run candidates after relay identity/source validation. */
+export async function getProjectCoordinatorRuns(
+  projectCoordinate: string,
+  homeChannelId: string,
+  options?: {
+    limit?: number;
+    cursor?: ProjectCoordinatorRunCursor | null;
+  },
+): Promise<ProjectCoordinatorRunsResponse> {
+  return invokeTauri<ProjectCoordinatorRunsResponse>(
+    "get_project_coordinator_runs",
+    {
+      projectCoordinate,
+      homeChannelId,
+      limit: options?.limit ?? 20,
+      cursor: options?.cursor ?? null,
+    },
+  );
+}
+
 export type BlobDescriptor = {
   url: string;
   sha256: string;
@@ -604,6 +656,7 @@ export function fromRawManagedAgent(agent: RawManagedAgent): ManagedAgent {
     parallelism: agent.parallelism,
     sessionPolicy: agent.session_policy ?? "channel",
     systemPrompt: agent.system_prompt,
+    executionProfile: agent.execution_profile ?? null,
     avatarUrl: agent.avatar_url ?? null,
     model: agent.model,
     modelSource: agent.model_source ?? null,
@@ -650,6 +703,8 @@ export function fromRawAcpRuntimeCatalogEntry(
     maxTokensEnvVar: entry.max_tokens_env_var ?? null,
     contextLimitEnvVar: entry.context_limit_env_var ?? null,
     maxRoundsEnvVar: entry.max_rounds_env_var ?? null,
+    summaryModelEnvVar: entry.summary_model_env_var ?? null,
+    summaryMaxTokensEnvVar: entry.summary_max_tokens_env_var ?? null,
     installHint: entry.install_hint,
     installInstructionsUrl: entry.install_instructions_url,
     canAutoInstall: entry.can_auto_install,
@@ -741,6 +796,11 @@ export async function listManagedAgents(): Promise<ManagedAgent[]> {
     fromRawManagedAgent,
   );
 }
+
+export async function listAgentArchetypes(): Promise<AgentArchetypeInfo[]> {
+  return invokeTauri<AgentArchetypeInfo[]>("list_agent_archetypes");
+}
+
 export async function createManagedAgent(input: CreateManagedAgentInput) {
   const response = await invokeTauri<RawCreateManagedAgentResponse>(
     "create_managed_agent",
@@ -759,6 +819,7 @@ export async function createManagedAgent(input: CreateManagedAgentInput) {
         idleTimeoutSeconds: input.idleTimeoutSeconds,
         maxTurnDurationSeconds: input.maxTurnDurationSeconds,
         parallelism: input.parallelism,
+        executionProfileId: input.executionProfileId,
         systemPrompt: input.systemPrompt,
         avatarUrl: input.avatarUrl,
         model: input.model,

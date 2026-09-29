@@ -149,6 +149,10 @@ pub(crate) struct KnownAcpRuntime {
     pub context_limit_env_var: Option<&'static str>,
     /// Env var for normalizing `max_rounds`. `None` when not applicable.
     pub max_rounds_env_var: Option<&'static str>,
+    /// Env var for Buzz Agent's optional status-summary model.
+    pub summary_model_env_var: Option<&'static str>,
+    /// Env var for Buzz Agent's status-summary output-token budget.
+    pub summary_max_tokens_env_var: Option<&'static str>,
     /// Normalized field keys that must be set for this harness to function.
     /// Used by the config bridge to mark fields as required in the UI.
     /// Keys match the camelCase names used in `NormalizedConfig` (e.g. "model", "provider").
@@ -181,6 +185,23 @@ impl KnownAcpRuntime {
 #[cfg(test)]
 mod tests {
     use super::super::known_acp_runtime_exact;
+
+    #[test]
+    fn status_summary_settings_are_declared_only_for_buzz_agent() {
+        let buzz_agent = known_acp_runtime_exact("buzz-agent").unwrap();
+        assert_eq!(
+            buzz_agent.summary_model_env_var,
+            Some("BUZZ_AGENT_SUMMARY_MODEL")
+        );
+        assert_eq!(
+            buzz_agent.summary_max_tokens_env_var,
+            Some("BUZZ_AGENT_SUMMARY_MAX_OUTPUT_TOKENS")
+        );
+
+        let goose = known_acp_runtime_exact("goose").unwrap();
+        assert_eq!(goose.summary_model_env_var, None);
+        assert_eq!(goose.summary_max_tokens_env_var, None);
+    }
 
     #[test]
     fn vendor_metadata_distinguishes_cli_and_adapter_guidance() {

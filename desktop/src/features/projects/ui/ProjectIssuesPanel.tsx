@@ -20,6 +20,11 @@ import {
   useCreateProjectIssueCommentMutation,
   useProjectIssuesQuery,
 } from "@/features/projects/hooks";
+import { useCreateProjectIssueMutation } from "@/features/projects/issueMutations";
+import {
+  projectIssueContentWithAcceptanceCriteria,
+  projectIssueHierarchy,
+} from "@/features/projects/projectIssues.mjs";
 import {
   resolveUserLabel,
   type UserProfileLookup,
@@ -27,6 +32,7 @@ import {
 import { entityDiscussionQuery } from "@/features/projects/lib/discussionChannels";
 import { selectionItemFromTask } from "@/features/projects/lib/projectSelection";
 import { issueShareLink } from "@/features/projects/lib/projectShareLinks";
+import { useProjectSelection } from "@/features/projects/lib/useProjectSelection";
 import { relativeTime } from "@/features/projects/lib/projectsViewHelpers";
 import {
   projectTaskCategoryLabel,
@@ -35,7 +41,10 @@ import {
 import { useIdentityQuery } from "@/shared/api/hooks";
 import type { ChannelMember } from "@/shared/api/types";
 import { BuzzLoadingState } from "@/shared/ui/BuzzLoadingState";
+import { Button } from "@/shared/ui/button";
+import { Input } from "@/shared/ui/input";
 import { normalizePubkey } from "@/shared/lib/pubkey";
+import { Textarea } from "@/shared/ui/textarea";
 import { IssueAssigneeFacepile, IssueAssigneesRow } from "./IssueAssigneesRow";
 import { DiscussedInChannels } from "./DiscussionChannels";
 import { ProjectIssueCommentTimeline } from "./ProjectIssueCommentTimeline";
@@ -46,6 +55,8 @@ import {
   ProjectDetailMetaRow,
 } from "./ProjectDetailMeta";
 import { ProjectDetailSection } from "./ProjectDetailSection";
+import { ProjectIssuePlanDraft } from "./ProjectIssuePlanDraft";
+import type { ProjectIssuePlanChatHandoff } from "@/features/projects/lib/projectIssuePlan";
 import { ProfileIdentityButton } from "./ProjectProfileIdentity";
 import { ProjectRichContent } from "./ProjectRichContent";
 import { ShareLinkButton } from "./ShareLinkButton";
@@ -273,14 +284,51 @@ function IssueRow({
 /** Full issue conversation and comment composer. */
 export function ProjectIssueDetail({
   issue,
+  onUseApprovedPlan,
+  onOpenRelatedIssue,
+  parentIssue,
   profiles,
   project,
+  subtasks,
 }: {
   issue: ProjectIssue;
+  onUseApprovedPlan?: (handoff: ProjectIssuePlanChatHandoff) => boolean;
+  onOpenRelatedIssue?: (id: string) => void;
+  parentIssue?: ProjectIssue | null;
   profiles?: UserProfileLookup;
   project: Project;
+  subtasks?: ProjectIssue[];
 }) {
   const commentMutation = useCreateProjectIssueCommentMutation(project);
+  const createSubtaskMutation = useCreateProjectIssueMutation(project);
+  const relatedIssuesQuery = useProjectIssuesQuery(
+    parentIssue === undefined || subtasks === undefined ? project : null,
+  );
+  const relatedIssuesLoading =
+    (parentIssue === undefined || subtasks === undefined) &&
+    relatedIssuesQuery.isLoading;
+  const relatedIssues = relatedIssuesQuery.data ?? [];
+  const relatedHierarchy = projectIssueHierarchy(relatedIssues);
+  const relatedIssueById = new Map(
+    relatedIssues.map(
+      (relatedIssue) => [relatedIssue.id, relatedIssue] as const,
+    ),
+  );
+  const derivedParentId = relatedHierarchy.parentByChildId.get(issue.id);
+  const resolvedParentIssue =
+    parentIssue === undefined
+      ? derivedParentId
+        ? (relatedIssueById.get(derivedParentId) ?? null)
+        : null
+      : parentIssue;
+  const resolvedSubtasks =
+    subtasks ?? relatedHierarchy.childrenByParentId.get(issue.id) ?? [];
+  const [subtaskTitle, setSubtaskTitle] = React.useState("");
+  const [subtaskBody, setSubtaskBody] = React.useState("");
+  const [subtaskAcceptanceCriteria, setSubtaskAcceptanceCriteria] =
+    React.useState("");
+  const projectSelection = useProjectSelection();
+  const canCreateSubtask = issue.category === "epic" && !issue.parentIssueId;
   const members = React.useMemo(
     () => issueMembers(project, issue, profiles),
     [issue, profiles, project],
@@ -318,6 +366,31 @@ export function ProjectIssueDetail({
   const isManagedAgentOwner = useIsManagedAgent(project.owner) === true;
   const canAssignOthers =
     Boolean(viewer) && (isAuthor || isOwner || isManagedAgentOwner);
+
+  async function handleCreateSubtask(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const title = subtaskTitle.trim();
+    if (!title || createSubtaskMutation.isPending) return;
+    try {
+      await createSubtaskMutation.mutateAsync({
+        body: projectIssueContentWithAcceptanceCriteria(
+          subtaskBody,
+          subtaskAcceptanceCriteria,
+        ),
+        category: "issue",
+        parentIssueId: issue.id,
+        title,
+      });
+      setSubtaskTitle("");
+      setSubtaskBody("");
+      setSubtaskAcceptanceCriteria("");
+      toast.success("Subtask created.");
+    } catch (error) {
+      toast.error(
+        error instanceof Error ? error.message : "Failed to create subtask.",
+      );
+    }
+  }
 
   return (
     <div
@@ -379,6 +452,160 @@ export function ProjectIssueDetail({
           </ProjectDetailMetaRow>
         ) : null}
       </ProjectDetailMetaList>
+      <ProjectIssuePlanDraft
+        key={`${project.repoAddress}:${issue.id}`}
+        issue={issue}
+        onUseApprovedPlan={
+          onUseApprovedPlan
+            ? (handoff) => {
+                projectSelection?.clear();
+                return onUseApprovedPlan(handoff);
+              }
+            : undefined
+        }
+        projectAddress={project.repoAddress}
+        subtasks={resolvedSubtasks}
+      />
+      {issue.category === "epic" || issue.parentIssueId ? (
+        <ProjectDetailSection
+          defaultOpen={canCreateSubtask || resolvedSubtasks.length > 0}
+          title={
+            canCreateSubtask
+              ? relatedIssuesLoading
+                ? "Subtasks"
+                : `Subtasks (${resolvedSubtasks.length})`
+              : resolvedParentIssue
+                ? "Parent task"
+                : "Task hierarchy"
+          }
+        >
+          {resolvedParentIssue ? (
+            onOpenRelatedIssue ? (
+              <button
+                className="w-full rounded-lg border border-border/60 px-3 py-2 text-left text-sm hover:bg-muted/40 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
+                onClick={() => onOpenRelatedIssue(resolvedParentIssue.id)}
+                type="button"
+              >
+                <span className="block truncate font-medium">
+                  {resolvedParentIssue.title}
+                </span>
+                <span className="text-xs text-muted-foreground">
+                  Epic · #{resolvedParentIssue.id.slice(0, 8)}
+                </span>
+              </button>
+            ) : (
+              <p className="rounded-lg border border-border/60 px-3 py-2 text-sm">
+                <span className="block truncate font-medium">
+                  {resolvedParentIssue.title}
+                </span>
+                <span className="text-xs text-muted-foreground">
+                  Epic · #{resolvedParentIssue.id.slice(0, 8)}
+                </span>
+              </p>
+            )
+          ) : issue.parentIssueId ? (
+            <p className="text-sm text-muted-foreground" role="status">
+              {relatedIssuesLoading
+                ? "Loading parent task…"
+                : "This parent reference does not point to a root Epic in this repository. The task remains visible at the top level."}
+            </p>
+          ) : canCreateSubtask ? (
+            <div className="space-y-3">
+              {relatedIssuesLoading ? (
+                <p className="text-sm text-muted-foreground" role="status">
+                  Loading subtasks…
+                </p>
+              ) : resolvedSubtasks.length > 0 ? (
+                <ul className="space-y-1" data-testid="project-issue-subtasks">
+                  {resolvedSubtasks.map((subtask) => {
+                    const subtaskStatus = issueStatusVisual(subtask.status);
+                    const subtaskContent = (
+                      <>
+                        <span className="min-w-0 truncate">
+                          {subtask.title}
+                        </span>
+                        <span
+                          className={`shrink-0 text-xs ${subtaskStatus.className}`}
+                        >
+                          {subtask.status}
+                        </span>
+                      </>
+                    );
+                    return (
+                      <li key={subtask.id}>
+                        {onOpenRelatedIssue ? (
+                          <button
+                            aria-label={`Open subtask ${subtask.title}`}
+                            className="flex w-full items-center justify-between gap-3 rounded-lg px-3 py-2 text-left text-sm hover:bg-muted/40 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
+                            onClick={() => onOpenRelatedIssue(subtask.id)}
+                            type="button"
+                          >
+                            {subtaskContent}
+                          </button>
+                        ) : (
+                          <div className="flex items-center justify-between gap-3 rounded-lg px-3 py-2 text-sm">
+                            {subtaskContent}
+                          </div>
+                        )}
+                      </li>
+                    );
+                  })}
+                </ul>
+              ) : (
+                <p className="text-sm text-muted-foreground">
+                  Break this epic into tasks the team can pick up.
+                </p>
+              )}
+              <form
+                className="space-y-2"
+                onSubmit={(event) => void handleCreateSubtask(event)}
+              >
+                <Input
+                  aria-label="Subtask title"
+                  maxLength={256}
+                  onChange={(event) => setSubtaskTitle(event.target.value)}
+                  placeholder="Name a subtask"
+                  value={subtaskTitle}
+                />
+                <Textarea
+                  aria-label="Subtask description"
+                  className="min-h-20"
+                  onChange={(event) => setSubtaskBody(event.target.value)}
+                  placeholder="Optional context"
+                  value={subtaskBody}
+                />
+                <Textarea
+                  aria-label="Subtask acceptance criteria"
+                  className="min-h-16"
+                  onChange={(event) =>
+                    setSubtaskAcceptanceCriteria(event.target.value)
+                  }
+                  placeholder="How will you verify this subtask is done?"
+                  value={subtaskAcceptanceCriteria}
+                />
+                <div className="flex justify-end">
+                  <Button
+                    disabled={
+                      !subtaskTitle.trim() || createSubtaskMutation.isPending
+                    }
+                    size="sm"
+                    type="submit"
+                    variant="outline"
+                  >
+                    {createSubtaskMutation.isPending
+                      ? "Creating…"
+                      : "Add subtask"}
+                  </Button>
+                </div>
+              </form>
+            </div>
+          ) : (
+            <p className="text-sm text-muted-foreground">
+              Create an Epic task to group related work into subtasks.
+            </p>
+          )}
+        </ProjectDetailSection>
+      ) : null}
       {issue.content ? (
         <ProjectDetailSection defaultOpen title="Description">
           <ProjectRichContent content={issue.content} tags={issue.tags} />
@@ -424,6 +651,7 @@ export function ProjectIssuesPanel({
   isLoading,
   issueItems,
   onSelectedIssueIdChange,
+  onUseApprovedIssuePlan,
   profiles,
   project,
   selectedIssueId,
@@ -432,6 +660,7 @@ export function ProjectIssuesPanel({
   isLoading?: boolean;
   issueItems?: ProjectIssuePanelItem[];
   onSelectedIssueIdChange: (id: string | null) => void;
+  onUseApprovedIssuePlan?: (handoff: ProjectIssuePlanChatHandoff) => boolean;
   profiles?: UserProfileLookup;
   project: Project;
   selectedIssueId: string | null;
@@ -441,6 +670,12 @@ export function ProjectIssuesPanel({
   );
   const resolvedItems =
     issueItems ?? (issuesQuery.data ?? []).map((issue) => ({ issue, project }));
+  const hierarchy = projectIssueHierarchy(
+    resolvedItems.map(({ issue }) => issue),
+  );
+  const issueById = new Map(
+    resolvedItems.map(({ issue }) => [issue.id, issue] as const),
+  );
   const selectedItem =
     resolvedItems.find(({ issue }) => issue.id === selectedIssueId) ?? null;
   const loading = isLoading ?? issuesQuery.isLoading;
@@ -467,20 +702,31 @@ export function ProjectIssuesPanel({
   }
 
   if (selectedItem) {
+    const parentId = hierarchy.parentByChildId.get(selectedItem.issue.id);
+    const parentIssue = parentId ? (issueById.get(parentId) ?? null) : null;
+    const subtasks =
+      hierarchy.childrenByParentId.get(selectedItem.issue.id) ?? [];
     return (
       <ProjectIssueDetail
         issue={selectedItem.issue}
+        onUseApprovedPlan={onUseApprovedIssuePlan}
+        onOpenRelatedIssue={onSelectedIssueIdChange}
+        parentIssue={parentIssue}
         profiles={profiles}
         project={selectedItem.project}
+        subtasks={subtasks}
       />
     );
   }
 
+  const topLevelItems = resolvedItems.filter(
+    ({ issue }) => !hierarchy.parentByChildId.has(issue.id),
+  );
   const groups = ISSUE_STATUS_ORDER.map((status) => ({
-    items: resolvedItems.filter(({ issue }) => issue.status === status),
+    items: topLevelItems.filter(({ issue }) => issue.status === status),
     status,
   })).filter((group) => group.items.length > 0);
-  const rangeItems = resolvedItems.map(({ issue, project: itemProject }) =>
+  const rangeItems = topLevelItems.map(({ issue, project: itemProject }) =>
     issueSelectionItem(itemProject, issue),
   );
 

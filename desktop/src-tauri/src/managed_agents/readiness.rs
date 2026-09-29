@@ -442,6 +442,15 @@ fn collect_missing_requirements(
     };
 
     match rt.id {
+        "dsh" => {
+            if crate::managed_agents::resolve_command("dsh").is_none() {
+                vec![Requirement::MissingBinary {
+                    command: "dsh".to_string(),
+                }]
+            } else {
+                vec![]
+            }
+        }
         "buzz-agent" => buzz_agent_requirements(effective),
         "goose" => {
             // Read the file config once at the call site so the inner fn is
@@ -495,6 +504,7 @@ fn buzz_agent_requirements(effective: &EffectiveAgentEnv) -> Vec<Requirement> {
         }
         Some("anthropic") => Some("ANTHROPIC_MODEL"),
         Some("openai") | Some("openai-compat") => Some("OPENAI_COMPAT_MODEL"),
+        Some("deepseek") => Some("DEEPSEEK_MODEL"),
         Some("openrouter") => Some("OPENROUTER_MODEL"),
         _ => None,
     };
@@ -530,6 +540,11 @@ fn buzz_agent_requirements(effective: &EffectiveAgentEnv) -> Vec<Requirement> {
                     key: "OPENAI_COMPAT_API_KEY".to_string(),
                 });
             }
+        Some("deepseek") if env_key_missing("DEEPSEEK_API_KEY") => {
+            missing.push(Requirement::EnvKey {
+                key: "DEEPSEEK_API_KEY".to_string(),
+            });
+        }
         Some("databricks") | Some("databricks_v2") | Some("databricks-v2")
             // DATABRICKS_HOST is hard-required; DATABRICKS_TOKEN is optional
             // (OAuth PKCE is the normal path — see buzz-agent/src/config.rs:143).
@@ -1068,6 +1083,8 @@ mod tests {
             max_tokens_env_var: None,
             context_limit_env_var: None,
             max_rounds_env_var: None,
+            summary_model_env_var: None,
+            summary_max_tokens_env_var: None,
             required_normalized_fields: &[],
             login_hint: None,
             auth_probe_args: None,
@@ -1262,6 +1279,8 @@ mod tests {
             max_tokens_env_var: None,
             context_limit_env_var: None,
             max_rounds_env_var: None,
+            summary_model_env_var: None,
+            summary_max_tokens_env_var: None,
             required_normalized_fields: &[],
             login_hint: None,
             auth_probe_args: None,
@@ -1550,6 +1569,7 @@ mod tests {
             definition_parallelism: None,
             relay_mesh: None,
             effort_level: None,
+            execution_profile: None,
         };
 
         let runtime = known_acp_runtime_exact("buzz-agent");
@@ -1674,6 +1694,32 @@ mod tests {
             agent_readiness(&env).is_ready(),
             "OPENAI_COMPAT_MODEL must satisfy the model requirement for openai"
         );
+    }
+
+    #[test]
+    fn buzz_agent_deepseek_uses_its_own_model_and_credential_env() {
+        let missing_key = make_env(
+            "buzz-agent",
+            env_with(&[
+                ("BUZZ_AGENT_PROVIDER", "deepseek"),
+                ("DEEPSEEK_MODEL", "deepseek-chat"),
+            ]),
+        );
+        assert!(agent_readiness(&missing_key)
+            .requirements()
+            .contains(&Requirement::EnvKey {
+                key: "DEEPSEEK_API_KEY".to_string(),
+            }));
+
+        let configured = make_env(
+            "buzz-agent",
+            env_with(&[
+                ("BUZZ_AGENT_PROVIDER", "deepseek"),
+                ("DEEPSEEK_MODEL", "deepseek-chat"),
+                ("DEEPSEEK_API_KEY", "test-key"),
+            ]),
+        );
+        assert!(agent_readiness(&configured).is_ready());
     }
 
     #[test]

@@ -25,10 +25,39 @@ const corpus = JSON.parse(readFileSync(fileURLToPath(corpusUrl), "utf8"));
 // (`_group`) are skipped. Mirrors the Rust corpus filter.
 const executable = corpus.filter((entry) => entry.expect != null);
 
-test("corpus has exactly 168 executable vectors", () => {
+test("corpus has exactly 170 executable vectors", () => {
   // Locks the vector count so a silent corpus edit can't quietly drop coverage;
   // must equal the gate in the Rust suite (model_capabilities.rs).
-  assert.equal(executable.length, 168);
+  assert.equal(executable.length, 170);
+});
+
+test("DeepSeek baseline canonicalizes provider spelling while unknown IDs stay neutral", () => {
+  const baseline = resolveModelCapabilities(" DeepSeek ", "");
+  assert.equal(baseline.thinkingMode, "adaptive");
+  assert.deepEqual(
+    [...baseline.supportedEfforts],
+    ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+  );
+  assert.equal(baseline.defaultEffort, "high");
+
+  const unknown = resolveModelCapabilities("deepseek", "unlisted-model-id");
+  const genericUnknown = resolveModelCapabilities(
+    "unknown-provider",
+    "unlisted-model-id",
+  );
+  assert.deepEqual(unknown, genericUnknown);
+});
+
+test("manifest stores the documented DeepSeek effort translation as data", () => {
+  assert.deepEqual(manifestJson.effort_mappings.deepseek, {
+    none: "none",
+    minimal: "low",
+    low: "low",
+    medium: "high",
+    high: "high",
+    xhigh: "high",
+    max: "max",
+  });
 });
 
 test("registry label aliases refuse an unprefixed query", () => {

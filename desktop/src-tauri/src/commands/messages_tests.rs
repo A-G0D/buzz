@@ -193,6 +193,37 @@ fn thread_replies_filter_pages_with_composite_cursor() {
 }
 
 #[test]
+fn thread_brief_filter_uses_shared_kinds_aux_and_composite_cursor() {
+    let cursor = crate::models::ThreadCursor {
+        created_at: 1_700_000_000,
+        event_id: "abcd".to_string(),
+    };
+    let filter = build_thread_brief_replies_filter("root-hex", "channel-1", 64, 100, Some(&cursor));
+    let kinds = filter["kinds"].as_array().expect("brief filter has kinds");
+
+    assert_eq!(
+        kinds,
+        serde_json::json!(buzz_core_pkg::thread_brief::THREAD_BRIEF_KINDS)
+            .as_array()
+            .unwrap()
+    );
+    assert!(kinds.iter().all(|kind| {
+        !buzz_core_pkg::kind::P_GATED_KINDS.contains(&(kind.as_u64().unwrap() as u32))
+    }));
+    assert_eq!(filter["#h"], serde_json::json!(["channel-1"]));
+    assert_eq!(filter["#e"], serde_json::json!(["root-hex"]));
+    assert_eq!(filter["include_aux"], serde_json::json!(true));
+    assert_eq!(
+        filter["thread_cursor"],
+        serde_json::json!(cursor.created_at)
+    );
+    assert_eq!(
+        filter["thread_cursor_id"],
+        serde_json::json!(cursor.event_id)
+    );
+}
+
+#[test]
 fn stored_managed_agent_auth_tag_trims_blank_values() {
     assert_eq!(
         stored_managed_agent_auth_tag(Some("  [\"auth\",\"owner\",\"\",\"sig\"]  ")),

@@ -83,13 +83,24 @@ fn make_prompt_context(
     let base_prompt_content = config.base_prompt_content.as_ref();
     let cwd = current_working_directory()?;
     Ok(PromptContext {
-        mcp_servers: build_mcp_servers(config),
+        configured_worker_pool_slots: config.agents,
+        mcp_servers: build_mcp_servers(config)?,
         initial_message: config.initial_message.clone(),
         idle_timeout: Duration::from_secs(config.idle_timeout_secs),
         max_turn_duration: Duration::from_secs(config.max_turn_duration_secs),
         turn_liveness_interval: Duration::from_secs(config.turn_liveness_secs),
         dedup_mode: config.dedup_mode,
         system_prompt: config.system_prompt.clone(),
+        provider_id: config.provider.clone(),
+        model_id: config.model.clone(),
+        execution_profile_id: config.execution_profile_id.clone(),
+        execution_profile_version: config.execution_profile_version,
+        prompt_profile_id: config.prompt_profile_id.clone(),
+        prompt_profile_version: config.prompt_profile_version,
+        prompt_profile_hash: config.prompt_profile_hash.clone(),
+        route_profile_id: config.route_profile_id.clone(),
+        route_profile_version: config.route_profile_version,
+        route_profile_hash: config.route_profile_hash.clone(),
         session_title: config.session_title.clone(),
         team_instructions: config.team_instructions.clone(),
         base_prompt: if config.no_base_prompt {

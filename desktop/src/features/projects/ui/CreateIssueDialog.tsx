@@ -20,7 +20,7 @@ export function CreateIssueDialog({
 }) {
   return (
     <CreateProjectWorkItemDialog
-      bodyPlaceholder="Add context, expected behavior, or reproduction steps"
+      bodyPlaceholder="Add context or reproduction steps"
       description={`Create a task in ${projectName}`}
       isCreating={isCreating}
       itemName="issue"
