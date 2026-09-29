@@ -90,7 +90,7 @@ mod tests {
         let id = Uuid::new_v4();
         let filter =
             json!({"kinds":[9008], "#h":[id], "#p":[viewer], "channel_delete_authority":1});
-        assert_eq!(channel(&[filter.clone()], &viewer), Some(id));
+        assert_eq!(channel(std::slice::from_ref(&filter), &viewer), Some(id));
         assert_eq!(channel(&[], &viewer), None);
         assert_eq!(channel(&[filter.clone(), filter.clone()], &viewer), None);
         for (key, value) in [
