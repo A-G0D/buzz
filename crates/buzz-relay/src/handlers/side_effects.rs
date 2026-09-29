@@ -447,6 +447,24 @@ async fn actor_owns_any_owner_agent(
     Ok(false)
 }
 
+/// Current Delete ownership authority, shared by the command and its read-only probe.
+/// The caller supplies an active roster from this community's writer. Other
+/// command checks (including archived state) remain with the command validator.
+pub(crate) async fn has_delete_authority(
+    state: &Arc<AppState>,
+    community_id: buzz_core::CommunityId,
+    members: &[buzz_db::channel::MemberRecord],
+    actor: &[u8],
+) -> anyhow::Result<bool> {
+    if members
+        .iter()
+        .any(|m| m.pubkey == actor && m.role == "owner")
+    {
+        return Ok(true);
+    }
+    actor_owns_any_owner_agent(state, community_id, members, actor).await
+}
+
 /// Validate an admin kind event BEFORE storage.
 pub async fn validate_admin_event(
     tenant: &TenantContext,
@@ -799,20 +817,10 @@ pub async fn validate_admin_event(
         9008 => {
             // DELETE_GROUP: owner only, or the owning human of the channel's agent-owner.
             let members = state.db.get_members(tenant.community(), channel_id).await?;
-            let actor_member = members.iter().find(|m| m.pubkey == actor_bytes);
-            match actor_member {
-                Some(m) if m.role == "owner" => Ok(()),
-                _ => {
-                    // Allow the owning human of any active owner-role agent in the
-                    // channel, even when the human is not a channel member —
-                    // diverges from kind:9001 intentionally.
-                    if actor_owns_any_owner_agent(state, tenant.community(), &members, &actor_bytes)
-                        .await?
-                    {
-                        return Ok(());
-                    }
-                    Err(anyhow::anyhow!("only owner can delete group"))
-                }
+            if has_delete_authority(state, tenant.community(), &members, &actor_bytes).await? {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!("only owner can delete group"))
             }
         }
         9022 => {
